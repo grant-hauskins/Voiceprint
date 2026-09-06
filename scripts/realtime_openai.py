@@ -255,4 +255,6 @@ if __name__ == "__main__":
     if parsed.list_devices:
         import sounddevice as sd
         print(sd.query_devices()); sys.exit(0)
+    if not parsed.mcp_url:
+        parser.error("--mcp-url is required (the public https URL from scripts\dev.ps1 tunnel, ending in /mcp)")
     asyncio.run(main(parsed))
