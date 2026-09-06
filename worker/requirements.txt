@@ -1,0 +1,8 @@
+# Install torch==2.6.0 and torchaudio==2.6.0 from the CPU wheel index first.
+numpy==1.26.4
+speechbrain==1.0.3
+huggingface-hub==0.29.3
+onnxruntime==1.22.1
+soundfile==0.13.1
+sounddevice==0.5.2
+scipy==1.15.3
