@@ -53,6 +53,13 @@ final class McpHttpServer implements AutoCloseable {
             if (message == null || !message.isObject()) { respond(exchange, 400, McpServer.error(null, -32600, "Expected a single JSON-RPC object; batches are not supported.")); return; }
             ObjectNode response = McpServer.dispatch(message, client, api, apiToken, null);
             if (response == null) { exchange.sendResponseHeaders(202, -1); return; }
+            // Independent evidence that a hosted agent used the tool: written by this process, not reported by the agent.
+            String rpc = message.path("method").asText();
+            String via = Optional.ofNullable(headers.getFirst("Cf-Connecting-Ip")).orElse(exchange.getRemoteAddress().getAddress().getHostAddress());
+            String detail = rpc.equals("tools/call") ? message.path("params").path("name").asText() + " " + message.path("params").path("arguments").toString() : "";
+            int size = response.toString().getBytes(StandardCharsets.UTF_8).length;
+            boolean failed = response.has("error") || response.path("result").path("isError").asBoolean(false);
+            System.err.println(java.time.LocalTime.now().withNano(0) + " MCP " + rpc + " " + detail + " from " + via + " -> " + (failed ? "error" : "ok") + " " + size + " bytes");
             respond(exchange, 200, response);
         } catch (Exception e) { System.err.println("MCP request failed: " + e.getClass().getSimpleName()); respond(exchange, 500, Json.error("internal_error", "Request could not be completed.")); }
         finally { exchange.close(); }
