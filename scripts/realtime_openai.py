@@ -218,7 +218,21 @@ async def main(args):
                                 "transcription": {"model": "gpt-4o-mini-transcribe", "language": "en"}},
                       "output": {"format": {"type": "audio/pcm", "rate": 24000}, "voice": args.voice}},
             "tools": [tool]}}))
-        print("Realtime session configured. Press Enter to start the conversation; SPACE = speak now, H = hold, Q = quit.", flush=True)
+        # Refuse to run in OpenAI's default mode: wait for session.updated and confirm the MCP tool is registered.
+        while True:
+            event = json.loads(await asyncio.wait_for(ws.recv(), timeout=20))
+            if log:
+                log.write(json.dumps({"openai": event}) + "\n"); log.flush()
+            if event.get("type") == "error":
+                sys.exit(f"OpenAI rejected the session config, not continuing: {event.get('error')}")
+            if event.get("type") == "session.updated":
+                tools = event.get("session", {}).get("tools", [])
+                if not any(t.get("type") == "mcp" and t.get("server_label") == "voiceprint" for t in tools):
+                    sys.exit(f"session.updated has no voiceprint MCP tool; tools = {tools}")
+                td = event["session"].get("audio", {}).get("input", {}).get("turn_detection") or {}
+                print(f"Realtime session configured: model={event['session'].get('model')} tools=voiceprint(mcp) vad={td.get('type')} auto_response={td.get('create_response')}", flush=True)
+                break
+        print("Press Enter to start the conversation; SPACE = speak now, H = hold, Q = quit.", flush=True)
         input()
         threading.Thread(target=mic_thread, daemon=True).start()
         threading.Thread(target=key_thread, daemon=True).start()
