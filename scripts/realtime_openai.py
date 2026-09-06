@@ -40,6 +40,43 @@ def instructions(agent_name, session_id, names):
     )
 
 
+HOSTAPI_PREFERENCE = ("MME", "Windows DirectSound", "Windows WASAPI", "Windows WDM-KS")   # MME resamples for us; WDM-KS is picky
+
+
+def resolve_device(spec, kind):
+    """
+    spec: None, an index, or comma-separated preferences (index or case-insensitive name substring), first present wins.
+    Bluetooth 'Hands-Free' endpoints (the low-quality call profile that also hijacks the mic) are skipped unless
+    named by index. Returns a device index, or None for the Windows default.
+    """
+    import sounddevice as sd
+    if spec is None or str(spec).strip() == "":
+        return None
+    apis, devices = sd.query_hostapis(), sd.query_devices()
+    key = "max_output_channels" if kind == "output" else "max_input_channels"
+    for pref in [x.strip() for x in str(spec).split(",") if x.strip()]:
+        if pref.isdigit():
+            i = int(pref)
+            if i < len(devices) and devices[i][key] > 0:
+                return i
+            continue
+        matches = [i for i, d in enumerate(devices) if d[key] > 0 and pref.lower() in d["name"].lower() and "hands-free" not in d["name"].lower()]
+        if matches:
+            def rank(i):
+                name = apis[devices[i]["hostapi"]]["name"]
+                return HOSTAPI_PREFERENCE.index(name) if name in HOSTAPI_PREFERENCE else 99
+            return sorted(matches, key=rank)[0]
+    return None
+
+
+def describe_device(index, kind):
+    import sounddevice as sd
+    if index is None:
+        index = sd.default.device[1 if kind == "output" else 0]
+        return f"Windows default: {sd.query_devices(index)['name']}"
+    return f"{index}: {sd.query_devices(index)['name']}"
+
+
 def resample_16k_to_24k(pcm16k):
     import numpy as np
     from scipy.signal import resample_poly
@@ -51,9 +88,10 @@ def resample_16k_to_24k(pcm16k):
 class Player:
     """Plays the agent's audio (24 kHz PCM16) and reports when playback is idle."""
 
-    def __init__(self, device=None):
+    def __init__(self, device=None, tail_s=0.4):
         import sounddevice as sd
         self.queue = []
+        self.tail_s = tail_s      # keep "busy" this long after the last buffer; raise for Bluetooth latency
         self.lock = threading.Lock()
         self.stream = sd.RawOutputStream(samplerate=24000, channels=1, dtype="int16", device=device, blocksize=1200, callback=self._callback)
         self.stream.start()
@@ -79,7 +117,7 @@ class Player:
     def busy(self):
         with self.lock:
             pending = sum(len(b) for b in self.queue)
-        return pending > 0 or time.monotonic() - self.last_audio_at < 0.3
+        return pending > 0 or time.monotonic() - self.last_audio_at < self.tail_s
 
 
 async def main(args):
@@ -92,9 +130,15 @@ async def main(args):
         path = Path(__file__).resolve().parents[1] / "data" / "mcp-token.txt"
         mcp_token = path.read_text(encoding="utf-8").strip() if path.exists() else None
 
+    mic = resolve_device(args.device, "input")
+    speaker = resolve_device(args.output_device, "output")
+    print("Microphone:", describe_device(mic, "input"), flush=True)
+    if speaker is None and args.output_device:
+        print(f"None of [{args.output_device}] is available as an output right now (Bluetooth not connected in stereo, or monitor audio off).", flush=True)
+    print("Speaker:", describe_device(speaker, "output"), flush=True)
     session_id = args.session or "agent_" + uuid.uuid4().hex[:10]
     print(f"Loading faster-whisper {args.model}...", flush=True)
-    names = vp.enroll(args.api, session_id, args.names, vp.record_from_mic(args.device))
+    names = vp.enroll(args.api, session_id, args.names, vp.record_from_mic(mic))
     print("Session", session_id, "ready:", ", ".join(f"{pid}={name}" for pid, name in names.items()), flush=True)
 
     log = open(args.events, "a", encoding="utf-8") if args.events else None
@@ -122,7 +166,7 @@ async def main(args):
             loop.call_soon_threadsafe(audio_out.put_nowait, pcm)
 
     stream = vp.Stream(args.api, session_id, vp.Turns(transcriber.submit, args.verbose), log, on_chunk=on_chunk, verbose=args.verbose)
-    player = Player(args.output_device)
+    player = Player(speaker, args.mute_tail)
     stop = threading.Event()
 
     muted = {"now": False}
@@ -133,9 +177,9 @@ async def main(args):
         # agent's own voice never reaches Voiceprint or OpenAI's input buffer. Human speech during the agent's
         # reply is lost for that moment; the trade-off is a clean transcript with no self-echo.
         try:
-            with vp.Microphone(args.device) as mic:
+            with vp.Microphone(mic) as capture:
                 while not stop.is_set():
-                    pcm, captured_at = mic.get()
+                    pcm, captured_at = capture.get()
                     muted["now"] = player.busy()
                     if muted["now"]:
                         pcm = b"\x00" * len(pcm)
@@ -243,8 +287,9 @@ if __name__ == "__main__":
     parser.add_argument("--agent-name", default="Ava")
     parser.add_argument("--eagerness", choices=["quiet", "balanced", "eager"], default="balanced")
     parser.add_argument("--session")
-    parser.add_argument("--device", type=int, help="microphone index")
-    parser.add_argument("--output-device", type=int, help="speaker index")
+    parser.add_argument("--device", default="Razer Seiren", help="microphone: index or comma-separated name preferences (default: Razer Seiren)")
+    parser.add_argument("--output-device", default="HD 4.40,BenQ", help="speaker: index or comma-separated name preferences, first present wins (default: HD 4.40 BT, then BenQ monitor, else Windows default)")
+    parser.add_argument("--mute-tail", type=float, default=0.4, help="seconds to keep the mic muted after the agent's audio drains; use ~0.8 for Bluetooth")
     parser.add_argument("--model", default="base.en", help="faster-whisper model")
     parser.add_argument("--realtime-model", default="gpt-realtime-2.1")
     parser.add_argument("--voice", default="marin")
@@ -256,5 +301,5 @@ if __name__ == "__main__":
         import sounddevice as sd
         print(sd.query_devices()); sys.exit(0)
     if not parsed.mcp_url:
-        parser.error("--mcp-url is required (the public https URL from scripts\dev.ps1 tunnel, ending in /mcp)")
+        parser.error("--mcp-url is required (the public https URL from scripts\\dev.ps1 tunnel, ending in /mcp)")
     asyncio.run(main(parsed))
