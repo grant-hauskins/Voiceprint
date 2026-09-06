@@ -32,8 +32,16 @@ def api(base, path, body=None):
         headers["Authorization"] = "Bearer " + os.environ["VOICEPRINT_API_TOKEN"]
     data = None if body is None else json.dumps(body).encode()
     request = urllib.request.Request(base + path, data, headers, method="POST" if body is not None else "GET")
-    with urllib.request.urlopen(request, timeout=40) as response:
-        return json.load(response)
+    try:
+        with urllib.request.urlopen(request, timeout=40) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", "replace")
+        try:
+            detail = json.loads(detail); detail = f'{detail.get("error")}: {detail.get("message")}'
+        except ValueError:
+            pass
+        raise RuntimeError(f"{path} -> HTTP {error.code} {detail}") from None
 
 
 def clock(ms):
@@ -143,18 +151,29 @@ def run(args):
     if not args.no_transcribe:
         print(f"Loading faster-whisper {args.model} (first run downloads the model)...", flush=True)
     session = args.session or "live_" + uuid.uuid4().hex[:12]
-    participants, names = [], {}
-    for index, name in enumerate(args.names, 1):
-        pid = f"participant_{index}"; names[pid] = name
-        if replay:
-            pcm = read_wav(args.enroll_wavs[index - 1])
-        else:
-            import sounddevice as sd
-            input(f"{name}: press Enter, then speak alone for 8 seconds. ")
-            audio = sd.rec(8 * 16000, samplerate=16000, channels=1, dtype="int16", device=args.device)
-            sd.wait(); pcm = audio.astype("<i2").tobytes()
-        participants.append({"id": pid, "name": name, "opening_statement_audio": base64.b64encode(pcm).decode()})
-    api(args.api, "/speaker/session/init", {"session_id": session, "sample_rate": 16000, "audio_format": "pcm_s16le", "participants": participants})
+    names = {f"participant_{i}": name for i, name in enumerate(args.names, 1)}
+    while True:
+        participants = []
+        for index, name in enumerate(args.names, 1):
+            pid = f"participant_{index}"
+            if replay:
+                pcm = read_wav(args.enroll_wavs[index - 1])
+            else:
+                import sounddevice as sd
+                input(f"{name}: press Enter, then talk continuously for 8 seconds, close to the microphone. ")
+                audio = sd.rec(8 * 16000, samplerate=16000, channels=1, dtype="int16", device=args.device)
+                sd.wait(); pcm = audio.astype("<i2").tobytes()
+                level = max(abs(int(audio.min())), int(audio.max()))
+                print(f"  recorded {name}: peak level {level} of 32767" + ("  (too quiet: move closer or raise input gain)" if level < 1500 else ""), flush=True)
+            participants.append({"id": pid, "name": name, "opening_statement_audio": base64.b64encode(pcm).decode()})
+        try:
+            api(args.api, "/speaker/session/init", {"session_id": session, "sample_rate": 16000, "audio_format": "pcm_s16le", "participants": participants})
+            break
+        except RuntimeError as error:
+            if "422" not in str(error) or replay:
+                raise
+            print(f"Enrollment rejected: {error}", flush=True)
+            print("One statement had silence, two voices, or a pause long enough to look like a speaker change. Recording everyone again.", flush=True)
     print("Session", session, "ready:", ", ".join(f"{pid}={name}" for pid, name in names.items()), flush=True)
     del participants  # Enrollment PCM is not written to disk.
     log = None
