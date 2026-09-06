@@ -16,6 +16,7 @@ import time
 import urllib.request
 import wave
 from collections import Counter
+from pathlib import Path
 
 CHUNK_BYTES = 8000          # 250 ms of mono 16 kHz PCM16
 CHUNK_MS = 250
@@ -28,14 +29,99 @@ OVERLAP_OPEN_CHUNKS = 2     # consecutive overlap chunks that open an overlap se
 OVERLAP_CLOSE_CHUNKS = 2    # consecutive clear chunks that close it
 
 
+class ConsentError(RuntimeError):
+    """The room no longer has authoritative prior permission for this operation."""
+
+
+class ConsentGuard:
+    """Fresh API checks before protected actions; authorization failures latch until restart."""
+    def __init__(self, base, session, hosted=False):
+        self.base, self.session, self.hosted = base, session, hosted
+        self.epoch = None
+        self.failed = threading.Event()
+        self.valid_until = 0
+
+    def deny(self):
+        self.valid_until = 0
+        self.failed.set()
+
+    def require(self, scope="local_processing"):
+        if self.failed.is_set():
+            raise ConsentError("Room authorization stopped; capture and disclosure are blocked")
+        try:
+            state = api(self.base, f"/speaker/session/{self.session}/consent")
+            epoch = (state.get("policy_version"), state.get("consent_method_version"), state.get("roster_version"))
+            people = state.get("participants") or []
+            scopes = state.get("scopes") or {}
+            if (state.get("session_id") != self.session or state.get("allowed") is not True
+                    or state.get("state") != "active" or not all(epoch)
+                    or not people or any(p.get("bipa_consent_granted") is not True for p in people)
+                    or scopes.get("local_processing") is not True or scopes.get(scope) is not True
+                    or state.get("retention_deadline_ms", 0) <= time.time() * 1000
+                    or (self.epoch is not None and epoch != self.epoch)):
+                raise ConsentError("Prior current written release and disclosure permission are required for every human")
+            if self.hosted and (scopes.get("openai_audio") is not True or scopes.get("hosted_mcp") is not True):
+                raise ConsentError("Hosted audio and MCP require every release and reviewed vendor configuration")
+            self.epoch = epoch
+            self.valid_until = time.monotonic() + 1.0
+            return state
+        except Exception:
+            self.deny()
+            raise ConsentError("Consent unavailable, revoked, expired, or changed; stopped all protected processing") from None
+
+
+def require_consent(consent, scope="local_processing"):
+    if consent is None:
+        raise ConsentError("An authoritative ConsentGuard is required before reading or capturing audio")
+    return consent.require(scope)
+
+
+def prepare_room(base, session, names, contacts=None, hosted=False):
+    """Collect roster text only. The actual people sign in the GUI while the mic stays closed."""
+    if not api_token():
+        raise ConsentError("VOICEPRINT_API_TOKEN must authenticate the operator before the consent flow")
+    notice = api(base, "/privacy/notice")
+    if not notice.get("configured"):
+        raise ConsentError("Configure the controller name, address, and email in the API before consent")
+    if contacts is not None and len(contacts) != len(names):
+        raise ValueError("Provide one --contacts entry per full participant name")
+    contacts = contacts or [input(f"{name}: type your email or phone (unverified): ").strip() for name in names]
+    if any(not name.strip() for name in names) or any(not contact.strip() for contact in contacts):
+        raise ValueError("Full typed names and contacts must be nonempty")
+    api(base, "/privacy/rooms", {"session_id": session, "purpose_id": "live_conversation_v1",
+        "participants": [{"id": f"participant_{i}", "name": name, "contact": contact}
+                         for i, (name, contact) in enumerate(zip(names, contacts), 1)]})
+    print(f"Pending session {session}. Each person must personally sign at {base}/ui. Microphone remains closed.", flush=True)
+    while True:
+        state = api(base, f"/speaker/session/{session}/consent")
+        if state.get("state") in ("revoked", "destroying", "destroyed", "legacy_blocked"):
+            raise ConsentError("This room cannot be authorized; start a new consent room")
+        if state.get("allowed"):
+            guard = ConsentGuard(base, session, hosted)
+            guard.require("openai_audio" if hosted else "local_processing")
+            return guard
+        time.sleep(.5)
+
+
+def api_token():
+    value = os.environ.get("VOICEPRINT_API_TOKEN")
+    if value:
+        return value
+    path = Path(__file__).resolve().parents[1] / "data" / "api-token.txt"
+    return path.read_text(encoding="utf-8").strip() if path.exists() else None
+
+
 def api(base, path, body=None):
     headers = {"Content-Type": "application/json"}
-    if os.environ.get("VOICEPRINT_API_TOKEN"):
-        headers["Authorization"] = "Bearer " + os.environ["VOICEPRINT_API_TOKEN"]
+    bearer = api_token()
+    if bearer:
+        headers["Authorization"] = "Bearer " + bearer
+    if path == "/speaker/session/init" and body:
+        headers["X-Voiceprint-Session"] = body["session_id"]
     data = None if body is None else json.dumps(body).encode()
     request = urllib.request.Request(base + path, data, headers, method="POST" if body is not None else "GET")
     try:
-        with urllib.request.urlopen(request, timeout=40) as response:
+        with urllib.request.urlopen(request, timeout=2 if path.endswith("/consent") else 40) as response:
             return json.load(response)
     except urllib.error.HTTPError as error:
         detail = error.read().decode("utf-8", "replace")
@@ -50,7 +136,8 @@ def clock(ms):
     return f"{ms // 60000}:{(ms // 1000) % 60:02d}.{(ms // 100) % 10}"
 
 
-def read_wav(path):
+def read_wav(path, consent=None):
+    require_consent(consent)
     with wave.open(str(path), "rb") as w:
         if w.getframerate() != 16000 or w.getnchannels() != 1 or w.getsampwidth() != 2:
             raise ValueError(f"{path}: need mono 16 kHz 16-bit PCM WAV")
@@ -73,7 +160,9 @@ def format_line(utterance, names):
 class Transcriber:
     """Runs faster-whisper on finished segments in a background thread and posts the text."""
 
-    def __init__(self, base, session, names, model_name="base.en", log=None, on_utterance=None):
+    def __init__(self, base, session, names, model_name="base.en", log=None, on_utterance=None, consent=None):
+        require_consent(consent)
+        self.consent = consent
         from faster_whisper import WhisperModel
         self.model = WhisperModel(model_name, device="cpu", compute_type="int8")
         self.base, self.session, self.names, self.log, self.on_utterance = base, session, names, log, on_utterance
@@ -87,13 +176,26 @@ class Transcriber:
         return self.jobs.empty() and self.in_flight == 0
 
     def submit(self, utterance, pcm):
+        require_consent(self.consent)
         self.jobs.put((utterance, pcm))
+
+    def discard(self):
+        while True:
+            try:
+                self.jobs.get_nowait()
+            except queue.Empty:
+                break
 
     def finish(self, timeout=60):
         self.jobs.put(None)
         self.thread.join(timeout)
+        if self.thread.is_alive():
+            self.consent.deny()
+            self.discard()
+            print("Transcription did not drain before shutdown; later persistence is blocked.", file=sys.stderr, flush=True)
 
     def transcribe(self, pcm):
+        require_consent(self.consent)
         import numpy as np
         audio = np.frombuffer(pcm, dtype="<i2").astype("float32") / 32768.0
         segments, _ = self.model.transcribe(audio, language="en", beam_size=1, condition_on_previous_text=False,
@@ -112,13 +214,17 @@ class Transcriber:
                 if not text:
                     continue
                 utterance = dict(utterance, text=text, source="faster_whisper")
+                require_consent(self.consent)
                 stored = api(self.base, f"/speaker/session/{self.session}/utterances", utterance)
                 utterance["utterance_id"] = stored["utterance_id"]; utterance["label"] = stored.get("label")
-                print(format_line(utterance, self.names), flush=True)
+                print(f"Stored human turn #{utterance['utterance_id']} [{utterance.get('label')}]; text available in local GUI.", flush=True)
                 if self.log:
                     self.log.write(json.dumps({"utterance": utterance}) + "\n"); self.log.flush()
                 if self.on_utterance:
                     self.on_utterance(utterance)
+            except ConsentError:
+                self.discard()
+                return
             except Exception as error:  # keep streaming even if one transcription fails
                 print(f'transcription failed for {clock(utterance["start_ms"])}-{clock(utterance["end_ms"])}: {error}', file=sys.stderr, flush=True)
             finally:
@@ -241,12 +347,15 @@ class Turns:
 class Stream:
     """Feeds ordered 250 ms chunks to the API and routes attributions to `Turns` and callbacks."""
 
-    def __init__(self, base, session, turns, log=None, on_chunk=None, verbose=False):
+    def __init__(self, base, session, turns, log=None, on_chunk=None, verbose=False, consent=None):
+        require_consent(consent)
+        self.consent = consent
         self.base, self.session, self.turns, self.log, self.on_chunk, self.verbose = base, session, turns, log, on_chunk, verbose
         self.sequence = 0
         self.latencies = []
 
     def feed(self, pcm, captured_at=None):
+        require_consent(self.consent)
         attribution = api(self.base, f"/speaker/session/{self.session}/audio", {"sequence": self.sequence, "audio_base64": base64.b64encode(pcm).decode()})
         elapsed = None if captured_at is None else (time.monotonic() - captured_at) * 1000
         self.turns.observe(self.sequence, pcm, attribution)
@@ -264,15 +373,18 @@ class Stream:
         return api(self.base, f"/speaker/session/{self.session}/end", {})
 
 
-def enroll(base, session, names, record, replay_wavs=None):
+def enroll(base, session, names, record, replay_wavs=None, consent=None):
     """Enroll `names` (list) and return {participant_id: name}. `record(name)` returns 8 s of PCM16 from the mic."""
     ids = {f"participant_{i}": name for i, name in enumerate(names, 1)}
+    require_consent(consent)
     while True:
         participants = []
         for index, (pid, name) in enumerate(ids.items()):
-            pcm = read_wav(replay_wavs[index]) if replay_wavs else record(name)
+            require_consent(consent)
+            pcm = read_wav(replay_wavs[index], consent) if replay_wavs else record(name)
             participants.append({"id": pid, "name": name, "opening_statement_audio": base64.b64encode(pcm).decode()})
         try:
+            require_consent(consent)
             api(base, "/speaker/session/init", {"session_id": session, "sample_rate": 16000, "audio_format": "pcm_s16le", "participants": participants})
             return ids
         except RuntimeError as error:
@@ -282,29 +394,37 @@ def enroll(base, session, names, record, replay_wavs=None):
             print("One statement had silence, two voices, or a pause long enough to look like a speaker change. Recording everyone again.", flush=True)
 
 
-def record_from_mic(device):
+def record_from_mic(device, consent=None):
     def record(name):
-        import sounddevice as sd
-        input(f"{name}: press Enter, then talk continuously for 8 seconds, close to the microphone. ")
-        audio = sd.rec(8 * 16000, samplerate=16000, channels=1, dtype="int16", device=device)
-        sd.wait()
+        import numpy as np
+        require_consent(consent)
+        input(f"{name}: after your written release, press Enter, then speak for 8 seconds, starting: "
+              f"I, {name}, consent to Voiceprint collecting my voiceprint for identifying consenting speakers and providing a speaker-attributed transcript during the current room conversation today. ")
+        with Microphone(device, consent=consent) as capture:
+            pcm = b"".join(capture.get()[0] for _ in range(32))
+        require_consent(consent)
+        audio = np.frombuffer(pcm, dtype="<i2")
         level = max(abs(int(audio.min())), int(audio.max()))
         print(f"  recorded {name}: peak level {level} of 32767" + ("  (too quiet: move closer or raise input gain)" if level < 1500 else ""), flush=True)
-        return audio.astype("<i2").tobytes()
+        return pcm
     return record
 
 
 class Microphone:
     """Shared-microphone capture into a bounded queue of (pcm, captured_at); stops instead of dropping audio."""
 
-    def __init__(self, device=None):
+    def __init__(self, device=None, consent=None):
         self.device = device
+        self.consent = consent
         self.chunks = queue.Queue(maxsize=4)
         self.failed = []
         self.stream = None
 
     def _callback(self, data, frames, timing, status):
         import sounddevice as sd
+        if self.consent is None or self.consent.failed.is_set() or time.monotonic() >= self.consent.valid_until:
+            self.failed.append("Consent stale or revoked; capture stopped")
+            raise sd.CallbackAbort
         if status:
             self.failed.append("Microphone overflow or device error"); raise sd.CallbackAbort
         try:
@@ -313,6 +433,7 @@ class Microphone:
             self.failed.append("Inference cannot keep up with capture; stopping instead of silently dropping audio"); raise sd.CallbackAbort
 
     def __enter__(self):
+        require_consent(self.consent)
         import sounddevice as sd
         self.stream = sd.RawInputStream(samplerate=16000, channels=1, dtype="int16", blocksize=CHUNK_BYTES // 2, device=self.device, callback=self._callback)
         self.stream.start()
@@ -323,14 +444,23 @@ class Microphone:
             self.stream.stop(); self.stream.close()
 
     def get(self, timeout=5):
+        try:
+            require_consent(self.consent)
+        except ConsentError:
+            if self.stream:
+                self.stream.abort()
+            while not self.chunks.empty():
+                self.chunks.get_nowait()
+            raise
         if self.failed:
             raise RuntimeError(self.failed[0])
         return self.chunks.get(timeout=timeout)
 
 
-def file_chunks(path, realtime=False):
-    pcm = read_wav(path)
+def file_chunks(path, realtime=False, consent=None):
+    pcm = read_wav(path, consent)
     for offset in range(0, len(pcm) - CHUNK_BYTES + 1, CHUNK_BYTES):
+        require_consent(consent)
         yield pcm[offset:offset + CHUNK_BYTES], time.monotonic()
         if realtime:
             time.sleep(CHUNK_MS / 1000)

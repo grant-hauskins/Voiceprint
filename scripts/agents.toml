@@ -1,0 +1,18 @@
+# Start with the tested Realtime provider. Voices are selected before the first reply.
+[[agents]]
+name = "Ava"
+provider = "openai_realtime"
+model = "gpt-realtime-2.1"
+voice = "marin"
+eagerness = "balanced"
+output_device = "HD 4.40,BenQ"
+instructions_extra = ""
+
+[[agents]]
+name = "Ben"
+provider = "openai_realtime"
+model = "gpt-realtime-2.1"
+voice = "cedar"
+eagerness = "quiet"
+output_device = "HD 4.40,BenQ"
+instructions_extra = ""

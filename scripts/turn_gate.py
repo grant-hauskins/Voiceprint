@@ -28,6 +28,8 @@ class GateState:
     last_overlap_at: float = -1e9
     manual: str = None                       # "speak": one reply now (consumed once). "hold": sticky mute until released.
     history: list = field(default_factory=list)   # recent utterances (dicts), newest last
+    others_speaking: bool = False             # another registered agent holds the room floor
+    room_agent_names: tuple = ()               # names in the registry, including this agent
 
     def note_utterance(self, utterance, now=None):
         now = time.monotonic() if now is None else now
@@ -65,6 +67,8 @@ def decide(state, now, current_status, last_utterance_end_at):
       "speaking" (a human turn is open), "overlap", "silence", "unknown".
     last_utterance_end_at: monotonic time the most recent human utterance finished (None if none yet).
     """
+    if state.others_speaking:
+        return "wait"                        # manual requests cannot bypass the room floor
     if state.manual == "hold":
         return "wait"                        # sticky: stays until the user releases it
     if state.manual == "speak":
@@ -74,6 +78,17 @@ def decide(state, now, current_status, last_utterance_end_at):
     if not humans:
         return "wait"
     last = humans[-1]
+    newest = state.history[-1]
+    # The stored bus includes our own output too. Never restart an old human question
+    # after our own reply or automatically answer another agent's unaddressed line.
+    if newest.get("source") == "agent" or newest.get("label") == "agent":
+        if newest.get("speaker_id") == state.agent_speaker_id:
+            return "wait"
+        if not addressed(newest.get("text"), state.agent_names):
+            return "wait"
+    elif (not addressed(last.get("text"), state.agent_names)
+          and addressed(last.get("text"), state.room_agent_names)):
+        return "wait"                        # a named request for Ben is not an opening for Ava
     # Inhibitors first: never talk over people, never answer into an overlap, never monologue.
     if current_status in ("speaking", "overlap"):
         return "wait"
