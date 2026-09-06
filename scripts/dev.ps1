@@ -65,8 +65,13 @@ try {
         & $taskMaven '-Dmaven.repo.local=.tools/m2' '-B' '-ntp' @ForwardArgs
     } else {
         $runtime = Join-Path $taskJdk 'bin\java.exe'
-        if ($Mode -eq 'mcp') { & $runtime -jar target\voiceprint-0.1.0.jar mcp @ForwardArgs }
-        else { & $runtime -jar target\voiceprint-0.1.0.jar @ForwardArgs }
+        # Run from a private copy: a JVM loads classes lazily, so rebuilding target\ under a running server breaks it.
+        $runDir = Join-Path $projectRoot ('data\run\' + $PID); New-Item -ItemType Directory -Force $runDir | Out-Null
+        $jar = Join-Path $runDir 'voiceprint.jar'; Copy-Item -LiteralPath (Join-Path $projectRoot 'target\voiceprint-0.1.0.jar') -Destination $jar -Force
+        try {
+            if ($Mode -eq 'mcp') { & $runtime -jar $jar mcp @ForwardArgs }
+            else { & $runtime -jar $jar @ForwardArgs }
+        } finally { Remove-Item -Recurse -Force $runDir -ErrorAction SilentlyContinue }
     }
     exit $LASTEXITCODE
 } finally {
