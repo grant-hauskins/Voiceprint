@@ -88,6 +88,14 @@ The API never transcribes audio. A client that groups chunks into turns and runs
 {"speaker_id": "grant", "start_ms": 1000, "end_ms": 3500, "text": "words spoken", "source": "faster_whisper"}
 ```
 
-`POST /speaker/session/{id}/utterances` returns `utterance_id`. `speaker_id` may be null for unattributed speech; a non-enrolled ID is 404. `GET /speaker/session/{id}/utterances?after_id=0&limit=100` returns rows ordered by `start_ms` plus a `text` field holding compact lines `#id m:ss.s-m:ss.s Name: words`, one per utterance. `next_after_id` is the cursor. `GET /speaker/sessions?limit=20` lists sessions newest first with status and enrolled participants.
+`POST /speaker/session/{id}/utterances` returns `utterance_id` and `label`. Optional numeric fields `similarity` (-1..1), `margin`, `overlap_ratio` (0..1) and `abstain_ratio` (0..1) describe the chunks behind the utterance; `candidates` (list of enrolled IDs) marks an overlap row. `speaker_id` may be null; a non-enrolled ID or candidate is 404.
+
+The server assigns `label` from engineering thresholds (see CALIBRATION.md; these are **not** calibrated probabilities): `overlap` when `overlap_ratio >= 0.3` or candidates are given; `high` when similarity >= 0.55, margin >= 0.25, overlap < 0.1 and abstention < 0.2; `medium` when similarity >= 0.40 and margin >= 0.12; `low` otherwise or when abstention >= 0.5; `unknown` when no stats were supplied.
+
+`GET /speaker/session/{id}/utterances?after_id=0&limit=100&min_label=medium` returns rows ordered by `start_ms` with all numeric fields, `label_kind: similarity_based_uncalibrated`, and a `text` field holding compact lines: `#id m:ss.s-m:ss.s Name [high]: words`, or `#id ... OVERLAP Alice+Bob [overlap 100%]: words` for people talking at once, or `Name [overlap 40%]` for an attributed turn partly talked over. `min_label` (`high|medium|low`) drops rows below that rank; overlap and unknown rows rank lowest. `next_after_id` is the cursor. `GET /speaker/sessions?limit=20` lists sessions newest first.
+
+## MCP over HTTP
+
+`POST http://127.0.0.1:{VOICEPRINT_MCP_PORT:-8082}/mcp` is a stateless MCP Streamable HTTP endpoint (spec 2025-11-25) exposing the same tools as the stdio adapter. Rules: POST only (GET/DELETE 405); any `Origin` header is 403; `VOICEPRINT_MCP_TOKEN`, when set, requires `Authorization: Bearer`; unsupported `MCP-Protocol-Version` is 400; JSON-RPC batches are 400; notifications return 202 with no body; every response is `application/json` (never SSE, which tunnels buffer). `initialize` may be repeated and `tools/list` needs no prior `initialize`, because hosted clients send each request from a different worker. Expose it with `scripts\dev.ps1 tunnel` (cloudflared quick tunnel) and give the printed URL plus token to the hosted agent.
 
 `GET /health` is Java process liveness. It is not a model-readiness claim; worker `/health` is available only after both real models load.

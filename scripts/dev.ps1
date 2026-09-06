@@ -19,16 +19,17 @@ try {
     if ($Mode -eq 'token') { Write-Output $env:VOICEPRINT_MCP_TOKEN; exit 0 }
     if ($Mode -eq 'tunnel') {
         $port = if ($env:VOICEPRINT_MCP_PORT) { $env:VOICEPRINT_MCP_PORT } else { '8082' }
-        $cloudflared = Get-Command cloudflared.exe -ErrorAction SilentlyContinue
+        $found = Get-Command cloudflared.exe -ErrorAction SilentlyContinue
+        $cloudflared = if ($found) { $found.Source } else { $null }
         if (-not $cloudflared) {
             foreach ($candidate in @("$env:ProgramFiles\cloudflared\cloudflared.exe", "${env:ProgramFiles(x86)}\cloudflared\cloudflared.exe", "$env:LOCALAPPDATA\Microsoft\WinGet\Links\cloudflared.exe")) {
-                if (Test-Path -LiteralPath $candidate) { $cloudflared = Get-Item -LiteralPath $candidate; break }
+                if (Test-Path -LiteralPath $candidate) { $cloudflared = $candidate; break }
             }
         }
         if (-not $cloudflared) { throw 'Install cloudflared: winget install --id Cloudflare.cloudflared' }
         Write-Host "MCP bearer token: $env:VOICEPRINT_MCP_TOKEN"
         Write-Host "Exposing http://127.0.0.1:$port/mcp - use https://<name>.trycloudflare.com/mcp as the MCP server_url"
-        & $cloudflared.Source tunnel --url "http://127.0.0.1:$port" @ForwardArgs
+        & $cloudflared tunnel --url "http://127.0.0.1:$port" @ForwardArgs
         exit $LASTEXITCODE
     }
     if ($Mode -eq 'worker') {

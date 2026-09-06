@@ -2,6 +2,10 @@
 
 **Status: mapping, fitting tool, validation contract and rejection tests implemented; the live validation set has not been collected. No release calibration artifact exists.** The two-speaker public fixture test is integration evidence only and is explicitly ineligible for release calibration.
 
+## Interim labels (before calibration)
+
+Until the artifact exists, utterances carry a discrete `label` derived from mean cosine similarity, mean top-two margin, overlap share and abstention share of the chunks in the turn (rule in `SpeakerService.label`, thresholds .55/.25 for high and .40/.12 for medium). These are engineering placeholders chosen next to the existing .25/.05 abstain thresholds; they are exposed as `label_kind: similarity_based_uncalibrated` and must not be presented as probabilities. Replace the rule with the calibrated probability once VP-Live-En-v1 is fitted.
+
 ## What the probability means
 
 For a verified single-speaker window with enrolled candidates, the target is:

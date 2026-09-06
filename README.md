@@ -13,8 +13,10 @@ The real-model integration path runs. **This is not a launch-qualified MVP:** ca
 - Corrections update SQLite profiles for verified single-speaker windows. Reassigning a correction moves its training example; repeated requests do not double count it.
 - Current-speaker queries expire after 1.5 seconds without fresh input. Worker errors return 503 and make current context unavailable.
 - Attributions, profiles and the correction audit survive restart. Raw audio is held only in memory.
-- Turn-level transcript: the live client groups chunks into speaker turns, transcribes each turn locally with faster-whisper (CPU, `base.en`), prints `[Name m:ss.s-m:ss.s] words`, and stores it through `POST .../utterances`.
-- MCP tools: `list_sessions`, `get_transcript` (compact `#id time Name: words` lines with an `after_id` cursor, so an agent pays only for new lines), current speaker, participant statements and exact-segment corrections.
+- Turn-level transcript: the live client groups chunks into speaker turns, transcribes each turn locally with faster-whisper (CPU, `base.en`), prints `[Name m:ss.s-m:ss.s high] words`, and stores it through `POST .../utterances` with similarity, margin, overlap and abstention stats.
+- Uncertainty labels per utterance (`high/medium/low`, similarity-based, not calibrated) and explicit overlap rows: `[OVERLAP Grant+Kyle 0:20.0-0:21.5 overlap] words` when two people talk at once. Agents can ask for `min_label=high` only.
+- MCP tools: `list_sessions`, `get_transcript` (compact `#id time Name [label]: words` lines with an `after_id` cursor, so an agent pays only for new lines), current speaker, participant statements and exact-segment corrections. Available over stdio for local clients and over Streamable HTTP (`:8082/mcp`) for hosted agents.
+- OpenAI Realtime voice agent (`scripts/realtime_openai.py`) with an application-level turn-taking gate (`scripts/turn_gate.py`, design in [TURN_TAKING.md](docs/TURN_TAKING.md)): the provider's VAD only segments audio; the client decides when the agent may speak from speaker labels, overlap and silence.
 
 The API returns `confidence: null`, `confidence_kind: "uncalibrated"`, and `trusted: false` until a validated calibration artifact is loaded. `similarity` is a cosine score, **not a probability**. Text is optional, supplied by an external ASR client; this spike does not transcribe audio.
 
@@ -66,6 +68,7 @@ On macOS/Linux, use `.venv/bin/python` for the same commands.
 
 ```powershell
 mvn test
+.venv\Scripts\python.exe -m unittest discover -s scripts -p "test_*.py" -v
 .venv\Scripts\python.exe -m unittest discover -s worker -p "test_*.py" -v
 .venv\Scripts\python.exe scripts\fetch_test_audio.py
 ```
@@ -103,7 +106,33 @@ Keep the worker and Java API running. `.mcp.json` in the repository root already
 }
 ```
 
-The adapter implements the MCP `2025-11-25` initialization/stdio protocol. It does not expose REST routes as if they were MCP; `initialize`, `notifications/initialized`, `tools/list` and `tools/call` are implemented and tested. It does not implement Streamable HTTP or claim support for newer protocol revisions.
+The adapter implements the MCP `2025-11-25` initialization/stdio protocol; `initialize`, `notifications/initialized`, `tools/list` and `tools/call` are implemented and tested.
+
+### Hosted agents (OpenAI, xAI, Gemini)
+
+The Java process also serves the same tools as a stateless MCP Streamable HTTP endpoint on `http://127.0.0.1:8082/mcp` (`VOICEPRINT_MCP_PORT`). It is protected by a bearer token: `scripts\dev.ps1 token` prints it (generated once into ignored `data\mcp-token.txt`, or set `VOICEPRINT_MCP_TOKEN`). Hosted providers need a public HTTPS URL:
+
+```powershell
+winget install --id Cloudflare.cloudflared --scope user
+scripts\dev.ps1 tunnel
+```
+
+This prints `https://<name>.trycloudflare.com` (new name each run) and the token. Text-only proof with the OpenAI Responses API:
+
+```powershell
+$env:OPENAI_API_KEY = "..."
+.venv\Scripts\python.exe scripts\openai_responses_probe.py https://<name>.trycloudflare.com/mcp
+```
+
+Voice agent in the room (OpenAI Realtime, remote MCP, gated turn-taking):
+
+```powershell
+.venv\Scripts\python.exe scripts\realtime_openai.py --names Grant Kyle --mcp-url https://<name>.trycloudflare.com/mcp --device 1
+```
+
+The agent is named Ava by default (`--agent-name`). It speaks when addressed by name, or after a clean high-label question followed by silence in `balanced` mode; it stays quiet during and just after overlap, and asks who spoke when the last label is low. Space forces a reply, H holds, Q quits. Events go to `data\realtime-events.jsonl`.
+
+Other providers: xAI Responses and Speech-to-Speech accept the same remote MCP server directly. Gemini Live has no remote MCP; bridge its function calls to `POST /mcp` from your backend. Neither is wired up yet.
 
 ## Runtime settings and retention
 
