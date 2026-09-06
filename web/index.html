@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Voiceprint · Room console</title>
+  <link rel="stylesheet" href="/ui/style.css">
+  <script src="/ui/app.js" defer></script>
+</head>
+<body>
+<header><div><span class="eyebrow">LOCAL ROOM CONSOLE</span><h1>Voiceprint</h1></div><span class="pill" id="connection">Disconnected</span></header>
+<main>
+  <section aria-labelledby="connect-title" class="panel">
+    <h2 id="connect-title">Connect on this computer</h2>
+    <form id="connect-form" class="inline">
+      <label>Operator API token <input id="token" type="password" autocomplete="off" required></label>
+      <button type="submit">Connect</button><button type="button" id="disconnect">Disconnect &amp; clear screen</button>
+    </form>
+    <p class="muted">The token identifies the operator. Each participant must give their own written release. Token is held only in this page's memory.</p>
+    <p id="message" role="status" aria-live="polite"></p>
+  </section>
+  <section aria-labelledby="notice-title" class="panel notice">
+    <span class="eyebrow">BEFORE ANY MICROPHONE CAPTURE</span><h2 id="notice-title">Voiceprint collection notice</h2>
+    <p id="configuration" role="status">Loading controller configuration…</p>
+    <address id="controller"></address>
+    <p id="notice-text" class="preserve"></p>
+    <p><strong>Retention</strong> <span id="retention"></span></p>
+    <p id="vendors" class="muted"></p>
+    <p class="muted">Identity is operator assisted: names and email/phone are stored but unverified. This page does not authenticate each signer. A representative-signature flow is not supported. Stop if a participant cannot personally sign.</p>
+  </section>
+  <section class="panel" aria-labelledby="room-title">
+    <h2 id="room-title">Choose or prepare a room</h2>
+    <div class="inline"><label>Known rooms <select id="session-picker"><option value="">Choose a room</option></select></label><button id="refresh" type="button">Refresh</button></div>
+    <form id="open-form" class="inline"><label>Exact room ID <input id="room-id" required pattern="[A-Za-z0-9_-]{1,80}" autocomplete="off"></label><button type="submit">Open room</button></form>
+    <p class="muted">Use the same room ID and participant IDs printed by the runtime. Open its pending room if it already created one.</p>
+    <details><summary>Create a pending room</summary>
+      <form id="create-form">
+        <label>New room ID <input id="new-room-id" required pattern="[A-Za-z0-9_-]{1,80}" autocomplete="off"></label>
+        <div id="new-roster"></div>
+        <div class="inline"><button id="add-person" type="button">Add participant</button><button id="create-room" type="submit" disabled>Create room without audio</button></div>
+        <p class="muted">Include every person within microphone range. The roster is fixed for this capture. If someone enters, stop the runtime before changing the room.</p>
+      </form>
+    </details>
+  </section>
+  <section class="panel" aria-labelledby="release-title">
+    <div class="section-heading"><h2 id="release-title">Participant releases</h2><span id="consent-state" class="pill">No room selected</span></div>
+    <p id="capture-status">Microphone capture requires a current release from everyone.</p>
+    <div id="consents"></div>
+    <p id="enrollment-help" class="preserve"></p>
+    <button id="end-room" type="button" class="danger" disabled>End room &amp; destroy session data</button>
+    <p id="destruction" role="status" aria-live="polite"></p>
+  </section>
+  <section class="panel proof" aria-labelledby="proof-title">
+    <div class="section-heading"><div><span class="eyebrow">SERVER-SIDE EVIDENCE</span><h2 id="proof-title">MCP calls <span id="call-count">0</span></h2></div><span id="feed-state">Waiting</span></div>
+    <p class="muted">These calls were recorded by our MCP server. Agent labels are caller declared, not independently verified identities. Tool success does not prove the agent used its result.</p>
+    <ol id="mcp-calls" class="feed"><li class="empty">No server calls received.</li></ol>
+  </section>
+  <div class="columns">
+    <section class="panel" aria-labelledby="transcript-title"><h2 id="transcript-title">Conversation <span id="utterance-count">0</span></h2><p class="muted">Human labels describe uncalibrated similarity, never a probability. Agent attribution is producer declared.</p><ol id="transcript" class="feed"><li class="empty">No utterances received.</li></ol></section>
+    <aside>
+      <section class="panel"><h2>In the room</h2><ul id="participants"></ul><p id="current">Waiting for attribution</p><label>Cosine similarity <meter id="similarity" min="-1" max="1" value="-1" hidden></meter></label><p class="muted">Similarity is not identity verification.</p><h3>Speaking floor</h3><p id="floor">Unknown</p></section>
+      <section class="panel"><h2>Agents</h2><p id="runtime-state">Runtime unavailable</p><div id="agents"></div></section>
+    </aside>
+  </div>
+</main>
+<footer>API and GUI stay on loopback. The existing MCP tunnel serves hosted tools on port 8082 only.</footer>
+</body>
+</html>

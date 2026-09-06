@@ -1,0 +1,14 @@
+{
+  "session_id": "synthetic_room",
+  "events": [
+    {"event_id": 1, "timestamp_ms": 1780000000000, "type": "utterance", "data": {"utterance_id": 1, "speaker_id": "person_1", "speaker_name": "Synthetic Person", "start_ms": 0, "end_ms": 1500, "label": "high", "similarity": 0.72, "text": "Synthetic test text."}},
+    {"event_id": 2, "timestamp_ms": 1780000001500, "type": "floor", "data": {"action": "granted", "held_by": "agent_1", "server_time_ms": 1780000001500, "expires_at_ms": 1780000026500}},
+    {"event_id": 3, "timestamp_ms": 1780000001600, "type": "mcp_call", "data": {"call_id": 1, "participant_id": "agent_1", "tool": "get_transcript", "arguments": {"session_id": "[redacted]"}, "bytes": 341, "failed": false}},
+    {"event_id": 4, "timestamp_ms": 1780000003000, "type": "utterance", "data": {"utterance_id": 2, "speaker_id": "agent_1", "speaker_name": "Ava", "start_ms": 1500, "end_ms": 3000, "label": "agent", "text": "Ben, this is a synthetic named handoff."}},
+    {"event_id": 5, "timestamp_ms": 1780000003100, "type": "future_event", "data": {"future_field": true}},
+    {"event_id": 6, "timestamp_ms": 1780000004500, "type": "utterance", "data": {"utterance_id": 3, "speaker_id": null, "speaker_name": "Synthetic overlap", "start_ms": 3000, "end_ms": 4500, "label": "overlap", "text": "<img src=x onerror=alert('not HTML')>"}},
+    {"event_id": 7, "timestamp_ms": 1780000004700, "type": "mcp_call", "data": {"call_id": 2, "participant_id": null, "tool": "get_current_speaker", "arguments": null, "bytes": 219, "failed": true}},
+    {"event_id": 8, "timestamp_ms": 1780000006500, "type": "utterance", "data": {"utterance_id": 4, "speaker_id": "agent_2", "speaker_name": "Ben", "start_ms": 4700, "end_ms": 6500, "label": "agent", "text": "Synthetic response attributed to Ben."}}
+  ],
+  "next_after_id": 8
+}
