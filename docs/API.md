@@ -80,4 +80,14 @@ Send this to `POST /speaker/session/{id}/correct`. A segment ID is required inst
 
 Clean corrected embeddings contribute to a rebuilt profile: normalize `0.8 * enrollment_anchor + 0.2 * mean(corrected_examples)`. No corrections means the original anchor. Overlap, silence, changes and windows not verified as one speaker do not train the profile. The label still enters the audit. Repeated identical corrections are idempotent. Relabeling moves one example and rebuilds both affected profiles transactionally.
 
+## Utterances (external transcript)
+
+The API never transcribes audio. A client that groups chunks into turns and runs its own ASR (the shipped `scripts/live.py` uses faster-whisper locally) stores each finished turn:
+
+```json
+{"speaker_id": "grant", "start_ms": 1000, "end_ms": 3500, "text": "words spoken", "source": "faster_whisper"}
+```
+
+`POST /speaker/session/{id}/utterances` returns `utterance_id`. `speaker_id` may be null for unattributed speech; a non-enrolled ID is 404. `GET /speaker/session/{id}/utterances?after_id=0&limit=100` returns rows ordered by `start_ms` plus a `text` field holding compact lines `#id m:ss.s-m:ss.s Name: words`, one per utterance. `next_after_id` is the cursor. `GET /speaker/sessions?limit=20` lists sessions newest first with status and enrolled participants.
+
 `GET /health` is Java process liveness. It is not a model-readiness claim; worker `/health` is available only after both real models load.

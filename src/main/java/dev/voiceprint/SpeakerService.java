@@ -168,6 +168,42 @@ final class SpeakerService {
         ArrayNode rows = store.corrections(session, after, limit);
         return Json.obj().put("session_id", session).put("next_after_id", rows.isEmpty() ? after : rows.get(rows.size() - 1).path("correction_id").asLong()).set("corrections", rows);
     }
+    synchronized ObjectNode sessions(int limit) {
+        return Json.obj().set("sessions", store.sessions(limit));
+    }
+    /** Stores one externally transcribed utterance; the API never transcribes audio itself. */
+    synchronized ObjectNode utter(String session, JsonNode request) {
+        store.session(session);
+        String speaker = null;
+        if (request.has("speaker_id") && !request.get("speaker_id").isNull()) {
+            speaker = Json.id(request, "speaker_id");
+            String s = speaker;
+            if (store.profiles(session).stream().noneMatch(p -> p.id().equals(s))) throw new ApiException(404, "speaker_not_found", "Speaker is not enrolled in this session.");
+        }
+        long start = Json.integer(request, "start_ms", 0, Long.MAX_VALUE / 2), end = Json.integer(request, "end_ms", 0, Long.MAX_VALUE / 2);
+        if (end <= start) throw new ApiException(400, "invalid_input", "end_ms must exceed start_ms.");
+        String text = Json.text(request, "text", 4000);
+        String source = request.has("source") ? Json.text(request, "source", 40) : "client_asr";
+        String who = speaker;
+        return store.transaction(() -> {
+            store.execute("INSERT INTO utterances(session_id,speaker_id,start_ms,end_ms,text,source,created_ms) VALUES(?,?,?,?,?,?,?)", session, who, start, end, text, source, clock.millis());
+            long id; try (var q = store.prepare("SELECT last_insert_rowid()"); var r = q.executeQuery()) { r.next(); id = r.getLong(1); }
+            return Json.obj().put("utterance_id", id).put("session_id", session).put("speaker_id", who).put("start_ms", start).put("end_ms", end).put("stored", true);
+        });
+    }
+    synchronized ObjectNode utterances(String session, long after, int limit) {
+        store.session(session); validatePage(after, limit);
+        ArrayNode rows = store.utterances(session, after, limit);
+        var text = new StringBuilder();
+        for (var row : rows) {
+            String name = row.path("speaker_name").isNull() ? "unknown" : row.path("speaker_name").asText();
+            text.append('#').append(row.path("utterance_id").asLong()).append(' ').append(clockText(row.path("start_ms").asLong())).append('-').append(clockText(row.path("end_ms").asLong()))
+                .append(' ').append(name).append(": ").append(row.path("text").asText()).append('\n');
+        }
+        return Json.obj().put("session_id", session).put("next_after_id", rows.isEmpty() ? after : rows.get(rows.size() - 1).path("utterance_id").asLong())
+            .put("text", text.toString()).set("utterances", rows);
+    }
+    private static String clockText(long ms) { return String.format("%d:%02d.%d", ms / 60000, (ms / 1000) % 60, (ms / 100) % 10); }
     private static void validatePage(long after, int limit) {
         if (after < -1 || limit < 1 || limit > 200) throw new ApiException(400, "invalid_pagination", "Use a cursor >= -1 and limit 1–200.");
     }

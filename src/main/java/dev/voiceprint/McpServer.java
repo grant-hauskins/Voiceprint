@@ -48,7 +48,7 @@ final class McpServer {
                 else if (method.equals("tools/list")) result = Json.obj().set("tools", tools());
                 else if (method.equals("tools/call")) {
                     var params = request.path("params"); String name = Json.text(params, "name", 80);
-                    if (!Set.of("get_current_speaker", "get_participant_statements", "correct_attribution").contains(name)) throw new ApiException(-32602, "protocol", "Unknown tool");
+                    if (!Set.of("list_sessions", "get_transcript", "get_current_speaker", "get_participant_statements", "correct_attribution").contains(name)) throw new ApiException(-32602, "protocol", "Unknown tool");
                     JsonNode arguments = params.path("arguments");
                     try { result = call(client, api, token, name, arguments); }
                     catch (Exception e) {
@@ -62,9 +62,16 @@ final class McpServer {
         }
     }
     private static ObjectNode call(HttpClient client, String base, String token, String tool, JsonNode args) throws Exception {
-        String session = Json.id(args, "session_id"); String path = "/speaker/session/" + session;
-        String body = null;
-        if (tool.equals("get_current_speaker")) path += "/current";
+        String path; String body = null;
+        if (tool.equals("list_sessions")) path = "/speaker/sessions?limit=" + (args.has("limit") ? Json.integer(args, "limit", 1, 200) : 10);
+        else path = "/speaker/session/" + Json.id(args, "session_id");
+        if (tool.equals("list_sessions")) {}
+        else if (tool.equals("get_transcript")) {
+            long after = args.has("after_id") ? Json.integer(args, "after_id", 0, Integer.MAX_VALUE) : 0;
+            long limit = args.has("limit") ? Json.integer(args, "limit", 1, 200) : 100;
+            path += "/utterances?after_id=" + after + "&limit=" + limit;
+        }
+        else if (tool.equals("get_current_speaker")) path += "/current";
         else if (tool.equals("get_participant_statements")) {
             String speaker = Json.id(args, "speaker_id");
             long after = args.has("after_sequence") ? Json.integer(args, "after_sequence", -1, Integer.MAX_VALUE) : -1;
@@ -78,7 +85,25 @@ final class McpServer {
         if (token != null) builder.header("Authorization", "Bearer " + token);
         if (body != null) builder.header("Content-Type", "application/json").POST(HttpRequest.BodyPublishers.ofString(body));
         var response = client.send(builder.build(), HttpResponse.BodyHandlers.ofString());
-        return toolResult(Json.parse(response.body()), response.statusCode() >= 400);
+        JsonNode value = Json.parse(response.body());
+        if (tool.equals("get_transcript") && response.statusCode() < 400) {
+            // Token-cheap: plain lines for the model, cursor kept in structuredContent.
+            String text = value.path("text").asText().strip();
+            // Some clients surface only structuredContent, so the lines live there as well.
+            var compact = Json.obj().put("session_id", value.path("session_id").asText()).put("next_after_id", value.path("next_after_id").asLong()).put("count", value.path("utterances").size())
+                .put("transcript", text.isEmpty() ? "(no utterances yet)" : text);
+            var result = Json.obj().put("isError", false); result.set("structuredContent", compact);
+            result.putArray("content").add(Json.obj().put("type", "text").put("text", text.isEmpty() ? "(no utterances yet)" : text.strip()));
+            return result;
+        }
+        if (tool.equals("list_sessions") && response.statusCode() < 400) {
+            var lines = new StringBuilder();
+            for (var s : value.path("sessions")) lines.append(s.path("session_id").asText()).append(' ').append(s.path("status").asText()).append(' ').append(s.path("elapsed_ms").asLong() / 1000).append("s [").append(s.path("participants").asText()).append("]\n");
+            var result = Json.obj().put("isError", false); result.set("structuredContent", value);
+            result.putArray("content").add(Json.obj().put("type", "text").put("text", lines.isEmpty() ? "(no sessions)" : lines.toString().strip()));
+            return result;
+        }
+        return toolResult(value, response.statusCode() >= 400);
     }
     private static ObjectNode toolResult(JsonNode value, boolean failed) {
         var result = Json.obj().put("isError", failed); result.set("structuredContent", value);
@@ -86,6 +111,14 @@ final class McpServer {
     }
     private static ArrayNode tools() {
         var result = Json.arr();
+        var sessions = tool("list_sessions", "List recent Voiceprint sessions (newest first) with status and enrolled participants. Call first to find a session_id.", true);
+        ((ObjectNode) sessions.path("inputSchema").path("properties")).set("limit", Json.obj().put("type", "integer").put("minimum", 1).put("maximum", 200));
+        result.add(sessions);
+        var transcript = tool("get_transcript", "Get the attributed transcript as compact lines '#id m:ss.s-m:ss.s Name: words'. Pass after_id from the previous call to fetch only new lines.", true, "session_id");
+        ObjectNode tp = (ObjectNode) transcript.path("inputSchema").path("properties");
+        tp.set("after_id", Json.obj().put("type", "integer").put("minimum", 0));
+        tp.set("limit", Json.obj().put("type", "integer").put("minimum", 1).put("maximum", 200));
+        result.add(transcript);
         result.add(tool("get_current_speaker", "Get current speaker, calibrated confidence when available, overlap and uncertainty.", true, "session_id"));
         var statements = tool("get_participant_statements", "Get a participant's statements with timestamps, attribution and confidence; text may be null without an ASR source.", true, "session_id", "speaker_id");
         ObjectNode properties = (ObjectNode) statements.path("inputSchema").path("properties");

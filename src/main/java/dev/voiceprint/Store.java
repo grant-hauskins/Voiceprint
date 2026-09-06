@@ -18,7 +18,7 @@ final class Store implements AutoCloseable {
         try (var s = db.createStatement()) {
             s.execute("PRAGMA foreign_keys=ON"); s.execute("PRAGMA journal_mode=WAL"); s.execute("PRAGMA busy_timeout=3000");
             int version; try (var r = s.executeQuery("PRAGMA user_version")) { version = r.getInt(1); }
-            if (version > 1) throw new IllegalStateException("Database schema is newer than this application");
+            if (version > 2) throw new IllegalStateException("Database schema is newer than this application");
             s.execute("CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,status TEXT NOT NULL,created_ms INTEGER NOT NULL,next_sequence INTEGER NOT NULL DEFAULT 0,elapsed_ms INTEGER NOT NULL DEFAULT 0)");
             s.execute("CREATE TABLE IF NOT EXISTS profiles(session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,id TEXT NOT NULL,name TEXT NOT NULL,model TEXT NOT NULL,anchor TEXT NOT NULL,vector TEXT NOT NULL,PRIMARY KEY(session_id,id))");
             s.execute("CREATE TABLE IF NOT EXISTS segments(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,sequence INTEGER NOT NULL,hash TEXT NOT NULL,speaker_id TEXT,body TEXT NOT NULL,embedding TEXT,eligible INTEGER NOT NULL,UNIQUE(session_id,sequence))");
@@ -26,7 +26,9 @@ final class Store implements AutoCloseable {
             s.execute("CREATE TABLE IF NOT EXISTS corrections(id INTEGER PRIMARY KEY AUTOINCREMENT,session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,segment_id TEXT NOT NULL REFERENCES segments(id) ON DELETE CASCADE,previous_speaker TEXT,actual_speaker TEXT NOT NULL,created_ms INTEGER NOT NULL,profile_updated INTEGER NOT NULL)");
             s.execute("CREATE INDEX IF NOT EXISTS corrections_session ON corrections(session_id,id)");
             s.execute("CREATE TABLE IF NOT EXISTS correction_examples(segment_id TEXT PRIMARY KEY REFERENCES segments(id) ON DELETE CASCADE,session_id TEXT NOT NULL,speaker_id TEXT NOT NULL,embedding TEXT NOT NULL,FOREIGN KEY(session_id,speaker_id) REFERENCES profiles(session_id,id) ON DELETE CASCADE)");
-            s.execute("PRAGMA user_version=1");
+            s.execute("CREATE TABLE IF NOT EXISTS utterances(id INTEGER PRIMARY KEY AUTOINCREMENT,session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,speaker_id TEXT,start_ms INTEGER NOT NULL,end_ms INTEGER NOT NULL,text TEXT NOT NULL,source TEXT NOT NULL,created_ms INTEGER NOT NULL)");
+            s.execute("CREATE INDEX IF NOT EXISTS utterances_session ON utterances(session_id,start_ms,id)");
+            s.execute("PRAGMA user_version=2");
         }
     }
     <T> T transaction(Work<T> work) {
@@ -71,6 +73,21 @@ final class Store implements AutoCloseable {
     ArrayNode transcript(String session, String speaker, long after, int limit) {
         try (var p = prepare("SELECT body FROM segments WHERE session_id=? AND sequence>? AND (? IS NULL OR speaker_id=?) ORDER BY sequence LIMIT ?", session, after, speaker, speaker, limit); var r = p.executeQuery()) {
             var result = Json.arr(); while (r.next()) result.add(Json.parse(r.getString(1))); return result;
+        } catch (SQLException e) { throw new IllegalStateException(e); }
+    }
+    ArrayNode sessions(int limit) {
+        try (var p = prepare("SELECT s.id,s.status,s.created_ms,s.elapsed_ms,(SELECT group_concat(id||'='||name,', ') FROM profiles WHERE session_id=s.id) AS who FROM sessions s ORDER BY s.created_ms DESC LIMIT ?", limit); var r = p.executeQuery()) {
+            var result = Json.arr();
+            while (r.next()) result.add(Json.obj().put("session_id", r.getString(1)).put("status", r.getString(2)).put("created_ms", r.getLong(3)).put("elapsed_ms", r.getLong(4)).put("participants", r.getString(5)));
+            return result;
+        } catch (SQLException e) { throw new IllegalStateException(e); }
+    }
+    ArrayNode utterances(String session, long after, int limit) {
+        try (var p = prepare("SELECT u.id,u.speaker_id,p.name,u.start_ms,u.end_ms,u.text,u.source FROM utterances u LEFT JOIN profiles p ON p.session_id=u.session_id AND p.id=u.speaker_id WHERE u.session_id=? AND u.id>? ORDER BY u.start_ms,u.id LIMIT ?", session, after, limit); var r = p.executeQuery()) {
+            var result = Json.arr();
+            while (r.next()) result.add(Json.obj().put("utterance_id", r.getLong(1)).put("speaker_id", r.getString(2)).put("speaker_name", r.getString(3))
+                .put("start_ms", r.getLong(4)).put("end_ms", r.getLong(5)).put("text", r.getString(6)).put("source", r.getString(7)));
+            return result;
         } catch (SQLException e) { throw new IllegalStateException(e); }
     }
     ArrayNode corrections(String session, long after, int limit) {

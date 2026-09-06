@@ -40,7 +40,7 @@ class TransportTest {
         var lines = output.toString(StandardCharsets.UTF_8).lines().map(Json::parse).toList();
         assertEquals(4, lines.size());
         assertEquals("2025-11-25", lines.get(0).path("result").path("protocolVersion").asText());
-        assertEquals(3, lines.get(1).path("result").path("tools").size());
+        assertEquals(5, lines.get(1).path("result").path("tools").size());
         assertEquals("waiting", lines.get(2).path("result").path("structuredContent").path("status").asText());
         assertTrue(lines.get(3).path("result").path("isError").asBoolean());
     }

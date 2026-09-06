@@ -45,6 +45,7 @@ final class RestServer implements AutoCloseable {
                 body = object;
             }
             if (path.equals("/speaker/session/init") && method.equals("POST")) { respond(exchange, 201, service.init(body)); return; }
+            if (path.equals("/speaker/sessions") && method.equals("GET")) { respond(exchange, 200, service.sessions((int) number(query(exchange.getRequestURI().getRawQuery()), "limit", 20))); return; }
             String[] parts = path.split("/");
             if (parts.length < 4 || !parts[1].equals("speaker") || !parts[2].equals("session")) throw new ApiException(404, "not_found", "Endpoint does not exist.");
             String session = parts[3];
@@ -61,6 +62,8 @@ final class RestServer implements AutoCloseable {
                 case "GET transcript" -> service.transcript(session, query.get("speaker_id"), number(query, "after_sequence", -1), (int) number(query, "limit", 100));
                 case "GET corrections" -> service.corrections(session, number(query, "after_id", 0), (int) number(query, "limit", 100));
                 case "POST correct" -> service.correct(session, body);
+                case "POST utterances" -> service.utter(session, body);
+                case "GET utterances" -> service.utterances(session, number(query, "after_id", 0), (int) number(query, "limit", 100));
                 case "POST end" -> service.end(session);
                 default -> throw new ApiException(404, "not_found", "Endpoint does not exist.");
             };

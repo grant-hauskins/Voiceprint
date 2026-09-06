@@ -13,7 +13,8 @@ The real-model integration path runs. **This is not a launch-qualified MVP:** ca
 - Corrections update SQLite profiles for verified single-speaker windows. Reassigning a correction moves its training example; repeated requests do not double count it.
 - Current-speaker queries expire after 1.5 seconds without fresh input. Worker errors return 503 and make current context unavailable.
 - Attributions, profiles and the correction audit survive restart. Raw audio is held only in memory.
-- MCP tools for current speaker, participant statements and exact-segment corrections.
+- Turn-level transcript: the live client groups chunks into speaker turns, transcribes each turn locally with faster-whisper (CPU, `base.en`), prints `[Name m:ss.s-m:ss.s] words`, and stores it through `POST .../utterances`.
+- MCP tools: `list_sessions`, `get_transcript` (compact `#id time Name: words` lines with an `after_id` cursor, so an agent pays only for new lines), current speaker, participant statements and exact-segment corrections.
 
 The API returns `confidence: null`, `confidence_kind: "uncalibrated"`, and `trusted: false` until a validated calibration artifact is loaded. `similarity` is a cosine score, **not a probability**. Text is optional, supplied by an external ASR client; this spike does not transcribe audio.
 
@@ -51,7 +52,7 @@ Run a shared-microphone conversation in a third terminal:
 .venv\Scripts\python.exe scripts\live.py run --names Grant Kyle --seconds 60 --events data\live-events.jsonl
 ```
 
-Each participant presses Enter and speaks alone for eight seconds. The client then starts the live stream. It prints speaker, confidence availability, uncertainty, latency and segment ID. It stops on audio overflow or sustained inference backlog instead of silently losing samples. Use `--device N` to choose a microphone device. All participants use the same microphone; separate participant streams are not implemented.
+Each participant presses Enter and speaks alone for eight seconds. The client then starts the live stream and prints one line per finished turn, e.g. `[Grant 0:12.5-0:18.0] words`. Add `--verbose` for every 250 ms attribution, `--no-transcribe` to skip ASR, `--model tiny.en` for faster ASR. Print a stored transcript later with `scripts\live.py transcript SESSION_ID`. Replay mode for testing without a microphone: `--enroll-wavs a.wav b.wav --stream-wav conversation.wav` (mono 16 kHz 16-bit WAV). It stops on audio overflow or sustained inference backlog instead of silently losing samples. Use `--device N` to choose a microphone device. All participants use the same microphone; separate participant streams are not implemented.
 
 Apply a correction in another terminal using IDs printed by the client:
 
@@ -88,7 +89,7 @@ See [VALIDATION.md](docs/VALIDATION.md) for measured results and their limits, [
 
 ## MCP
 
-Keep the worker and Java API running. Configure your MCP client to launch:
+Keep the worker and Java API running. `.mcp.json` in the repository root already configures Claude Code for this checkout (project scope; approve it when Claude Code asks). Start `claude` in this directory, then ask for example "list voiceprint sessions and show the transcript of the latest one". For other MCP clients, launch:
 
 ```json
 {

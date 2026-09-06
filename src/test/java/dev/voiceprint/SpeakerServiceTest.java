@@ -118,6 +118,21 @@ class SpeakerServiceTest {
         assertThrows(ApiException.class, () -> service.transcript("test", null, -1, 201));
         service.delete("test"); assertThrows(ApiException.class, () -> service.current("test"));
     }
+    @Test void utterancesStoreExternalTextOrderedByTimeWithCompactLines() {
+        service.init(initRequest("test"));
+        assertEquals(1, service.utter("test", Json.obj().put("speaker_id", "b").put("start_ms", 4000).put("end_ms", 6500).put("text", "second words")).get("utterance_id").asLong());
+        service.utter("test", Json.obj().put("speaker_id", "a").put("start_ms", 1000).put("end_ms", 3500).put("text", "first words"));
+        service.utter("test", Json.obj().putNull("speaker_id").put("start_ms", 7000).put("end_ms", 8000).put("text", "mystery"));
+        assertEquals(404, assertThrows(ApiException.class, () -> service.utter("test", Json.obj().put("speaker_id", "zed").put("start_ms", 0).put("end_ms", 1).put("text", "x"))).status);
+        assertEquals(400, assertThrows(ApiException.class, () -> service.utter("test", Json.obj().put("speaker_id", "a").put("start_ms", 5).put("end_ms", 5).put("text", "x"))).status);
+        var page = service.utterances("test", 0, 100);
+        assertEquals("#2 0:01.0-0:03.5 Alice: first words\n#1 0:04.0-0:06.5 Bob: second words\n#3 0:07.0-0:08.0 unknown: mystery\n", page.get("text").asText());
+        assertEquals(3, page.get("next_after_id").asLong());
+        assertEquals(0, service.utterances("test", 3, 100).get("utterances").size());
+        var sessions = service.sessions(10).get("sessions");
+        assertEquals("test", sessions.get(0).get("session_id").asText());
+        assertEquals("a=Alice, b=Bob", sessions.get(0).get("participants").asText());
+    }
     @Test void malformedAudioAndNonintegralSequenceRejected() {
         service.init(initRequest("test"));
         assertThrows(ApiException.class, () -> service.ingest("test", frame(0).put("audio_base64", "bad")));
