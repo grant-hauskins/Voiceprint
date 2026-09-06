@@ -22,8 +22,13 @@ final class McpHttpServer implements AutoCloseable {
     private final ThreadPoolExecutor executor;
     private final HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(2)).build();
     private final String api, apiToken, mcpToken;
+    private final SpeakerService recorder;
     McpHttpServer(int port, String api, String apiToken, String mcpToken) throws IOException {
+        this(port, api, apiToken, mcpToken, null);
+    }
+    McpHttpServer(int port, String api, String apiToken, String mcpToken, SpeakerService recorder) throws IOException {
         this.api = api; this.apiToken = apiToken; this.mcpToken = mcpToken;
+        this.recorder = recorder;
         server = HttpServer.create(new InetSocketAddress("127.0.0.1", port), 16);
         executor = new ThreadPoolExecutor(4, 4, 0, TimeUnit.SECONDS, new ArrayBlockingQueue<>(32), new ThreadPoolExecutor.AbortPolicy());
         server.setExecutor(executor); server.createContext("/mcp", this::handle);
@@ -60,9 +65,28 @@ final class McpHttpServer implements AutoCloseable {
             int size = response.toString().getBytes(StandardCharsets.UTF_8).length;
             boolean failed = response.has("error") || response.path("result").path("isError").asBoolean(false);
             System.err.println(java.time.LocalTime.now().withNano(0) + " MCP " + rpc + " " + detail + " from " + via + " -> " + (failed ? "error" : "ok") + " " + size + " bytes");
+            if (rpc.equals("tools/call") && recorder != null) {
+                var arguments = message.path("params").path("arguments");
+                recorder.recordMcpCall(via, participantTag(exchange.getRequestURI().getRawQuery()), message.path("params").path("name").asText(),
+                    arguments.isMissingNode() ? Json.obj() : arguments, size, failed);
+            }
             respond(exchange, 200, response);
         } catch (Exception e) { System.err.println("MCP request failed: " + e.getClass().getSimpleName()); respond(exchange, 500, Json.error("internal_error", "Request could not be completed.")); }
         finally { exchange.close(); }
+    }
+    private static String participantTag(String rawQuery) {
+        if (rawQuery == null) return null;
+        String found = null;
+        for (String item : rawQuery.split("&")) {
+            String[] pair = item.split("=", 2);
+            try {
+                if (java.net.URLDecoder.decode(pair[0], StandardCharsets.UTF_8).equals("participant_id")) {
+                    if (found != null || pair.length != 2) return null;
+                    found = java.net.URLDecoder.decode(pair[1], StandardCharsets.UTF_8);
+                }
+            } catch (IllegalArgumentException e) { return null; }
+        }
+        return found != null && found.matches("[A-Za-z0-9_-]{1,80}") ? found : null;
     }
     private static void respond(HttpExchange exchange, int status, ObjectNode body) throws IOException {
         byte[] bytes = body.toString().getBytes(StandardCharsets.UTF_8);

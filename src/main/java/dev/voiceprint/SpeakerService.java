@@ -47,6 +47,7 @@ final class SpeakerService {
             for (int i = 0; i < participants.size(); i++) {
                 var p = participants.get(i); var result = results.get(i); String vector = Store.vectorJson(Audio.normalize(result.embedding()));
                 store.execute("INSERT INTO profiles VALUES(?,?,?,?,?,?)", session, p.get("id").asText(), p.get("name").asText(), result.modelId(), vector, vector);
+                store.execute("INSERT INTO participants VALUES(?,?,?,'human',NULL,?)", session, p.get("id").asText(), p.get("name").asText(), result.modelId());
             }
             return Json.obj().put("session_id", session).put("profiles_created", participants.size()).put("status", "ready")
                 .put("confidence_kind", "uncalibrated").put("chunk_ms", 250).put("context_ms", 1500);
@@ -163,6 +164,127 @@ final class SpeakerService {
         for (var p : store.profiles(session)) profiles.add(Json.obj().put("id", p.id()).put("name", p.name()).put("model_id", p.model()));
         return Json.obj().put("session_id", session).set("participants", profiles);
     }
+    record Registration(boolean created, ObjectNode response) {}
+    synchronized Registration register(String session, JsonNode request) {
+        if (!store.session(session).status().equals("active")) throw new ApiException(409, "session_ended", "This session has ended.");
+        String id = Json.id(request, "id"), name = Json.text(request, "name", 200);
+        if (!"agent".equals(Json.text(request, "kind", 20))) throw new ApiException(400, "invalid_participant", "Register agents here; humans require voice enrollment.");
+        String provider = Json.text(request, "provider", 200), model = Json.text(request, "model", 200);
+        var participant = Json.obj().put("id", id).put("name", name).put("kind", "agent").put("provider", provider).put("model", model);
+        ObjectNode response = Json.obj().put("session_id", session).set("participant", participant);
+        for (var existing : store.participants(session)) {
+            if (!existing.path("id").asText().equals(id)) continue;
+            if (!existing.equals(participant)) throw new ApiException(409, "participant_exists", "Participant ID already has different registration fields.");
+            return new Registration(false, response);
+        }
+        store.transaction(() -> { store.execute("INSERT INTO participants VALUES(?,?,?,'agent',?,?)", session, id, name, provider, model); return null; });
+        return new Registration(true, response);
+    }
+    synchronized ObjectNode participants(String session) {
+        store.session(session);
+        return Json.obj().put("session_id", session).set("participants", store.participants(session));
+    }
+    private static ObjectNode floorData(Store.Lease lease, long now) {
+        var result = Json.obj().put("server_time_ms", now);
+        if (lease == null) return result.putNull("held_by").putNull("expires_at_ms");
+        return result.put("held_by", lease.participant()).put("expires_at_ms", lease.expiresAt());
+    }
+    /** Called only inside a transaction; expiry and its evidence are one durable change. */
+    private Store.Lease activeLease(String session, long now) throws java.sql.SQLException {
+        var lease = store.lease(session);
+        if (lease != null && now >= lease.expiresAt()) {
+            store.execute("DELETE FROM floor WHERE session_id=?", session);
+            store.event(session, now, "floor", floorData(null, now).put("action", "expired"));
+            return null;
+        }
+        return lease;
+    }
+    synchronized ObjectNode claimFloor(String session, JsonNode request) {
+        if (!store.session(session).status().equals("active")) throw new ApiException(409, "session_ended", "This session has ended.");
+        String participant = Json.id(request, "participant_id");
+        if (!store.participant(session, participant).path("kind").asText().equals("agent")) throw new ApiException(400, "invalid_participant", "Only registered agents can claim the floor.");
+        long duration = request.has("lease_ms") ? Json.integer(request, "lease_ms", 1000, 30000) : 15000;
+        ObjectNode result = store.transaction(() -> {
+            long now = clock.millis();
+            var previous = activeLease(session, now);
+            boolean granted = previous == null || previous.participant().equals(participant);
+            var lease = granted ? new Store.Lease(participant, now + duration) : previous;
+            if (granted) {
+                store.execute("INSERT INTO floor VALUES(?,?,?) ON CONFLICT(session_id) DO UPDATE SET participant_id=excluded.participant_id,expires_at_ms=excluded.expires_at_ms", session, participant, lease.expiresAt());
+                store.event(session, now, "floor", floorData(lease, now).put("action", previous == null ? "granted" : "renewed"));
+            }
+            return floorData(lease, now).put("session_id", session).put("granted", granted);
+        });
+        notifyAll();
+        return result;
+    }
+    synchronized ObjectNode floor(String session) {
+        store.session(session);
+        ObjectNode result = store.transaction(() -> {
+            long now = clock.millis();
+            return floorData(activeLease(session, now), now).put("session_id", session);
+        });
+        notifyAll();
+        return result;
+    }
+    synchronized ObjectNode releaseFloor(String session, String participant) {
+        store.session(session);
+        Json.id(Json.obj().put("participant_id", participant), "participant_id");
+        ObjectNode result = store.transaction(() -> {
+            long now = clock.millis();
+            var lease = activeLease(session, now);
+            boolean released = lease != null && lease.participant().equals(participant);
+            if (released) {
+                store.execute("DELETE FROM floor WHERE session_id=?", session);
+                store.event(session, now, "floor", floorData(null, now).put("action", "released"));
+                lease = null;
+            }
+            return floorData(lease, now).put("session_id", session).put("released", released);
+        });
+        notifyAll();
+        return result;
+    }
+    synchronized ObjectNode events(String session, long after, int limit, long waitMs) {
+        if (after < 0 || limit < 1 || limit > 200 || waitMs < 0 || waitMs > 10000)
+            throw new ApiException(400, "invalid_pagination", "Use after_id >= 0, limit 1–200, and wait_ms 0–10000.");
+        long deadline = System.nanoTime() + waitMs * 1_000_000;
+        while (true) {
+            store.session(session);
+            var lease = store.transaction(() -> activeLease(session, clock.millis()));
+            var rows = store.events(session, after, limit);
+            long remaining = (deadline - System.nanoTime()) / 1_000_000;
+            if (!rows.isEmpty() || remaining <= 0 || Thread.currentThread().isInterrupted())
+                return Json.obj().put("session_id", session).put("next_after_id", rows.isEmpty() ? after : rows.get(rows.size() - 1).path("event_id").asLong()).set("events", rows);
+            long pause = lease == null ? remaining : Math.min(remaining, Math.max(1, lease.expiresAt() - clock.millis()));
+            // Object.wait releases the service monitor: audio, floor and MCP writes can proceed.
+            try { wait(Math.max(1, pause)); }
+            catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        }
+    }
+    /** Internal HTTP MCP transport hook; no HTTP write endpoint and no headers or credentials. */
+    synchronized void recordMcpCall(String caller, String participantTag, String tool, JsonNode arguments, int bytes, boolean failed) {
+        String requestedSession = arguments.path("session_id").isTextual() ? arguments.path("session_id").asText() : null;
+        String session = null, participant = null;
+        if (requestedSession != null) {
+            try { store.session(requestedSession); session = requestedSession; }
+            catch (ApiException e) { if (e.status != 404) throw e; }
+        }
+        if (session != null && participantTag != null) {
+            try { if (store.participant(session, participantTag).path("kind").asText().equals("agent")) participant = participantTag; }
+            catch (ApiException e) { if (e.status != 404) throw e; }
+        }
+        String recordedSession = session, recordedParticipant = participant;
+        store.transaction(() -> {
+            long now = clock.millis();
+            store.execute("INSERT INTO mcp_calls(session_id,timestamp_ms,caller_ip,participant_id,tool,arguments,bytes,failed) VALUES(?,?,?,?,?,?,?,?)", recordedSession, now, caller, recordedParticipant, tool, arguments.toString(), bytes, failed);
+            long id = store.lastInsertId();
+            var data = Json.obj().put("call_id", id).put("session_id", recordedSession).put("timestamp_ms", now).put("caller_ip", caller).put("participant_id", recordedParticipant)
+                .put("tool", tool).put("bytes", bytes).put("failed", failed).set("arguments", arguments);
+            if (recordedSession != null) store.event(recordedSession, now, "mcp_call", data);
+            return null;
+        });
+        notifyAll();
+    }
     synchronized ObjectNode corrections(String session, long after, int limit) {
         store.session(session); validatePage(after, limit);
         ArrayNode rows = store.corrections(session, after, limit);
@@ -175,33 +297,38 @@ final class SpeakerService {
     synchronized ObjectNode utter(String session, JsonNode request) {
         store.session(session);
         String speaker = null;
+        boolean agent = false;
         if (request.has("speaker_id") && !request.get("speaker_id").isNull()) {
             speaker = Json.id(request, "speaker_id");
-            String s = speaker;
-            if (store.profiles(session).stream().noneMatch(p -> p.id().equals(s))) throw new ApiException(404, "speaker_not_found", "Speaker is not enrolled in this session.");
+            agent = store.participant(session, speaker).path("kind").asText().equals("agent");
         }
         long start = Json.integer(request, "start_ms", 0, Long.MAX_VALUE / 2), end = Json.integer(request, "end_ms", 0, Long.MAX_VALUE / 2);
         if (end <= start) throw new ApiException(400, "invalid_input", "end_ms must exceed start_ms.");
         String text = Json.text(request, "text", 4000);
         String source = request.has("source") ? Json.text(request, "source", 40) : "client_asr";
-        Double similarity = ratio(request, "similarity", -1, 1), margin = ratio(request, "margin", -1, 2);
-        Double overlapRatio = ratio(request, "overlap_ratio", 0, 1), abstainRatio = ratio(request, "abstain_ratio", 0, 1);
+        if (agent != source.equals("agent")) throw new ApiException(400, "invalid_source", "source=agent requires a registered agent speaker and agent speakers require source=agent.");
+        Double similarity = agent ? null : ratio(request, "similarity", -1, 1), margin = agent ? null : ratio(request, "margin", -1, 2);
+        Double overlapRatio = agent ? null : ratio(request, "overlap_ratio", 0, 1), abstainRatio = agent ? null : ratio(request, "abstain_ratio", 0, 1);
         var candidates = Json.arr();
-        if (request.has("candidates") && request.get("candidates").isArray()) {
+        if (!agent && request.has("candidates") && request.get("candidates").isArray()) {
             var enrolled = store.profiles(session).stream().map(Store.Profile::id).toList();
             for (JsonNode c : request.get("candidates")) {
                 if (!c.isTextual() || !enrolled.contains(c.asText())) throw new ApiException(404, "speaker_not_found", "Candidate is not enrolled in this session.");
                 candidates.add(c.asText());
             }
         }
-        String label = label(speaker, similarity, margin, overlapRatio, abstainRatio, candidates.size());
+        String label = agent ? "agent" : label(speaker, similarity, margin, overlapRatio, abstainRatio, candidates.size());
         String who = speaker;
-        return store.transaction(() -> {
+        ObjectNode result = store.transaction(() -> {
+            long now = clock.millis();
             store.execute("INSERT INTO utterances(session_id,speaker_id,start_ms,end_ms,text,source,created_ms,similarity,margin,overlap_ratio,abstain_ratio,label,candidates) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                session, who, start, end, text, source, clock.millis(), similarity, margin, overlapRatio, abstainRatio, label, candidates.isEmpty() ? null : candidates.toString());
-            long id; try (var q = store.prepare("SELECT last_insert_rowid()"); var r = q.executeQuery()) { r.next(); id = r.getLong(1); }
+                session, who, start, end, text, source, now, similarity, margin, overlapRatio, abstainRatio, label, candidates.isEmpty() ? null : candidates.toString());
+            long id = store.lastInsertId();
+            store.event(session, now, "utterance", store.utterance(session, id));
             return Json.obj().put("utterance_id", id).put("session_id", session).put("speaker_id", who).put("start_ms", start).put("end_ms", end).put("label", label).put("stored", true);
         });
+        notifyAll();
+        return result;
     }
     private static Double ratio(JsonNode n, String key, double min, double max) {
         JsonNode v = n.path(key);
@@ -284,14 +411,23 @@ final class SpeakerService {
 
     synchronized ObjectNode end(String session) {
         store.session(session);
-        store.transaction(() -> { store.execute("UPDATE sessions SET status='ended' WHERE id=?", session); return null; });
+        store.transaction(() -> {
+            long now = clock.millis();
+            if (activeLease(session, now) != null) {
+                store.execute("DELETE FROM floor WHERE session_id=?", session);
+                store.event(session, now, "floor", floorData(null, now).put("action", "released"));
+            }
+            store.execute("UPDATE sessions SET status='ended' WHERE id=?", session); return null;
+        });
         buffers.remove(session); failures.remove(session);
+        notifyAll();
         return Json.obj().put("session_id", session).put("status", "ended");
     }
     synchronized ObjectNode delete(String session) {
         store.session(session);
         store.transaction(() -> { store.execute("DELETE FROM sessions WHERE id=?", session); return null; });
         buffers.remove(session); failures.remove(session);
+        notifyAll();
         return Json.obj().put("session_id", session).put("deleted", true);
     }
     private static String hash(byte[] pcm, String text) {

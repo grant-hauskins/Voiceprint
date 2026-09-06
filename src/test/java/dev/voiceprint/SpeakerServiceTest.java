@@ -118,7 +118,7 @@ class SpeakerServiceTest {
         assertThrows(ApiException.class, () -> service.transcript("test", null, -1, 201));
         service.delete("test"); assertThrows(ApiException.class, () -> service.current("test"));
     }
-    @Test void utterancesStoreExternalTextOrderedByTimeWithCompactLines() {
+    @Test void utterancesStoreExternalTextOrderedByIdWithCompactLines() {
         service.init(initRequest("test"));
         assertEquals(1, service.utter("test", Json.obj().put("speaker_id", "b").put("start_ms", 4000).put("end_ms", 6500).put("text", "second words")).get("utterance_id").asLong());
         service.utter("test", Json.obj().put("speaker_id", "a").put("start_ms", 1000).put("end_ms", 3500).put("text", "first words"));
@@ -126,7 +126,7 @@ class SpeakerServiceTest {
         assertEquals(404, assertThrows(ApiException.class, () -> service.utter("test", Json.obj().put("speaker_id", "zed").put("start_ms", 0).put("end_ms", 1).put("text", "x"))).status);
         assertEquals(400, assertThrows(ApiException.class, () -> service.utter("test", Json.obj().put("speaker_id", "a").put("start_ms", 5).put("end_ms", 5).put("text", "x"))).status);
         var page = service.utterances("test", 0, 100, null);
-        assertEquals("#2 0:01.0-0:03.5 Alice [unknown]: first words\n#1 0:04.0-0:06.5 Bob [unknown]: second words\n#3 0:07.0-0:08.0 unknown [unknown]: mystery\n", page.get("text").asText());
+        assertEquals("#1 0:04.0-0:06.5 Bob [unknown]: second words\n#2 0:01.0-0:03.5 Alice [unknown]: first words\n#3 0:07.0-0:08.0 unknown [unknown]: mystery\n", page.get("text").asText());
         assertEquals(3, page.get("next_after_id").asLong());
         assertEquals(0, service.utterances("test", 3, 100, null).get("utterances").size());
         var sessions = service.sessions(10).get("sessions");
@@ -175,7 +175,7 @@ class SpeakerServiceTest {
         }
         store = new Store(temp.resolve("old.sqlite")); service = new SpeakerService(store, engine, clock);
         assertEquals("#1 0:00.0-0:01.0 Alice [unknown]: legacy\n", service.utterances("old", 0, 100, null).get("text").asText());
-        try (var s = store.db.createStatement(); var r = s.executeQuery("PRAGMA user_version")) { assertEquals(3, r.getInt(1)); }
+        try (var s = store.db.createStatement(); var r = s.executeQuery("PRAGMA user_version")) { assertEquals(4, r.getInt(1)); }
     }
     @Test void malformedAudioAndNonintegralSequenceRejected() {
         service.init(initRequest("test"));
