@@ -118,17 +118,27 @@ async def main(args):
             status["current"] = "speaking"
         else:
             status["current"] = "silence"
-        loop.call_soon_threadsafe(audio_out.put_nowait, pcm)
+        if not muted["now"]:
+            loop.call_soon_threadsafe(audio_out.put_nowait, pcm)
 
     stream = vp.Stream(args.api, session_id, vp.Turns(transcriber.submit, args.verbose), log, on_chunk=on_chunk, verbose=args.verbose)
     player = Player(args.output_device)
     stop = threading.Event()
 
+    muted = {"now": False}
+
     def mic_thread():
+        # Half-duplex: PortAudio has no echo cancellation, so while the agent's audio is playing the shared
+        # microphone is replaced by silence. Voiceprint keeps a continuous timeline (silence chunks) and the
+        # agent's own voice never reaches Voiceprint or OpenAI's input buffer. Human speech during the agent's
+        # reply is lost for that moment; the trade-off is a clean transcript with no self-echo.
         try:
             with vp.Microphone(args.device) as mic:
                 while not stop.is_set():
                     pcm, captured_at = mic.get()
+                    muted["now"] = player.busy()
+                    if muted["now"]:
+                        pcm = b"\x00" * len(pcm)
                     stream.feed(pcm, captured_at)
         except Exception as error:
             print("microphone loop stopped:", error, file=sys.stderr, flush=True)
@@ -227,7 +237,7 @@ async def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--api", default="http://127.0.0.1:8080")
-    parser.add_argument("--mcp-url", required=True, help="public https URL of the Voiceprint MCP endpoint (…/mcp)")
+    parser.add_argument("--mcp-url", required=False, help="public https URL of the Voiceprint MCP endpoint (…/mcp)")
     parser.add_argument("--mcp-token")
     parser.add_argument("--names", nargs="+", required=True, help="human participants to enroll")
     parser.add_argument("--agent-name", default="Ava")
@@ -240,4 +250,9 @@ if __name__ == "__main__":
     parser.add_argument("--voice", default="marin")
     parser.add_argument("--events", type=Path, default=Path("data/realtime-events.jsonl"))
     parser.add_argument("--verbose", action="store_true")
-    asyncio.run(main(parser.parse_args()))
+    parser.add_argument("--list-devices", action="store_true", help="print microphone/speaker indexes and exit")
+    parsed = parser.parse_args()
+    if parsed.list_devices:
+        import sounddevice as sd
+        print(sd.query_devices()); sys.exit(0)
+    asyncio.run(main(parsed))
