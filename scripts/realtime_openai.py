@@ -36,7 +36,8 @@ def instructions(agent_name, session_id, names):
         f"You cannot tell voices apart yourself. Before every reply call get_transcript with session_id \"{session_id}\" "
         "and the after_id you received last time (0 the first time) to learn who said what. "
         "Address people by name. If the latest lines are marked OVERLAP or low, say you are not sure who spoke and ask, "
-        "instead of guessing. Keep every reply under two sentences. Do not narrate tool use."
+        "instead of guessing. Keep every reply under two sentences. Call tools silently: never say that you are checking, "
+        "looking, or pulling anything up; just call get_transcript and then answer."
     )
 
 
@@ -245,7 +246,8 @@ async def main(args):
         input()
         threading.Thread(target=mic_thread, daemon=True).start()
         threading.Thread(target=key_thread, daemon=True).start()
-        responding = {"active": False}
+        responding = {"active": False, "continuations": 0}
+        MAX_CONTINUATIONS = 3   # tool call -> continue -> (tool call -> continue ...) before we give up on a turn
 
         async def sender():
             while not stop.is_set():
@@ -265,7 +267,17 @@ async def main(args):
                     item = event["item"]
                     print(f"  mcp_call {item.get('name')}({item.get('arguments')}) -> {('ERROR ' + str(item.get('error'))) if item.get('error') else 'ok'}", flush=True)
                 elif kind == "response.done":
-                    responding["active"] = False; state.note_agent_spoke()
+                    output = event.get("response", {}).get("output", [])
+                    spoke = any(item.get("type") == "message" for item in output)
+                    called_tool = any(item.get("type") == "mcp_call" for item in output)
+                    if called_tool and not spoke and responding["continuations"] < MAX_CONTINUATIONS:
+                        # Realtime ends the response after a tool call; ask for the follow-up that uses the result.
+                        responding["continuations"] += 1
+                        await ws.send(json.dumps({"type": "response.create"}))
+                    else:
+                        responding["active"] = False; responding["continuations"] = 0
+                        if spoke:
+                            state.note_agent_spoke()
                 elif kind == "error":
                     print("OpenAI error:", event.get("error"), file=sys.stderr, flush=True)
                 if stop.is_set():
@@ -285,7 +297,7 @@ async def main(args):
                 decision = tg.decide(state, time.monotonic(), status["current"], last_end["at"])
                 if decision == "wait":
                     continue
-                responding["active"] = True
+                responding["active"] = True; responding["continuations"] = 0
                 print(f"  [gate: {decision}]", flush=True)
                 # response.instructions would REPLACE the session instructions (and the session id), so the nudge goes
                 # in as a conversation item instead and response.create stays bare.

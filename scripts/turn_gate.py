@@ -79,7 +79,9 @@ def decide(state, now, current_status, last_utterance_end_at):
         return "wait"
     if now - state.last_overlap_at < OVERLAP_HOLD_S:
         return "wait"
-    direct = addressed(last.get("text"), state.agent_names) and now - last["seen_at"] < ADDRESS_WINDOW_S
+    # A direct address counts once: only if it arrived after the agent's last reply.
+    direct = (addressed(last.get("text"), state.agent_names) and now - last["seen_at"] < ADDRESS_WINDOW_S
+              and last["seen_at"] > state.agent_last_spoke_at)
     if now - state.agent_last_spoke_at < AGENT_COOLDOWN_S[state.eagerness] and not direct:
         return "wait"
     silence = (now - last_utterance_end_at) if last_utterance_end_at is not None else 0

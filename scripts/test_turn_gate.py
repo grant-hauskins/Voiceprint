@@ -65,6 +65,14 @@ class GateTest(unittest.TestCase):
         state.manual = None
         self.assertEqual(tg.decide(state, 20, "silence", 16), "speak")   # released within the address window
 
+    def test_direct_address_is_answered_once(self):
+        self.state.note_utterance(utt("Ava, who is here?"), now=10)
+        self.assertEqual(tg.decide(self.state, 10.5, "silence", 10), "speak")
+        self.state.note_agent_spoke(now=13)
+        self.assertEqual(tg.decide(self.state, 14, "silence", 10), "wait")     # same address, already answered
+        self.state.note_utterance(utt("Ava, and Kyle?"), now=15)
+        self.assertEqual(tg.decide(self.state, 15.5, "silence", 15), "speak")  # new address
+
     def test_agent_own_voice_is_ignored(self):
         state = tg.GateState(agent_names=("Ava",), agent_speaker_id="participant_3")
         state.note_utterance(utt("Ava, what time is it?", speaker="participant_3"), now=10)  # its own echo through the mic
