@@ -1,0 +1,134 @@
+package dev.voiceprint;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.*;
+import java.nio.file.*;
+import java.sql.*;
+import java.util.*;
+
+/** One service owns a database. All access is serialized by SpeakerService. */
+final class Store implements AutoCloseable {
+    final Connection db;
+    record Session(String id, String status, long nextSequence, long elapsedMs) {}
+    record Profile(String id, String name, String model, double[] anchor, double[] vector) {}
+    interface Work<T> { T run() throws Exception; }
+    Store(Path path) throws Exception {
+        Path parent = path.toAbsolutePath().getParent(); Files.createDirectories(parent);
+        db = DriverManager.getConnection("jdbc:sqlite:" + path.toAbsolutePath());
+        try (var s = db.createStatement()) {
+            s.execute("PRAGMA foreign_keys=ON"); s.execute("PRAGMA journal_mode=WAL"); s.execute("PRAGMA busy_timeout=3000");
+            int version; try (var r = s.executeQuery("PRAGMA user_version")) { version = r.getInt(1); }
+            if (version > 3) throw new IllegalStateException("Database schema is newer than this application");
+            s.execute("CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,status TEXT NOT NULL,created_ms INTEGER NOT NULL,next_sequence INTEGER NOT NULL DEFAULT 0,elapsed_ms INTEGER NOT NULL DEFAULT 0)");
+            s.execute("CREATE TABLE IF NOT EXISTS profiles(session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,id TEXT NOT NULL,name TEXT NOT NULL,model TEXT NOT NULL,anchor TEXT NOT NULL,vector TEXT NOT NULL,PRIMARY KEY(session_id,id))");
+            s.execute("CREATE TABLE IF NOT EXISTS segments(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,sequence INTEGER NOT NULL,hash TEXT NOT NULL,speaker_id TEXT,body TEXT NOT NULL,embedding TEXT,eligible INTEGER NOT NULL,UNIQUE(session_id,sequence))");
+            s.execute("CREATE INDEX IF NOT EXISTS segments_speaker ON segments(session_id,speaker_id,sequence)");
+            s.execute("CREATE TABLE IF NOT EXISTS corrections(id INTEGER PRIMARY KEY AUTOINCREMENT,session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,segment_id TEXT NOT NULL REFERENCES segments(id) ON DELETE CASCADE,previous_speaker TEXT,actual_speaker TEXT NOT NULL,created_ms INTEGER NOT NULL,profile_updated INTEGER NOT NULL)");
+            s.execute("CREATE INDEX IF NOT EXISTS corrections_session ON corrections(session_id,id)");
+            s.execute("CREATE TABLE IF NOT EXISTS correction_examples(segment_id TEXT PRIMARY KEY REFERENCES segments(id) ON DELETE CASCADE,session_id TEXT NOT NULL,speaker_id TEXT NOT NULL,embedding TEXT NOT NULL,FOREIGN KEY(session_id,speaker_id) REFERENCES profiles(session_id,id) ON DELETE CASCADE)");
+            s.execute("CREATE TABLE IF NOT EXISTS utterances(id INTEGER PRIMARY KEY AUTOINCREMENT,session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,speaker_id TEXT,start_ms INTEGER NOT NULL,end_ms INTEGER NOT NULL,text TEXT NOT NULL,source TEXT NOT NULL,created_ms INTEGER NOT NULL,similarity REAL,margin REAL,overlap_ratio REAL,abstain_ratio REAL,label TEXT NOT NULL DEFAULT 'unknown',candidates TEXT)");
+            s.execute("CREATE INDEX IF NOT EXISTS utterances_session ON utterances(session_id,start_ms,id)");
+            if (version == 2) // v2 databases predate the uncertainty columns.
+                for (String column : new String[] {"similarity REAL", "margin REAL", "overlap_ratio REAL", "abstain_ratio REAL", "label TEXT NOT NULL DEFAULT 'unknown'", "candidates TEXT"})
+                    s.execute("ALTER TABLE utterances ADD COLUMN " + column);
+            s.execute("PRAGMA user_version=3");
+        }
+    }
+    <T> T transaction(Work<T> work) {
+        try {
+            db.setAutoCommit(false);
+            try { T result = work.run(); db.commit(); return result; }
+            catch (Exception e) { db.rollback(); if (e instanceof RuntimeException r) throw r; throw new IllegalStateException(e); }
+            finally { db.setAutoCommit(true); }
+        } catch (SQLException e) { throw new IllegalStateException(e); }
+    }
+    void execute(String sql, Object... args) throws SQLException {
+        try (var p = prepare(sql, args)) { p.executeUpdate(); }
+    }
+    PreparedStatement prepare(String sql, Object... args) throws SQLException {
+        var p = db.prepareStatement(sql);
+        for (int i = 0; i < args.length; i++) p.setObject(i + 1, args[i]);
+        return p;
+    }
+    Session session(String id) {
+        try (var p = prepare("SELECT * FROM sessions WHERE id=?", id); var r = p.executeQuery()) {
+            if (!r.next()) throw new ApiException(404, "session_not_found", "Session does not exist.");
+            return new Session(id, r.getString("status"), r.getLong("next_sequence"), r.getLong("elapsed_ms"));
+        } catch (SQLException e) { throw new IllegalStateException(e); }
+    }
+    List<Profile> profiles(String session) {
+        try (var p = prepare("SELECT * FROM profiles WHERE session_id=? ORDER BY id", session); var r = p.executeQuery()) {
+            var list = new ArrayList<Profile>();
+            while (r.next()) list.add(new Profile(r.getString("id"), r.getString("name"), r.getString("model"), vector(r.getString("anchor")), vector(r.getString("vector"))));
+            return list;
+        } catch (SQLException e) { throw new IllegalStateException(e); }
+    }
+    static double[] vector(String json) {
+        JsonNode node = Json.parse(json); double[] v = new double[node.size()];
+        for (int i = 0; i < v.length; i++) v[i] = node.get(i).asDouble(); return v;
+    }
+    static String vectorJson(double[] v) { return Json.MAPPER.valueToTree(v).toString(); }
+    ObjectNode segment(String session, long sequence) {
+        try (var p = prepare("SELECT body FROM segments WHERE session_id=? AND sequence=?", session, sequence); var r = p.executeQuery()) {
+            return r.next() ? (ObjectNode) Json.parse(r.getString(1)) : null;
+        } catch (SQLException e) { throw new IllegalStateException(e); }
+    }
+    ArrayNode transcript(String session, String speaker, long after, int limit) {
+        try (var p = prepare("SELECT body FROM segments WHERE session_id=? AND sequence>? AND (? IS NULL OR speaker_id=?) ORDER BY sequence LIMIT ?", session, after, speaker, speaker, limit); var r = p.executeQuery()) {
+            var result = Json.arr(); while (r.next()) result.add(Json.parse(r.getString(1))); return result;
+        } catch (SQLException e) { throw new IllegalStateException(e); }
+    }
+    ArrayNode sessions(int limit) {
+        try (var p = prepare("SELECT s.id,s.status,s.created_ms,s.elapsed_ms,(SELECT group_concat(id||'='||name,', ') FROM profiles WHERE session_id=s.id) AS who FROM sessions s ORDER BY s.created_ms DESC LIMIT ?", limit); var r = p.executeQuery()) {
+            var result = Json.arr();
+            while (r.next()) result.add(Json.obj().put("session_id", r.getString(1)).put("status", r.getString(2)).put("created_ms", r.getLong(3)).put("elapsed_ms", r.getLong(4)).put("participants", r.getString(5)));
+            return result;
+        } catch (SQLException e) { throw new IllegalStateException(e); }
+    }
+    ArrayNode utterances(String session, long after, int limit, int minRank) {
+        try (var p = prepare("SELECT u.id,u.speaker_id,p.name,u.start_ms,u.end_ms,u.text,u.source,u.similarity,u.margin,u.overlap_ratio,u.abstain_ratio,u.label,u.candidates FROM utterances u LEFT JOIN profiles p ON p.session_id=u.session_id AND p.id=u.speaker_id WHERE u.session_id=? AND u.id>? AND (CASE u.label WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END)>=? ORDER BY u.start_ms,u.id LIMIT ?", session, after, minRank, limit); var r = p.executeQuery()) {
+            var result = Json.arr();
+            while (r.next()) {
+                var row = Json.obj().put("utterance_id", r.getLong(1)).put("speaker_id", r.getString(2)).put("speaker_name", r.getString(3))
+                    .put("start_ms", r.getLong(4)).put("end_ms", r.getLong(5)).put("text", r.getString(6)).put("source", r.getString(7));
+                for (int i = 8; i <= 11; i++) { double v = r.getDouble(i); if (r.wasNull()) row.putNull(COLUMNS[i - 8]); else row.put(COLUMNS[i - 8], v); }
+                row.put("label", r.getString(12));
+                String candidates = r.getString(13);
+                row.set("candidates", candidates == null ? Json.arr() : Json.parse(candidates));
+                result.add(row);
+            }
+            return result;
+        } catch (SQLException e) { throw new IllegalStateException(e); }
+    }
+    private static final String[] COLUMNS = {"similarity", "margin", "overlap_ratio", "abstain_ratio"};
+    /** Candidate names for an overlap row, e.g. "Alice+Bob". */
+    String names(String session, JsonNode candidates) {
+        var byId = new LinkedHashMap<String, String>();
+        for (Profile p : profiles(session)) byId.put(p.id(), p.name());
+        var parts = new ArrayList<String>();
+        for (JsonNode c : candidates) parts.add(byId.getOrDefault(c.asText(), c.asText()));
+        return String.join("+", parts);
+    }
+    ArrayNode corrections(String session, long after, int limit) {
+        try (var p = prepare("SELECT * FROM corrections WHERE session_id=? AND id>? ORDER BY id LIMIT ?", session, after, limit); var r = p.executeQuery()) {
+            var result = Json.arr();
+            while (r.next()) result.add(Json.obj().put("correction_id", r.getLong("id")).put("segment_id", r.getString("segment_id"))
+                .put("previous_speaker", r.getString("previous_speaker")).put("actual_speaker", r.getString("actual_speaker"))
+                .put("timestamp_ms", r.getLong("created_ms")).put("profile_updated", r.getBoolean("profile_updated")));
+            return result;
+        } catch (SQLException e) { throw new IllegalStateException(e); }
+    }
+    void rebuildProfiles(String session) throws SQLException {
+        for (Profile p : profiles(session)) {
+            double[] sum = new double[p.anchor.length]; int count = 0;
+            try (var q = prepare("SELECT embedding FROM correction_examples WHERE session_id=? AND speaker_id=?", session, p.id); var r = q.executeQuery()) {
+                while (r.next()) { double[] v = vector(r.getString(1)); for (int i = 0; i < sum.length; i++) sum[i] += v[i]; count++; }
+            }
+            // Corrections jointly contribute at most 20%; repeated edits never compound drift.
+            double[] updated = p.anchor.clone();
+            if (count > 0) for (int i = 0; i < updated.length; i++) updated[i] = .8 * updated[i] + .2 * sum[i] / count;
+            execute("UPDATE profiles SET vector=? WHERE session_id=? AND id=?", vectorJson(Audio.normalize(updated)), session, p.id);
+        }
+    }
+    public void close() throws SQLException { db.close(); }
+}

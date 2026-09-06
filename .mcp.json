@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "voiceprint": {
+      "command": "C:\\tools\\jdk-21\\bin\\java.exe",
+      "args": ["-jar", "C:\\Users\\Grant\\git\\Voiceprint\\target\\voiceprint-0.1.0.jar", "mcp"],
+      "env": { "VOICEPRINT_API_URL": "http://127.0.0.1:8080" }
+    }
+  }
+}
