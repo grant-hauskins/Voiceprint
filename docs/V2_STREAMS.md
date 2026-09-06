@@ -8,7 +8,7 @@ Today's live test closed the loop the project exists for: a shared microphone, s
 2. **More than one voice agent**: configure two or more agents (possibly different providers) in the same conversation.
 3. **Everyone in the loop**: when one agent speaks, every other agent sees it as a transcript line, attributed, so agents and humans share one record.
 
-Nothing here is built yet. This document is the contract for tomorrow's sessions.
+Implementation is now in separate `ws/*` worktrees. See [the September 6 handoff](SESSION_HANDOFF_2026-09-06.md) for actual commits, tests and unfinished work, and [the resume checklist](V2_RESUME_CHECKLIST.md) for merge order. [BIPA_V2.md](BIPA_V2.md) supersedes this plan wherever prior consent, disclosure, logging or retention requirements differ; in particular, human replay is not permitted without documented prior permission.
 
 ## The one design decision that makes the rest easy
 

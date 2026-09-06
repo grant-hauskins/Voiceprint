@@ -1,5 +1,7 @@
 # Voiceprint
 
+**Current v2 checkpoint:** see [September 6 handoff](docs/SESSION_HANDOFF_2026-09-06.md) and [resume checklist](docs/V2_RESUME_CHECKLIST.md). Implementation is in separate worktrees and is not yet integrated or live-verified. The [prior-consent and destruction contract](docs/BIPA_V2.md) supersedes older permissive audio/replay instructions for v2.
+
 A working two-speaker middleware spike: **Python owns ML; Java owns the API, session coordination and SQLite persistence.** The two processes communicate over local REST. A thin Java stdio MCP adapter queries the same API.
 
 The real-model integration path runs. **This is not a launch-qualified MVP:** calibrated confidence and live accuracy still require the explicitly defined validation set in [CALIBRATION.md](docs/CALIBRATION.md). No fixture-derived probabilities are presented to agents.
