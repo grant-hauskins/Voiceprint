@@ -12,54 +12,68 @@ import java.util.Set;
 /** A stdio MCP adapter for the 2025-11-25 handshake protocol; the API owns all state. */
 final class McpServer {
     static final String VERSION = "2025-11-25";
+    static final Set<String> VERSIONS = Set.of("2025-03-26", "2025-06-18", "2025-11-25");
+    static final Set<String> TOOLS = Set.of("list_sessions", "get_transcript", "get_current_speaker", "get_participant_statements", "correct_attribution");
+
+    /** Per-connection state for stdio, where the lifecycle handshake is enforced. HTTP is stateless and skips it. */
+    static final class Session { boolean initialized, ready; }
+
     static void run(InputStream input, OutputStream output, String api, String token) throws IOException {
         var reader = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8));
         var writer = new PrintWriter(new OutputStreamWriter(output, StandardCharsets.UTF_8), true);
         var client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(2)).build();
-        boolean initialized = false, ready = false;
+        var session = new Session();
         String line;
         while ((line = readLine(reader)) != null) {
             JsonNode request;
             try { request = Json.parse(line); }
             catch (ApiException e) { writer.println(error(null, -32700, "Invalid JSON")); continue; }
-            JsonNode id = request == null ? null : request.get("id");
-            if (request == null || !request.isObject() || !request.path("jsonrpc").asText().equals("2.0") || !request.path("method").isTextual()
-                || (id != null && !(id.isTextual() || id.isIntegralNumber()))) {
-                writer.println(error(null, -32600, "Invalid request")); continue;
-            }
-            String method = request.get("method").asText();
-            if (id == null) {
-                if (method.equals("notifications/initialized") && initialized) ready = true;
-                continue;
-            }
-            try {
-                ObjectNode result;
-                if (method.equals("initialize")) {
-                    if (initialized) throw new ApiException(-32600, "protocol", "Already initialized");
-                    var params = request.path("params"); Json.text(params, "protocolVersion", 40);
-                    if (!params.path("capabilities").isObject() || !params.path("clientInfo").isObject()) throw new ApiException(-32602, "protocol", "Invalid initialization parameters");
-                    result = Json.obj().put("protocolVersion", VERSION);
-                    result.set("serverInfo", Json.obj().put("name", "voiceprint").put("version", "0.1.0"));
-                    result.set("capabilities", Json.obj().set("tools", Json.obj().put("listChanged", false)));
-                    result.put("instructions", "Use speaker context only when trusted is true. Null confidence is unavailable, not zero. Corrections are human labels; text is supplied by an external transcript source.");
-                    initialized = true;
-                } else if (method.equals("ping")) result = Json.obj();
-                else if (!ready) throw new ApiException(-32002, "protocol", "Complete initialization before calling tools");
-                else if (method.equals("tools/list")) result = Json.obj().set("tools", tools());
-                else if (method.equals("tools/call")) {
-                    var params = request.path("params"); String name = Json.text(params, "name", 80);
-                    if (!Set.of("list_sessions", "get_transcript", "get_current_speaker", "get_participant_statements", "correct_attribution").contains(name)) throw new ApiException(-32602, "protocol", "Unknown tool");
-                    JsonNode arguments = params.path("arguments");
-                    try { result = call(client, api, token, name, arguments); }
-                    catch (Exception e) {
-                        if (e instanceof InterruptedException) Thread.currentThread().interrupt();
-                        String message = e instanceof ApiException ? e.getMessage() : "Voiceprint API is unavailable.";
-                        result = toolResult(Json.error("tool_error", message), true);
-                    }
-                } else throw new ApiException(-32601, "protocol", "Method not found");
-                var response = Json.obj().put("jsonrpc", "2.0"); response.set("id", id); response.set("result", result); writer.println(response);
-            } catch (ApiException e) { writer.println(error(id, e.status < 0 ? e.status : -32602, e.getMessage())); }
+            ObjectNode response = dispatch(request, client, api, token, session);
+            if (response != null) writer.println(response);
         }
+    }
+
+    /**
+     * Handles one JSON-RPC message. Returns null for notifications (nothing to send). With a non-null `session`
+     * the stdio lifecycle is enforced (initialize before tools); with null every request stands alone.
+     */
+    static ObjectNode dispatch(JsonNode request, HttpClient client, String api, String token, Session session) {
+        JsonNode id = request == null ? null : request.get("id");
+        if (request == null || !request.isObject() || !request.path("jsonrpc").asText().equals("2.0") || !request.path("method").isTextual()
+            || (id != null && !(id.isTextual() || id.isIntegralNumber())))
+            return error(null, -32600, "Invalid request");
+        String method = request.get("method").asText();
+        if (id == null) {
+            if (method.equals("notifications/initialized") && session != null && session.initialized) session.ready = true;
+            return null;
+        }
+        try {
+            ObjectNode result;
+            if (method.equals("initialize")) {
+                if (session != null && session.initialized) throw new ApiException(-32600, "protocol", "Already initialized");
+                var params = request.path("params"); String requested = Json.text(params, "protocolVersion", 40);
+                if (!params.path("capabilities").isObject() || !params.path("clientInfo").isObject()) throw new ApiException(-32602, "protocol", "Invalid initialization parameters");
+                result = Json.obj().put("protocolVersion", VERSIONS.contains(requested) ? requested : VERSION);
+                result.set("serverInfo", Json.obj().put("name", "voiceprint").put("version", "0.1.0"));
+                result.set("capabilities", Json.obj().set("tools", Json.obj().put("listChanged", false)));
+                result.put("instructions", "Speaker labels high/medium/low are similarity-based, not calibrated probabilities; OVERLAP lines are people talking at once and cannot be attributed. Null confidence is unavailable, not zero. Corrections are human labels; text comes from an external transcript source.");
+                if (session != null) session.initialized = true;
+            } else if (method.equals("ping")) result = Json.obj();
+            else if (session != null && !session.ready) throw new ApiException(-32002, "protocol", "Complete initialization before calling tools");
+            else if (method.equals("tools/list")) result = Json.obj().set("tools", tools());
+            else if (method.equals("tools/call")) {
+                var params = request.path("params"); String name = Json.text(params, "name", 80);
+                if (!TOOLS.contains(name)) throw new ApiException(-32602, "protocol", "Unknown tool");
+                JsonNode arguments = params.path("arguments");
+                try { result = call(client, api, token, name, arguments); }
+                catch (Exception e) {
+                    if (e instanceof InterruptedException) Thread.currentThread().interrupt();
+                    String message = e instanceof ApiException ? e.getMessage() : "Voiceprint API is unavailable.";
+                    result = toolResult(Json.error("tool_error", message), true);
+                }
+            } else throw new ApiException(-32601, "protocol", "Method not found");
+            var response = Json.obj().put("jsonrpc", "2.0"); response.set("id", id); response.set("result", result); return response;
+        } catch (ApiException e) { return error(id, e.status < 0 ? e.status : -32602, e.getMessage()); }
     }
     private static ObjectNode call(HttpClient client, String base, String token, String tool, JsonNode args) throws Exception {
         String path; String body = null;
@@ -70,6 +84,11 @@ final class McpServer {
             long after = args.has("after_id") ? Json.integer(args, "after_id", 0, Integer.MAX_VALUE) : 0;
             long limit = args.has("limit") ? Json.integer(args, "limit", 1, 200) : 100;
             path += "/utterances?after_id=" + after + "&limit=" + limit;
+            if (args.has("min_label")) {
+                String minLabel = Json.text(args, "min_label", 10);
+                if (!Set.of("high", "medium", "low").contains(minLabel)) throw new ApiException(-32602, "protocol", "min_label must be high, medium or low");
+                path += "&min_label=" + minLabel;
+            }
         }
         else if (tool.equals("get_current_speaker")) path += "/current";
         else if (tool.equals("get_participant_statements")) {
@@ -114,8 +133,9 @@ final class McpServer {
         var sessions = tool("list_sessions", "List recent Voiceprint sessions (newest first) with status and enrolled participants. Call first to find a session_id.", true);
         ((ObjectNode) sessions.path("inputSchema").path("properties")).set("limit", Json.obj().put("type", "integer").put("minimum", 1).put("maximum", 200));
         result.add(sessions);
-        var transcript = tool("get_transcript", "Get the attributed transcript as compact lines '#id m:ss.s-m:ss.s Name: words'. Pass after_id from the previous call to fetch only new lines.", true, "session_id");
+        var transcript = tool("get_transcript", "Get the attributed transcript as compact lines '#id m:ss.s-m:ss.s Name [label]: words'. Labels high/medium/low are similarity-based, NOT calibrated probabilities; 'OVERLAP A+B' lines are people talking over each other and their words cannot be attributed. Pass after_id from the previous call to fetch only new lines; min_label=high returns only trusted lines.", true, "session_id");
         ObjectNode tp = (ObjectNode) transcript.path("inputSchema").path("properties");
+        tp.set("min_label", Json.obj().put("type", "string").put("enum", Json.arr().add("high").add("medium").add("low")));
         tp.set("after_id", Json.obj().put("type", "integer").put("minimum", 0));
         tp.set("limit", Json.obj().put("type", "integer").put("minimum", 1).put("maximum", 200));
         result.add(transcript);
@@ -135,7 +155,7 @@ final class McpServer {
         result.set("inputSchema", schema);
         result.set("annotations", Json.obj().put("readOnlyHint", readOnly).put("destructiveHint", !readOnly).put("openWorldHint", false)); return result;
     }
-    private static ObjectNode error(JsonNode id, int code, String message) {
+    static ObjectNode error(JsonNode id, int code, String message) {
         var result = Json.obj().put("jsonrpc", "2.0"); result.set("id", id == null ? NullNode.instance : id);
         return result.set("error", Json.obj().put("code", code).put("message", message));
     }

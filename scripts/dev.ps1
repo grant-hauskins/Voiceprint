@@ -1,11 +1,36 @@
 param(
-    [ValidateSet('build', 'api', 'worker', 'mcp')][string]$Mode = 'build',
+    [ValidateSet('build', 'api', 'worker', 'mcp', 'tunnel', 'token')][string]$Mode = 'build',
     [Parameter(ValueFromRemainingArguments = $true)][string[]]$ForwardArgs
 )
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 Push-Location -LiteralPath $projectRoot
 try {
+    # Shared secret for the public MCP endpoint. Generated once into ignored data\mcp-token.txt unless VOICEPRINT_MCP_TOKEN is set.
+    $tokenFile = Join-Path $projectRoot 'data\mcp-token.txt'
+    if (-not $env:VOICEPRINT_MCP_TOKEN) {
+        if (-not (Test-Path -LiteralPath $tokenFile)) {
+            New-Item -ItemType Directory -Force (Split-Path -Parent $tokenFile) | Out-Null
+            $bytes = New-Object byte[] 24; [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+            [System.IO.File]::WriteAllText($tokenFile, ([System.BitConverter]::ToString($bytes) -replace '-', '').ToLower())
+        }
+        $env:VOICEPRINT_MCP_TOKEN = (Get-Content -LiteralPath $tokenFile -Raw).Trim()
+    }
+    if ($Mode -eq 'token') { Write-Output $env:VOICEPRINT_MCP_TOKEN; exit 0 }
+    if ($Mode -eq 'tunnel') {
+        $port = if ($env:VOICEPRINT_MCP_PORT) { $env:VOICEPRINT_MCP_PORT } else { '8082' }
+        $cloudflared = Get-Command cloudflared.exe -ErrorAction SilentlyContinue
+        if (-not $cloudflared) {
+            foreach ($candidate in @("$env:ProgramFiles\cloudflared\cloudflared.exe", "${env:ProgramFiles(x86)}\cloudflared\cloudflared.exe", "$env:LOCALAPPDATA\Microsoft\WinGet\Links\cloudflared.exe")) {
+                if (Test-Path -LiteralPath $candidate) { $cloudflared = Get-Item -LiteralPath $candidate; break }
+            }
+        }
+        if (-not $cloudflared) { throw 'Install cloudflared: winget install --id Cloudflare.cloudflared' }
+        Write-Host "MCP bearer token: $env:VOICEPRINT_MCP_TOKEN"
+        Write-Host "Exposing http://127.0.0.1:$port/mcp - use https://<name>.trycloudflare.com/mcp as the MCP server_url"
+        & $cloudflared.Source tunnel --url "http://127.0.0.1:$port" @ForwardArgs
+        exit $LASTEXITCODE
+    }
     if ($Mode -eq 'worker') {
         & (Join-Path $projectRoot '.venv\Scripts\python.exe') worker\worker.py @ForwardArgs
         exit $LASTEXITCODE

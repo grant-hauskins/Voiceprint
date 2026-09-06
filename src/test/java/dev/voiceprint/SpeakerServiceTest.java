@@ -125,13 +125,57 @@ class SpeakerServiceTest {
         service.utter("test", Json.obj().putNull("speaker_id").put("start_ms", 7000).put("end_ms", 8000).put("text", "mystery"));
         assertEquals(404, assertThrows(ApiException.class, () -> service.utter("test", Json.obj().put("speaker_id", "zed").put("start_ms", 0).put("end_ms", 1).put("text", "x"))).status);
         assertEquals(400, assertThrows(ApiException.class, () -> service.utter("test", Json.obj().put("speaker_id", "a").put("start_ms", 5).put("end_ms", 5).put("text", "x"))).status);
-        var page = service.utterances("test", 0, 100);
-        assertEquals("#2 0:01.0-0:03.5 Alice: first words\n#1 0:04.0-0:06.5 Bob: second words\n#3 0:07.0-0:08.0 unknown: mystery\n", page.get("text").asText());
+        var page = service.utterances("test", 0, 100, null);
+        assertEquals("#2 0:01.0-0:03.5 Alice [unknown]: first words\n#1 0:04.0-0:06.5 Bob [unknown]: second words\n#3 0:07.0-0:08.0 unknown [unknown]: mystery\n", page.get("text").asText());
         assertEquals(3, page.get("next_after_id").asLong());
-        assertEquals(0, service.utterances("test", 3, 100).get("utterances").size());
+        assertEquals(0, service.utterances("test", 3, 100, null).get("utterances").size());
         var sessions = service.sessions(10).get("sessions");
         assertEquals("test", sessions.get(0).get("session_id").asText());
         assertEquals("a=Alice, b=Bob", sessions.get(0).get("participants").asText());
+    }
+    @Test void labelsAreSimilarityBasedAndOverlapRowsNameBothCandidates() {
+        assertEquals("high", SpeakerService.label("a", .70, .40, 0.0, 0.0, 0));
+        assertEquals("medium", SpeakerService.label("a", .54, .40, 0.0, 0.0, 0));   // similarity just under the high bar
+        assertEquals("medium", SpeakerService.label("a", .70, .24, 0.0, 0.0, 0));   // margin just under the high bar
+        assertEquals("medium", SpeakerService.label("a", .70, .40, .15, 0.0, 0));   // some overlap in the window
+        assertEquals("low", SpeakerService.label("a", .70, .40, 0.0, .5, 0));       // half the chunks abstained
+        assertEquals("low", SpeakerService.label("a", .30, .06, 0.0, 0.0, 0));
+        assertEquals("overlap", SpeakerService.label("a", .70, .40, .3, 0.0, 0));
+        assertEquals("overlap", SpeakerService.label(null, null, null, null, null, 2));
+        assertEquals("unknown", SpeakerService.label(null, null, null, null, null, 0));
+        assertEquals("unknown", SpeakerService.label("a", null, null, 0.0, 0.0, 0));
+        service.init(initRequest("test"));
+        service.utter("test", Json.obj().put("speaker_id", "a").put("start_ms", 0).put("end_ms", 2000).put("text", "clean").put("similarity", .7).put("margin", .4).put("overlap_ratio", 0).put("abstain_ratio", 0));
+        var overlap = Json.obj().putNull("speaker_id").put("start_ms", 2000).put("end_ms", 3000).put("text", "both").put("overlap_ratio", 1.0);
+        overlap.putArray("candidates").add("a").add("b");
+        service.utter("test", overlap);
+        service.utter("test", Json.obj().put("speaker_id", "b").put("start_ms", 3000).put("end_ms", 5000).put("text", "weak").put("similarity", .3).put("margin", .06).put("overlap_ratio", 0).put("abstain_ratio", .1));
+        assertEquals(404, assertThrows(ApiException.class, () -> service.utter("test", Json.obj().putNull("speaker_id").put("start_ms", 0).put("end_ms", 1).put("text", "x").set("candidates", Json.arr().add("zed")))).status);
+        assertEquals(400, assertThrows(ApiException.class, () -> service.utter("test", Json.obj().put("speaker_id", "a").put("start_ms", 0).put("end_ms", 1).put("text", "x").put("overlap_ratio", 2))).status);
+        service.utter("test", Json.obj().put("speaker_id", "b").put("start_ms", 5000).put("end_ms", 6000).put("text", "partly").put("similarity", .6).put("margin", .3).put("overlap_ratio", .4).put("abstain_ratio", 0));
+        var all = service.utterances("test", 0, 100, null);
+        assertEquals("#1 0:00.0-0:02.0 Alice [high]: clean\n#2 0:02.0-0:03.0 OVERLAP Alice+Bob [overlap 100%]: both\n#3 0:03.0-0:05.0 Bob [low]: weak\n#4 0:05.0-0:06.0 Bob [overlap 40%]: partly\n", all.get("text").asText());
+        assertEquals("similarity_based_uncalibrated", all.get("label_kind").asText());
+        assertEquals(.7, all.get("utterances").get(0).get("similarity").asDouble());
+        assertEquals(2, all.get("utterances").get(1).get("candidates").size());
+        assertEquals("#1 0:00.0-0:02.0 Alice [high]: clean\n", service.utterances("test", 0, 100, "high").get("text").asText());
+        assertEquals(2, service.utterances("test", 0, 100, "low").get("utterances").size());
+        assertEquals(400, assertThrows(ApiException.class, () -> service.utterances("test", 0, 100, "certain")).status);
+    }
+    @Test void version2DatabaseGainsUncertaintyColumns() throws Exception {
+        store.close();
+        try (var db = java.sql.DriverManager.getConnection("jdbc:sqlite:" + temp.resolve("old.sqlite").toAbsolutePath()); var s = db.createStatement()) {
+            s.execute("CREATE TABLE sessions(id TEXT PRIMARY KEY,status TEXT NOT NULL,created_ms INTEGER NOT NULL,next_sequence INTEGER NOT NULL DEFAULT 0,elapsed_ms INTEGER NOT NULL DEFAULT 0)");
+            s.execute("CREATE TABLE profiles(session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,id TEXT NOT NULL,name TEXT NOT NULL,model TEXT NOT NULL,anchor TEXT NOT NULL,vector TEXT NOT NULL,PRIMARY KEY(session_id,id))");
+            s.execute("CREATE TABLE utterances(id INTEGER PRIMARY KEY AUTOINCREMENT,session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,speaker_id TEXT,start_ms INTEGER NOT NULL,end_ms INTEGER NOT NULL,text TEXT NOT NULL,source TEXT NOT NULL,created_ms INTEGER NOT NULL)");
+            s.execute("INSERT INTO sessions(id,status,created_ms) VALUES('old','ended',1)");
+            s.execute("INSERT INTO profiles VALUES('old','a','Alice','m','[1]','[1]')");
+            s.execute("INSERT INTO utterances(session_id,speaker_id,start_ms,end_ms,text,source,created_ms) VALUES('old','a',0,1000,'legacy','x',1)");
+            s.execute("PRAGMA user_version=2");
+        }
+        store = new Store(temp.resolve("old.sqlite")); service = new SpeakerService(store, engine, clock);
+        assertEquals("#1 0:00.0-0:01.0 Alice [unknown]: legacy\n", service.utterances("old", 0, 100, null).get("text").asText());
+        try (var s = store.db.createStatement(); var r = s.executeQuery("PRAGMA user_version")) { assertEquals(3, r.getInt(1)); }
     }
     @Test void malformedAudioAndNonintegralSequenceRejected() {
         service.init(initRequest("test"));

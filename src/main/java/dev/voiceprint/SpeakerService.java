@@ -184,24 +184,69 @@ final class SpeakerService {
         if (end <= start) throw new ApiException(400, "invalid_input", "end_ms must exceed start_ms.");
         String text = Json.text(request, "text", 4000);
         String source = request.has("source") ? Json.text(request, "source", 40) : "client_asr";
+        Double similarity = ratio(request, "similarity", -1, 1), margin = ratio(request, "margin", -1, 2);
+        Double overlapRatio = ratio(request, "overlap_ratio", 0, 1), abstainRatio = ratio(request, "abstain_ratio", 0, 1);
+        var candidates = Json.arr();
+        if (request.has("candidates") && request.get("candidates").isArray()) {
+            var enrolled = store.profiles(session).stream().map(Store.Profile::id).toList();
+            for (JsonNode c : request.get("candidates")) {
+                if (!c.isTextual() || !enrolled.contains(c.asText())) throw new ApiException(404, "speaker_not_found", "Candidate is not enrolled in this session.");
+                candidates.add(c.asText());
+            }
+        }
+        String label = label(speaker, similarity, margin, overlapRatio, abstainRatio, candidates.size());
         String who = speaker;
         return store.transaction(() -> {
-            store.execute("INSERT INTO utterances(session_id,speaker_id,start_ms,end_ms,text,source,created_ms) VALUES(?,?,?,?,?,?,?)", session, who, start, end, text, source, clock.millis());
+            store.execute("INSERT INTO utterances(session_id,speaker_id,start_ms,end_ms,text,source,created_ms,similarity,margin,overlap_ratio,abstain_ratio,label,candidates) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                session, who, start, end, text, source, clock.millis(), similarity, margin, overlapRatio, abstainRatio, label, candidates.isEmpty() ? null : candidates.toString());
             long id; try (var q = store.prepare("SELECT last_insert_rowid()"); var r = q.executeQuery()) { r.next(); id = r.getLong(1); }
-            return Json.obj().put("utterance_id", id).put("session_id", session).put("speaker_id", who).put("start_ms", start).put("end_ms", end).put("stored", true);
+            return Json.obj().put("utterance_id", id).put("session_id", session).put("speaker_id", who).put("start_ms", start).put("end_ms", end).put("label", label).put("stored", true);
         });
     }
-    synchronized ObjectNode utterances(String session, long after, int limit) {
+    private static Double ratio(JsonNode n, String key, double min, double max) {
+        JsonNode v = n.path(key);
+        if (v.isMissingNode() || v.isNull()) return null;
+        if (!v.isNumber() || v.doubleValue() < min || v.doubleValue() > max) throw new ApiException(400, "invalid_input", key + " must be a number in [" + min + "," + max + "].");
+        return v.doubleValue();
+    }
+    /**
+     * Engineering defaults, not calibrated probabilities: derived from cosine similarity and top-two margin,
+     * discounted by overlap and abstention. Replace with the calibration artifact once VP-Live-En-v1 exists.
+     */
+    static String label(String speaker, Double similarity, Double margin, Double overlapRatio, Double abstainRatio, int candidates) {
+        double overlap = overlapRatio == null ? 0 : overlapRatio, abstain = abstainRatio == null ? 0 : abstainRatio;
+        if (overlap >= .3 || (speaker == null && candidates > 0)) return "overlap";
+        if (speaker == null || similarity == null || margin == null) return "unknown";
+        if (abstain >= .5) return "low";
+        if (similarity >= .55 && margin >= .25 && overlap < .1 && abstain < .2) return "high";
+        if (similarity >= .40 && margin >= .12) return "medium";
+        return "low";
+    }
+    static int labelRank(String minLabel) {
+        if (minLabel == null) return 0;
+        return switch (minLabel) { case "high" -> 3; case "medium" -> 2; case "low" -> 1; default -> throw new ApiException(400, "invalid_query", "min_label must be high, medium or low."); };
+    }
+    synchronized ObjectNode utterances(String session, long after, int limit, String minLabel) {
         store.session(session); validatePage(after, limit);
-        ArrayNode rows = store.utterances(session, after, limit);
+        ArrayNode rows = store.utterances(session, after, limit, labelRank(minLabel));
         var text = new StringBuilder();
         for (var row : rows) {
-            String name = row.path("speaker_name").isNull() ? "unknown" : row.path("speaker_name").asText();
+            String label = row.path("label").asText();
+            String who;
+            if (label.equals("overlap")) {
+                double ratio = row.path("overlap_ratio").isNull() ? 1 : row.path("overlap_ratio").asDouble();
+                String tag = " [overlap " + Math.round(ratio * 100) + "%]";
+                if (row.path("candidates").size() > 0) who = "OVERLAP " + store.names(session, row.path("candidates")) + tag;
+                else who = (row.path("speaker_name").isNull() ? "unknown" : row.path("speaker_name").asText()) + tag;  // attributed, but partly talked over
+            } else {
+                String name = row.path("speaker_name").isNull() ? "unknown" : row.path("speaker_name").asText();
+                who = name + " [" + label + "]";
+            }
             text.append('#').append(row.path("utterance_id").asLong()).append(' ').append(clockText(row.path("start_ms").asLong())).append('-').append(clockText(row.path("end_ms").asLong()))
-                .append(' ').append(name).append(": ").append(row.path("text").asText()).append('\n');
+                .append(' ').append(who).append(": ").append(row.path("text").asText()).append('\n');
         }
         return Json.obj().put("session_id", session).put("next_after_id", rows.isEmpty() ? after : rows.get(rows.size() - 1).path("utterance_id").asLong())
-            .put("text", text.toString()).set("utterances", rows);
+            .put("label_kind", "similarity_based_uncalibrated").put("text", text.toString()).set("utterances", rows);
     }
     private static String clockText(long ms) { return String.format("%d:%02d.%d", ms / 60000, (ms / 1000) % 60, (ms / 100) % 10); }
     private static void validatePage(long after, int limit) {

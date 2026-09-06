@@ -63,7 +63,7 @@ final class RestServer implements AutoCloseable {
                 case "GET corrections" -> service.corrections(session, number(query, "after_id", 0), (int) number(query, "limit", 100));
                 case "POST correct" -> service.correct(session, body);
                 case "POST utterances" -> service.utter(session, body);
-                case "GET utterances" -> service.utterances(session, number(query, "after_id", 0), (int) number(query, "limit", 100));
+                case "GET utterances" -> service.utterances(session, number(query, "after_id", 0), (int) number(query, "limit", 100), query.get("min_label"));
                 case "POST end" -> service.end(session);
                 default -> throw new ApiException(404, "not_found", "Endpoint does not exist.");
             };
