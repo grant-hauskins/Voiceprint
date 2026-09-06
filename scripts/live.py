@@ -32,6 +32,7 @@ def run(args):
     transcriber = None if args.no_transcribe else vp.Transcriber(args.api, session, names, args.model, log)
     sink = transcriber.submit if transcriber else (lambda utterance, pcm: print(vp.format_line(dict(utterance, text="(not transcribed)"), names), flush=True))
     stream = vp.Stream(args.api, session, vp.Turns(sink, args.verbose), log, verbose=args.verbose)
+    print("Lines starting with #id are stored and readable by agents via get_transcript under that id.", flush=True)
     if not replay:
         input("Press Enter to start the conversation. Ctrl+C ends the session. ")
     try:

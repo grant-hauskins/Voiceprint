@@ -65,7 +65,9 @@ def format_line(utterance, names):
     else:
         who = names.get(utterance.get("speaker_id"), "unknown")
     label = utterance.get("label")
-    return f"[{who} {span}{' ' + label if label else ''}] {utterance['text']}"
+    # "#id" appears only once the row is stored, i.e. visible to agents via get_transcript under that same id.
+    stored = f"#{utterance['utterance_id']} " if utterance.get("utterance_id") is not None else "   "
+    return f"{stored}[{who} {span}{' ' + label if label else ''}] {utterance['text']}"
 
 
 class Transcriber:

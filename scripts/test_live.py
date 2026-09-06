@@ -89,8 +89,8 @@ class TurnsTest(unittest.TestCase):
 
     def test_format_line(self):
         names = {"participant_1": "Grant", "participant_2": "Kyle"}
-        self.assertEqual(vp.format_line({"speaker_id": "participant_1", "start_ms": 12500, "end_ms": 18000, "text": "hi", "label": "high"}, names), "[Grant 0:12.5-0:18.0 high] hi")
-        self.assertEqual(vp.format_line({"speaker_id": None, "candidates": ["participant_1", "participant_2"], "start_ms": 0, "end_ms": 1500, "text": "x", "label": "overlap"}, names), "[OVERLAP Grant+Kyle 0:00.0-0:01.5 overlap] x")
+        self.assertEqual(vp.format_line({"speaker_id": "participant_1", "start_ms": 12500, "end_ms": 18000, "text": "hi", "label": "high", "utterance_id": 7}, names), "#7 [Grant 0:12.5-0:18.0 high] hi")
+        self.assertEqual(vp.format_line({"speaker_id": None, "candidates": ["participant_1", "participant_2"], "start_ms": 0, "end_ms": 1500, "text": "x", "label": "overlap"}, names), "   [OVERLAP Grant+Kyle 0:00.0-0:01.5 overlap] x")
 
 
 if __name__ == "__main__":

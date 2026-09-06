@@ -244,6 +244,7 @@ async def main(args):
                 break
         await ws.send(json.dumps({"type": "conversation.item.create", "item": {"type": "message", "role": "user", "content": [{"type": "input_text",
             "text": f"(system) This room's Voiceprint session_id is {session_id}. Participants: " + ", ".join(f"{n} (id {pid})" for pid, n in names.items()) + "."}]}}))
+        print("Lines starting with #id are stored and readable by Ava via get_transcript under that id.", flush=True)
         print("Press Enter to start the conversation; SPACE = one reply now, H = hold/release (mutes and cuts off), C = cancel current reply, Q = quit.", flush=True)
         input()
         threading.Thread(target=mic_thread, daemon=True).start()
