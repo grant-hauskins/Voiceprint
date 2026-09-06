@@ -33,10 +33,12 @@ def instructions(agent_name, session_id, names):
     people = ", ".join(f"{n} (id {pid})" for pid, n in names.items())
     return (
         f"You are {agent_name}, one participant in a spoken group conversation with {people}. "
-        f"You cannot tell voices apart yourself. Before every reply call get_transcript with session_id \"{session_id}\" "
-        "and the after_id you received last time (0 the first time) to learn who said what. "
-        "Address people by name. If the latest lines are marked OVERLAP or low, say you are not sure who spoke and ask, "
-        "instead of guessing. Keep every reply under two sentences. Call tools silently: never say that you are checking, "
+        f"You cannot tell voices apart yourself; the get_transcript tool (session_id \"{session_id}\") tells you who said what, "
+        "with a label per line: high and medium mean the name is reliable, low means unsure, OVERLAP means two people at once. "
+        "Before every reply call get_transcript with the after_id from your last call (0 the first time). "
+        "'Who is in the room' means the enrolled people listed above; the transcript lines carry their names. "
+        "Judge only by the newest lines; older OVERLAP or low lines are history. If the newest line is low or OVERLAP, ask who spoke. "
+        "Address people by name. Keep every reply under two sentences. Call tools silently: never say that you are checking, "
         "looking, or pulling anything up; just call get_transcript and then answer."
     )
 
@@ -301,9 +303,16 @@ async def main(args):
                 print(f"  [gate: {decision}]", flush=True)
                 # response.instructions would REPLACE the session instructions (and the session id), so the nudge goes
                 # in as a conversation item instead and response.create stays bare.
-                note = f"(system) Voiceprint session_id is {session_id}. Call get_transcript with after_id from your last call before replying."
+                roster = ", ".join(names.values())
+                last = state.history[-1] if state.history else None
+                who = names.get(last.get("speaker_id"), "unknown") if last else "unknown"
+                note = (f"(system) Voiceprint session_id is {session_id}. People in this room: {roster}. "
+                        f"The most recent line was spoken by {who} (label {last.get('label') if last else 'none'}). "
+                        "Call get_transcript with after_id from your last call, then answer that person by name. "
+                        "Only the newest line's label matters; earlier OVERLAP or low lines are history, not a reason to refuse. "
+                        "Labels high and medium are reliable enough to name the speaker.")
                 if decision == "clarify":
-                    note += " The latest attribution is uncertain: ask who just spoke instead of answering."
+                    note += " The newest line's attribution is uncertain: ask who just spoke instead of answering."
                 await ws.send(json.dumps({"type": "conversation.item.create", "item": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": note}]}}))
                 await ws.send(json.dumps({"type": "response.create"}))
 
