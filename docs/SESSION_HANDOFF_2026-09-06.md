@@ -4,6 +4,19 @@
 
 This document records the stopping point requested by Grant. It supersedes the older documents' statements that v2 has not started or that PR #1 still needs merging. Existing v1 live evidence remains historical evidence; it does not verify the new consent gates or two-agent runtime.
 
+## Integration checkpoint (later on 2026-09-06)
+
+Branch `v2-integration` merges `ws/api` (`fb10324`), `ws/gui` (`a0b10c0`), `ws/agent` (`b70618a`) and `ws/eval` (`2f7272f`, the scorer/fixture/EVENTS commit) onto `main` `9ecdabb`. File ownership was disjoint, so every merge was conflict-free. Two follow-up commits: the launcher credential change (`b80ed34`) and a one-request runtime fix (`56a687b`) that sends the local `Origin` when `prepare_room` creates a pending room; without it the merged API answered `403 origin_rejected` and no live run could start. No consent gate was weakened.
+
+Evidence obtained on the integration tree, all with synthetic people and no provider, tunnel or microphone:
+
+- Java 35, scripts 61 (27 runtime, 15 live/turn-gate, 19 scorer), worker 13, web 4 including the opt-in headless Chrome smoke; `agent_runtime.py --check-config` passes. Zero skipped.
+- A loopback HTTP driver against the built jar plus the real worker on isolated ports (18080/18082/18091, scratch database) passed 58 checks with vendor review flags off and 59 with them on: public notice; room creation only from the exact local Origin; challenge/release negatives (wrong name, not accepted, tampered hash, tampered or replayed nonce, participant outside roster); one unsigned human blocks the room and enrollment; effective scopes stay false without every disclosure and both review flags; enrollment requires the matching `X-Voiceprint-Session`; live chunks, sequence gaps, human and agent utterances, agent registration, floor contention and release, ordered events; hosted MCP requires the bearer token, rejects any Origin, hides undisclosed rooms, returns lines for a fully disclosed room, and persists a proof row for both allowed and denied calls; revoke stops audio, reads and re-signing; local-only destruction verifies `sqlite_session_graph`, while hosted egress leaves `vendor_deletion_evidence` pending with `verified:false` and sanitized failure messages. Enrollment audio was the public SpeechBrain fixtures under `data/fixtures`, not participant recordings.
+- The real GUI served from that API in a browser created a room, signed both releases through the challenge flow, showed the room active with the enrollment prompt, and after Withdraw showed `destroyed` with verified local destruction.
+- One transient `ConnectionResetError` occurred during the first hosted-mode run and did not recur in two reruns; not diagnosed.
+
+Still not done: no runtime-against-API run with a provider (needs Grant's key and real releases); no two-agent live session; dedicated Java negative/fault tests for the privacy boundary remain unwritten beyond the HTTP driver above; direct OpenAI audio possible-egress accounting is present as a pending vendor item on hosted rooms but has not been reviewed against the runtime's actual send path; the runtime control port 8090 default is currently occupied on Grant's machine by an unrelated Wondershare notifier bound to `0.0.0.0`, so pass `--control-port` or stop that process before a live run.
+
 ## Decisions to preserve
 
 - Grant owns the product. Second agent: **Ben**, configured with `cedar`; Ava uses `marin`. One shared microphone, one runtime, separate agent state and a server-owned floor. The utterances table remains the conversation bus.
