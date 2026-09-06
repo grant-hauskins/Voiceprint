@@ -26,7 +26,7 @@ class GateState:
     agent_speaker_id: str = None             # Voiceprint id of the agent's own enrolled voice, if any
     agent_last_spoke_at: float = -1e9
     last_overlap_at: float = -1e9
-    manual: str = None                       # "speak" or "hold" from a key press; consumed once
+    manual: str = None                       # "speak": one reply now (consumed once). "hold": sticky mute until released.
     history: list = field(default_factory=list)   # recent utterances (dicts), newest last
 
     def note_utterance(self, utterance, now=None):
@@ -66,8 +66,7 @@ def decide(state, now, current_status, last_utterance_end_at):
     last_utterance_end_at: monotonic time the most recent human utterance finished (None if none yet).
     """
     if state.manual == "hold":
-        state.manual = None
-        return "wait"
+        return "wait"                        # sticky: stays until the user releases it
     if state.manual == "speak":
         state.manual = None
         return "speak"

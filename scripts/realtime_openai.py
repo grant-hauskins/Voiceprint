@@ -9,7 +9,7 @@ Usage (PowerShell), with the worker, API and `scripts\\dev.ps1 tunnel` already r
   $env:OPENAI_API_KEY = "..."
   .venv\\Scripts\\python.exe scripts\\realtime_openai.py --names Grant Kyle --mcp-url https://<name>.trycloudflare.com/mcp --device 1
 
-Keys while running: SPACE = let the agent speak now, H = hold (skip the next opportunity), Q = quit.
+Keys while running: SPACE = one reply now, H = hold/release (sticky mute; also cuts off a reply), C = cancel current reply, Q = quit.
 """
 import argparse
 import asyncio
@@ -188,6 +188,8 @@ async def main(args):
             print("microphone loop stopped:", error, file=sys.stderr, flush=True)
             stop.set()
 
+    cancel = {"now": False}
+
     def key_thread():
         try:
             import msvcrt
@@ -197,9 +199,14 @@ async def main(args):
             if msvcrt.kbhit():
                 ch = msvcrt.getwch().lower()
                 if ch == " ":
-                    state.manual = "speak"; print("  [manual: speak]", flush=True)
+                    state.manual = "speak"; print("  [manual: speak once]", flush=True)
                 elif ch == "h":
-                    state.manual = "hold"; print("  [manual: hold]", flush=True)
+                    if state.manual == "hold":
+                        state.manual = None; print("  [manual: hold released]", flush=True)
+                    else:
+                        state.manual = "hold"; cancel["now"] = True; print("  [manual: HOLD - agent muted until H again or SPACE]", flush=True)
+                elif ch == "c":
+                    cancel["now"] = True; print("  [manual: cancel current reply]", flush=True)
                 elif ch == "q":
                     stop.set()
             time.sleep(0.05)
@@ -232,7 +239,7 @@ async def main(args):
                 td = event["session"].get("audio", {}).get("input", {}).get("turn_detection") or {}
                 print(f"Realtime session configured: model={event['session'].get('model')} tools=voiceprint(mcp) vad={td.get('type')} auto_response={td.get('create_response')}", flush=True)
                 break
-        print("Press Enter to start the conversation; SPACE = speak now, H = hold, Q = quit.", flush=True)
+        print("Press Enter to start the conversation; SPACE = one reply now, H = hold/release (mutes and cuts off), C = cancel current reply, Q = quit.", flush=True)
         input()
         threading.Thread(target=mic_thread, daemon=True).start()
         threading.Thread(target=key_thread, daemon=True).start()
@@ -265,6 +272,12 @@ async def main(args):
         async def gate_loop():
             while not stop.is_set():
                 await asyncio.sleep(0.2)
+                if cancel["now"]:
+                    cancel["now"] = False
+                    if responding["active"]:
+                        await ws.send(json.dumps({"type": "response.cancel"}))
+                    player.flush(); responding["active"] = False
+                    continue
                 if responding["active"] or player.busy():
                     continue
                 decision = tg.decide(state, time.monotonic(), status["current"], last_end["at"])
