@@ -207,7 +207,7 @@ async def main(args):
     headers = {"Authorization": "Bearer " + key}
     async with websockets.connect(f"{REALTIME_URL}?model={args.realtime_model}", additional_headers=headers, max_size=None) as ws:
         tool = {"type": "mcp", "server_label": "voiceprint", "server_url": args.mcp_url, "allowed_tools": ["get_transcript", "get_current_speaker"],
-                "require_approval": "never", "server_description": "Who said what in this room, with confidence labels."}
+                "require_approval": "never"}   # Realtime rejects server_description (Responses accepts it)
         if mcp_token:
             tool["authorization"] = mcp_token
         await ws.send(json.dumps({"type": "session.update", "session": {
