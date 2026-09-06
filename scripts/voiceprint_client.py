@@ -118,6 +118,10 @@ def api(base, path, body=None):
         headers["Authorization"] = "Bearer " + bearer
     if path == "/speaker/session/init" and body:
         headers["X-Voiceprint-Session"] = body["session_id"]
+    if path == "/privacy/rooms" and body is not None:
+        # The API accepts pending-room creation only from its exact local origin; the runtime
+        # is that local operator process. Releases are still signed only by each person in the GUI.
+        headers["Origin"] = base
     data = None if body is None else json.dumps(body).encode()
     request = urllib.request.Request(base + path, data, headers, method="POST" if body is not None else "GET")
     try:
