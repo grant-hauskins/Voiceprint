@@ -56,21 +56,39 @@ final class McpHttpServer implements AutoCloseable {
             try { message = Json.parse(new String(bytes, StandardCharsets.UTF_8)); }
             catch (ApiException e) { respond(exchange, 400, McpServer.error(null, -32700, "Invalid JSON")); return; }
             if (message == null || !message.isObject()) { respond(exchange, 400, McpServer.error(null, -32600, "Expected a single JSON-RPC object; batches are not supported.")); return; }
-            ObjectNode response = McpServer.dispatch(message, client, api, apiToken, null);
+            boolean toolCall = message.path("method").asText().equals("tools/call") && message.has("id");
+            String tool = message.path("params").path("name").asText();
+            JsonNode arguments = message.path("params").path("arguments");
+            if (arguments.isMissingNode()) arguments = Json.obj();
+            ObjectNode response;
+            int status = 200;
+            try {
+                if (toolCall) {
+                    if (recorder == null) throw new ApiException(403, "privacy_gate_unavailable", "Hosted disclosure requires the authoritative privacy gate.");
+                    recorder.authorizeHosted(tool, arguments);
+                }
+                response = McpServer.dispatch(message, client, api, apiToken, null, true);
+            } catch (ApiException e) { response = McpServer.error(message.get("id"), -32003, e.getMessage()); status = 403; }
             if (response == null) { exchange.sendResponseHeaders(202, -1); return; }
             // Independent evidence that a hosted agent used the tool: written by this process, not reported by the agent.
             String rpc = message.path("method").asText();
             String via = Optional.ofNullable(headers.getFirst("Cf-Connecting-Ip")).orElse(exchange.getRemoteAddress().getAddress().getHostAddress());
-            String detail = rpc.equals("tools/call") ? message.path("params").path("name").asText() + " " + message.path("params").path("arguments").toString() : "";
-            int size = response.toString().getBytes(StandardCharsets.UTF_8).length;
-            boolean failed = response.has("error") || response.path("result").path("isError").asBoolean(false);
-            System.err.println(java.time.LocalTime.now().withNano(0) + " MCP " + rpc + " " + detail + " from " + via + " -> " + (failed ? "error" : "ok") + " " + size + " bytes");
-            if (rpc.equals("tools/call") && recorder != null) {
-                var arguments = message.path("params").path("arguments");
-                recorder.recordMcpCall(via, participantTag(exchange.getRequestURI().getRawQuery()), message.path("params").path("name").asText(),
-                    arguments.isMissingNode() ? Json.obj() : arguments, size, failed);
+            if (!via.matches("[0-9a-fA-F:.]{1,64}")) via = exchange.getRemoteAddress().getAddress().getHostAddress();
+            String safeTool = McpServer.TOOLS.contains(tool) ? tool : "unknown_tool";
+            String detail = rpc.equals("tools/call") ? safeTool + " " + SpeakerService.safeMcpArguments(arguments) : "";
+            if (!Set.of("tools/call", "tools/list", "initialize", "ping").contains(rpc)) rpc = "unsupported_method";
+            // Recheck after tool execution and hold the operation barrier until the response is sent.
+            synchronized (recorder == null ? this : recorder) {
+                if (toolCall && status == 200) {
+                    try { recorder.authorizeHosted(tool, arguments); }
+                    catch (ApiException e) { response = McpServer.error(message.get("id"), -32003, e.getMessage()); status = 403; }
+                }
+                int size = response.toString().getBytes(StandardCharsets.UTF_8).length;
+                boolean failed = response.has("error") || response.path("result").path("isError").asBoolean(false);
+                System.err.println(java.time.LocalTime.now().withNano(0) + " MCP " + rpc + " " + detail + " from " + via + " -> " + (failed ? "error" : "ok") + " " + size + " bytes");
+                if (toolCall && recorder != null) recorder.recordMcpCall(via, participantTag(exchange.getRequestURI().getRawQuery()), safeTool, arguments, size, failed);
+                respond(exchange, status, response);
             }
-            respond(exchange, 200, response);
         } catch (Exception e) { System.err.println("MCP request failed: " + e.getClass().getSimpleName()); respond(exchange, 500, Json.error("internal_error", "Request could not be completed.")); }
         finally { exchange.close(); }
     }

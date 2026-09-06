@@ -24,8 +24,8 @@ class V2ContractTest {
     @BeforeEach void setup() throws Exception {
         store = new Store(temp.resolve("room.sqlite"));
         clock = new SpeakerServiceTest.MutableClock();
-        service = new SpeakerService(store, new SpeakerServiceTest.FakeEngine(), clock);
-        service.init(SpeakerServiceTest.initRequest("room"));
+        service = new SpeakerService(store, new SpeakerServiceTest.FakeEngine(), clock, PrivacyTestSupport.POLICY);
+        PrivacyTestSupport.init(service, SpeakerServiceTest.initRequest("room"));
     }
     @AfterEach void close() throws Exception { store.close(); client.close(); }
     static ObjectNode agent(String id, String name) {
@@ -58,7 +58,7 @@ class V2ContractTest {
             assertEquals(400, assertThrows(ApiException.class, () -> service.register("room", agent("ben", "Ben").put(field, " "))).status);
             assertEquals(400, assertThrows(ApiException.class, () -> service.register("room", agent("ben", "Ben").put(field, "x".repeat(201)))).status);
         }
-        assertEquals(404, assertThrows(ApiException.class, () -> service.register("missing", agent("ava", "Ava"))).status);
+        assertEquals(403, assertThrows(ApiException.class, () -> service.register("missing", agent("ava", "Ava"))).status);
         var participants = service.participants("room").path("participants");
         assertEquals(List.of("a", "ava", "b"), new ArrayList<JsonNode>() {{ participants.forEach(this::add); }}.stream().map(p -> p.path("id").asText()).toList());
         assertEquals("human", participants.get(0).path("kind").asText());
@@ -70,17 +70,17 @@ class V2ContractTest {
         for (int i = 0; i < 6; i++) service.ingest("room", Json.obj().put("sequence", i).put("audio_base64", SpeakerServiceTest.AUDIO));
         assertEquals(2, service.current("room").path("candidates").size());
         service.end("room");
-        assertEquals(409, assertThrows(ApiException.class, () -> service.register("room", agent("ben", "Ben"))).status);
+        assertEquals(403, assertThrows(ApiException.class, () -> service.register("room", agent("ben", "Ben"))).status);
     }
 
     @Test void restRegistrationReturns201Then200() throws Exception {
-        try (var api = new RestServer(service, 0, null)) {
+        try (var api = new RestServer(service, 0, "test-secret")) {
             api.start(); String base = "http://127.0.0.1:" + api.port();
-            assertEquals(201, request(base, "POST", "/speaker/session/room/participants", agent("ava", "Ava"), null, null).statusCode());
-            var retry = request(base, "POST", "/speaker/session/room/participants", agent("ava", "Ava"), null, null);
+            assertEquals(201, request(base, "POST", "/speaker/session/room/participants", agent("ava", "Ava"), "test-secret", null).statusCode());
+            var retry = request(base, "POST", "/speaker/session/room/participants", agent("ava", "Ava"), "test-secret", null);
             assertEquals(200, retry.statusCode());
             assertEquals(agent("ava", "Ava"), Json.parse(retry.body()).path("participant"));
-            assertEquals(3, Json.parse(request(base, "GET", "/speaker/session/room/participants", null, null, null).body()).path("participants").size());
+            assertEquals(3, Json.parse(request(base, "GET", "/speaker/session/room/participants", null, "test-secret", null).body()).path("participants").size());
         }
     }
 
@@ -130,19 +130,20 @@ class V2ContractTest {
         clock.now += 500;
         assertEquals(clock.now + 1000, service.claimFloor("room", claim("ava", 1000)).path("expires_at_ms").asLong());
         store.close(); store = new Store(temp.resolve("room.sqlite"));
-        service = new SpeakerService(store, new SpeakerServiceTest.FakeEngine(), clock);
+        service = new SpeakerService(store, new SpeakerServiceTest.FakeEngine(), clock, PrivacyTestSupport.POLICY);
         assertEquals("ava", service.floor("room").path("held_by").asText());
         clock.now += 1000;
         assertTrue(service.floor("room").path("held_by").isNull());
         assertTrue(service.floor("room").path("expires_at_ms").isNull());
         assertFalse(service.releaseFloor("room", "ava").path("released").asBoolean());
         assertTrue(service.claimFloor("room", claim("ben", 1000)).path("granted").asBoolean());
-        service.end("room");
-        assertTrue(service.floor("room").path("held_by").isNull());
-        assertEquals(409, assertThrows(ApiException.class, () -> service.claimFloor("room", claim("ava", 1000))).status);
         var actions = new ArrayList<String>();
         for (var event : service.events("room", 0, 100, 0).path("events")) actions.add(event.path("data").path("action").asText());
-        assertEquals(List.of("granted", "renewed", "expired", "granted", "released"), actions);
+        assertEquals(List.of("granted", "renewed", "expired", "granted"), actions);
+        service.end("room");
+        assertEquals(403, assertThrows(ApiException.class, () -> service.floor("room")).status);
+        assertEquals(403, assertThrows(ApiException.class, () -> service.claimFloor("room", claim("ava", 1000))).status);
+        service.sweepPrivacy(); assertEquals(0, count("floor"));
     }
 
     @Test void simultaneousFloorClaimsHaveExactlyOneWinner() throws Exception {
@@ -200,18 +201,18 @@ class V2ContractTest {
     }
 
     @Test void longPollDoesNotStarveAudioAndWakesOnCommittedEvent() throws Exception {
-        try (var api = new RestServer(service, 0, null)) {
+        try (var api = new RestServer(service, 0, "test-secret")) {
             api.start(); String base = "http://127.0.0.1:" + api.port();
             var polls = new ArrayList<CompletableFuture<HttpResponse<String>>>();
-            for (int i = 0; i < 8; i++) polls.add(client.sendAsync(HttpRequest.newBuilder(URI.create(base + "/speaker/session/room/events?wait_ms=5000")).build(), HttpResponse.BodyHandlers.ofString()));
+            for (int i = 0; i < 8; i++) polls.add(client.sendAsync(HttpRequest.newBuilder(URI.create(base + "/speaker/session/room/events?wait_ms=5000")).header("Authorization", "Bearer test-secret").build(), HttpResponse.BodyHandlers.ofString()));
             Thread.sleep(150);
             assertTrue(polls.stream().noneMatch(CompletableFuture::isDone));
-            var audio = request(base, "POST", "/speaker/session/room/audio", Json.obj().put("sequence", 0).put("audio_base64", SpeakerServiceTest.AUDIO), null, null);
+            var audio = request(base, "POST", "/speaker/session/room/audio", Json.obj().put("sequence", 0).put("audio_base64", SpeakerServiceTest.AUDIO), "test-secret", null);
             assertEquals(200, audio.statusCode());
             assertEquals("buffering", Json.parse(audio.body()).path("status").asText());
             service.utter("room", utterance("a", 0, "wake every poll"));
             for (var poll : polls) assertEquals("wake every poll", Json.parse(poll.get(2, TimeUnit.SECONDS).body()).path("events").get(0).path("data").path("text").asText());
-            var empty = request(base, "GET", "/speaker/session/room/events?after_id=1&wait_ms=30", null, null, null);
+            var empty = request(base, "GET", "/speaker/session/room/events?after_id=1&wait_ms=30", null, "test-secret", null);
             assertEquals(1, Json.parse(empty.body()).path("next_after_id").asLong());
             assertTrue(Json.parse(empty.body()).path("events").isEmpty());
         }
@@ -226,24 +227,26 @@ class V2ContractTest {
         var beforeTranscript = service.transcript("room", null, -1, 100);
         var beforeCorrections = service.corrections("room", 0, 100);
         var beforeUtterances = service.utterances("room", 0, 100, null);
-        for (String table : List.of("floor", "events", "mcp_calls", "participants")) store.execute("DROP TABLE " + table);
+        for (String table : List.of("destruction_items", "destruction_jobs", "consent_challenges", "consent_audit", "biometric_consents", "privacy_rooms", "floor", "events", "mcp_calls", "participants")) store.execute("DROP TABLE " + table);
         store.execute("PRAGMA user_version=3");
-        store.close(); store = new Store(temp.resolve("room.sqlite")); service = new SpeakerService(store, new SpeakerServiceTest.FakeEngine(), clock);
-        assertEquals(2, service.participants("room").path("participants").size());
-        assertEquals(beforeTranscript, service.transcript("room", null, -1, 100));
-        assertEquals(beforeCorrections, service.corrections("room", 0, 100));
-        assertEquals(beforeUtterances, service.utterances("room", 0, 100, null));
+        store.close(); store = new Store(temp.resolve("room.sqlite")); service = new SpeakerService(store, new SpeakerServiceTest.FakeEngine(), clock, PrivacyTestSupport.POLICY);
+        assertEquals(2, store.participants("room").size());
+        assertEquals(beforeTranscript.path("transcript"), store.transcript("room", null, -1, 100));
+        assertEquals(beforeCorrections.path("corrections"), store.corrections("room", 0, 100));
+        assertEquals(beforeUtterances.path("utterances"), store.utterances("room", 0, 100, 0));
+        assertEquals("legacy_blocked", service.consentStatus("room").path("state").asText());
+        assertEquals(403, assertThrows(ApiException.class, () -> service.participants("room")).status);
         for (int i = 0; i < 2; i++) {
             assertArrayEquals(beforeProfiles.get(i).anchor(), store.profiles("room").get(i).anchor());
             assertArrayEquals(beforeProfiles.get(i).vector(), store.profiles("room").get(i).vector());
         }
-        var events = service.events("room", 0, 100, 0).path("events");
+        var events = store.events("room", 0, 100);
         assertEquals(2, events.size());
         assertEquals(1, events.get(0).path("data").path("utterance_id").asLong());
         assertEquals(2, events.get(1).path("data").path("utterance_id").asLong());
         store.close(); store = new Store(temp.resolve("room.sqlite"));
         assertEquals(2, count("events"));
-        try (var p = store.prepare("PRAGMA user_version"); var r = p.executeQuery()) { assertEquals(4, r.getInt(1)); }
+        try (var p = store.prepare("PRAGMA user_version"); var r = p.executeQuery()) { assertEquals(5, r.getInt(1)); }
     }
 
     @Test void deletingSessionCascadesAllRoomDataAndEventIdsNeverRepeat() throws Exception {
@@ -252,9 +255,10 @@ class V2ContractTest {
         service.recordMcpCall("127.0.0.1", "ava", "get_transcript", Json.obj().put("session_id", "missing"), 10, true);
         long last = service.events("room", 0, 100, 0).path("next_after_id").asLong();
         service.delete("room");
+        service.sweepPrivacy();
         for (String table : List.of("profiles", "participants", "utterances", "floor", "events")) assertEquals(0, count(table));
         assertEquals(1, count("mcp_calls"));
-        service.init(SpeakerServiceTest.initRequest("room2")); service.utter("room2", utterance("a", 0, "new session"));
+        PrivacyTestSupport.init(service, SpeakerServiceTest.initRequest("room2")); service.utter("room2", utterance("a", 0, "new session"));
         assertTrue(service.events("room2", 0, 100, 0).path("events").get(0).path("event_id").asLong() > last);
     }
 

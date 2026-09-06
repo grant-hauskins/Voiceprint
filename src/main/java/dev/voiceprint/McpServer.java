@@ -39,6 +39,9 @@ final class McpServer {
      * the stdio lifecycle is enforced (initialize before tools); with null every request stands alone.
      */
     static ObjectNode dispatch(JsonNode request, HttpClient client, String api, String token, Session session) {
+        return dispatch(request, client, api, token, session, false);
+    }
+    static ObjectNode dispatch(JsonNode request, HttpClient client, String api, String token, Session session, boolean hosted) {
         JsonNode id = request == null ? null : request.get("id");
         if (request == null || !request.isObject() || !request.path("jsonrpc").asText().equals("2.0") || !request.path("method").isTextual()
             || (id != null && !(id.isTextual() || id.isIntegralNumber())))
@@ -66,7 +69,7 @@ final class McpServer {
                 var params = request.path("params"); String name = Json.text(params, "name", 80);
                 if (!TOOLS.contains(name)) throw new ApiException(-32602, "protocol", "Unknown tool");
                 JsonNode arguments = params.path("arguments");
-                try { result = call(client, api, token, name, arguments); }
+                try { result = call(client, api, token, name, arguments, hosted); }
                 catch (Exception e) {
                     if (e instanceof InterruptedException) Thread.currentThread().interrupt();
                     String message = e instanceof ApiException ? e.getMessage() : "Voiceprint API is unavailable.";
@@ -78,7 +81,7 @@ final class McpServer {
             var response = Json.obj().put("jsonrpc", "2.0"); response.set("id", id); response.set("result", result); return response;
         } catch (ApiException e) { return error(id, e.status < 0 ? e.status : -32602, e.getMessage()); }
     }
-    private static ObjectNode call(HttpClient client, String base, String token, String tool, JsonNode args) throws Exception {
+    private static ObjectNode call(HttpClient client, String base, String token, String tool, JsonNode args, boolean hosted) throws Exception {
         String path; String body = null;
         if (tool.equals("list_sessions")) path = "/speaker/sessions?limit=" + (args.has("limit") ? Json.integer(args, "limit", 1, 200) : 10);
         else path = "/speaker/session/" + Json.id(args, "session_id");
@@ -105,6 +108,7 @@ final class McpServer {
         }
         var builder = HttpRequest.newBuilder(URI.create(base + path)).timeout(Duration.ofSeconds(10));
         if (token != null) builder.header("Authorization", "Bearer " + token);
+        if (hosted) builder.header("X-Voiceprint-Hosted-MCP", "true");
         if (body != null) builder.header("Content-Type", "application/json").POST(HttpRequest.BodyPublishers.ofString(body));
         var response = client.send(builder.build(), HttpResponse.BodyHandlers.ofString());
         JsonNode value = Json.parse(response.body());

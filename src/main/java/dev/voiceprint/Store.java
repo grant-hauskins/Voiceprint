@@ -18,8 +18,9 @@ final class Store implements AutoCloseable {
         db = DriverManager.getConnection("jdbc:sqlite:" + path.toAbsolutePath());
         try (var s = db.createStatement()) {
             s.execute("PRAGMA foreign_keys=ON"); s.execute("PRAGMA journal_mode=WAL"); s.execute("PRAGMA busy_timeout=3000");
+            s.execute("PRAGMA secure_delete=ON");
             int version; try (var r = s.executeQuery("PRAGMA user_version")) { version = r.getInt(1); }
-            if (version > 4) throw new IllegalStateException("Database schema is newer than this application");
+            if (version > 5) throw new IllegalStateException("Database schema is newer than this application");
             s.execute("CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,status TEXT NOT NULL,created_ms INTEGER NOT NULL,next_sequence INTEGER NOT NULL DEFAULT 0,elapsed_ms INTEGER NOT NULL DEFAULT 0)");
             s.execute("CREATE TABLE IF NOT EXISTS profiles(session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,id TEXT NOT NULL,name TEXT NOT NULL,model TEXT NOT NULL,anchor TEXT NOT NULL,vector TEXT NOT NULL,PRIMARY KEY(session_id,id))");
             s.execute("CREATE TABLE IF NOT EXISTS segments(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,sequence INTEGER NOT NULL,hash TEXT NOT NULL,speaker_id TEXT,body TEXT NOT NULL,embedding TEXT,eligible INTEGER NOT NULL,UNIQUE(session_id,sequence))");
@@ -54,6 +55,22 @@ final class Store implements AutoCloseable {
                         while (r.next()) event(r.getString("session_id"), r.getLong("created_ms"), "utterance", utteranceRow(r));
                     }
                     s.execute("PRAGMA user_version=4");
+                    db.commit();
+                } catch (Exception e) { db.rollback(); throw e; }
+                finally { db.setAutoCommit(true); }
+            }
+            if (version < 5) {
+                db.setAutoCommit(false);
+                try {
+                    s.execute("CREATE TABLE privacy_rooms(session_id TEXT PRIMARY KEY,purpose_id TEXT NOT NULL,roster_version INTEGER NOT NULL DEFAULT 1,state TEXT NOT NULL CHECK(state IN ('pending','active','revoked','destroying','destroyed','legacy_blocked')),created_ms INTEGER NOT NULL,last_interaction_ms INTEGER NOT NULL,purpose_completed_ms INTEGER,retention_deadline_ms INTEGER NOT NULL,policy_version TEXT NOT NULL,hosted_disclosed INTEGER NOT NULL DEFAULT 0 CHECK(hosted_disclosed IN(0,1)))");
+                    s.execute("CREATE TABLE biometric_consents(consent_id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES privacy_rooms(session_id),participant_id TEXT NOT NULL,subject_name TEXT NOT NULL,bipa_consent_granted INTEGER NOT NULL DEFAULT 0 CHECK(bipa_consent_granted IN(0,1)),consent_timestamp INTEGER,consent_method_version TEXT,notice_sha256 TEXT,signature_text TEXT,identity_method TEXT,subject_contact TEXT,operator_identity TEXT,opening_audio_sha256 TEXT,disclosure_scopes TEXT NOT NULL DEFAULT '[]',revoked_at_ms INTEGER,notice_text TEXT,last_interaction_ms INTEGER,retention_deadline_ms INTEGER,CHECK(bipa_consent_granted=0 OR (consent_timestamp IS NOT NULL AND consent_method_version IS NOT NULL AND notice_sha256 IS NOT NULL AND signature_text IS NOT NULL AND identity_method IS NOT NULL)),UNIQUE(session_id,participant_id))");
+                    s.execute("CREATE TABLE consent_challenges(nonce_sha256 TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES privacy_rooms(session_id),participant_id TEXT NOT NULL,notice_sha256 TEXT NOT NULL,expires_at_ms INTEGER NOT NULL,consumed INTEGER NOT NULL DEFAULT 0 CHECK(consumed IN(0,1)))");
+                    s.execute("CREATE TABLE consent_audit(id INTEGER PRIMARY KEY AUTOINCREMENT,session_id TEXT NOT NULL,participant_id TEXT,timestamp_ms INTEGER NOT NULL,action TEXT NOT NULL,detail TEXT NOT NULL)");
+                    s.execute("CREATE TABLE destruction_jobs(job_id INTEGER PRIMARY KEY AUTOINCREMENT,session_id TEXT NOT NULL UNIQUE REFERENCES privacy_rooms(session_id),state TEXT NOT NULL,created_ms INTEGER NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,lease_until_ms INTEGER,last_error TEXT)");
+                    s.execute("CREATE TABLE destruction_items(job_id INTEGER NOT NULL REFERENCES destruction_jobs(job_id),destination TEXT NOT NULL,state TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,receipt TEXT,last_error TEXT,PRIMARY KEY(job_id,destination))");
+                    // Unknown old data is preserved but never silently authorized or auto-purged.
+                    s.execute("INSERT INTO privacy_rooms(session_id,purpose_id,state,created_ms,last_interaction_ms,retention_deadline_ms,policy_version) SELECT id,'legacy_unknown','legacy_blocked',created_ms,created_ms,created_ms,'legacy_unknown' FROM sessions");
+                    s.execute("PRAGMA user_version=5");
                     db.commit();
                 } catch (Exception e) { db.rollback(); throw e; }
                 finally { db.setAutoCommit(true); }

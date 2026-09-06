@@ -18,7 +18,7 @@ class SpeakerServiceTest {
     static final String OPENING = Base64.getEncoder().encodeToString(new byte[160000]);
     @BeforeEach void setup() throws Exception {
         store = new Store(temp.resolve("test.sqlite")); engine = new FakeEngine(); clock = new MutableClock();
-        service = new SpeakerService(store, engine, clock);
+        service = new SpeakerService(store, engine, clock, PrivacyTestSupport.POLICY);
     }
     @AfterEach void close() throws Exception { store.close(); }
     static ObjectNode initRequest(String id) {
@@ -30,22 +30,22 @@ class SpeakerServiceTest {
     ObjectNode frame(int sequence) { return Json.obj().put("sequence", sequence).put("audio_base64", AUDIO); }
     ObjectNode warmup() { ObjectNode n = null; for (int i = 0; i < 6; i++) { n = service.ingest("test", frame(i)); clock.now += 250; } return n; }
     @Test void enrollmentIsAtomicAndCreatesDistinctProfiles() {
-        assertEquals(2, service.init(initRequest("test")).get("profiles_created").asInt());
+        assertEquals(2, PrivacyTestSupport.init(service, initRequest("test")).get("profiles_created").asInt());
         assertEquals(2, service.profiles("test").get("participants").size());
-        assertEquals(409, assertThrows(ApiException.class, () -> service.init(initRequest("test"))).status);
+        assertEquals(409, assertThrows(ApiException.class, () -> PrivacyTestSupport.init(service, initRequest("test"))).status);
     }
     @Test void failedEnrollmentDoesNotLeavePartialSession() {
         engine.failEnrollmentAt = 2;
-        assertThrows(ApiException.class, () -> service.init(initRequest("test")));
+        assertThrows(ApiException.class, () -> PrivacyTestSupport.init(service, initRequest("test")));
         assertEquals(404, assertThrows(ApiException.class, () -> service.profiles("test")).status);
     }
     @Test void duplicateParticipantsRejectedBeforeInference() {
         var n = initRequest("test"); ((ObjectNode) n.get("participants").get(1)).put("id", "a");
-        assertEquals(400, assertThrows(ApiException.class, () -> service.init(n)).status);
+        assertEquals(400, assertThrows(ApiException.class, () -> PrivacyTestSupport.init(service, n)).status);
         assertEquals(0, engine.enrollments);
     }
     @Test void buffersThenAttributesWithoutInventingProbability() {
-        service.init(initRequest("test"));
+        PrivacyTestSupport.init(service, initRequest("test"));
         var result = warmup();
         assertEquals("a", result.get("speaker_id").asText());
         assertTrue(result.get("confidence").isNull()); assertTrue(result.get("uncertain").asBoolean());
@@ -53,27 +53,27 @@ class SpeakerServiceTest {
         assertEquals(1250, result.get("start_ms").asInt()); assertEquals(0, result.get("context_start_ms").asInt());
     }
     @Test void sequenceRetriesAreIdempotentAndGapsRejected() {
-        service.init(initRequest("test")); var original = warmup();
+        PrivacyTestSupport.init(service, initRequest("test")); var original = warmup();
         assertEquals(original.toString(), service.ingest("test", frame(5)).toString()); assertEquals(1, engine.calls);
         assertEquals(409, assertThrows(ApiException.class, () -> service.ingest("test", frame(8))).status);
         assertEquals(409, assertThrows(ApiException.class, () -> service.ingest("test", frame(5).put("text", "changed"))).status);
     }
     @Test void failureIsNotLowConfidenceAndCanRetryWithoutLosingAudio() {
-        service.init(initRequest("test")); warmup(); engine.fail = true;
+        PrivacyTestSupport.init(service, initRequest("test")); warmup(); engine.fail = true;
         assertEquals(503, assertThrows(ApiException.class, () -> service.ingest("test", frame(6))).status);
         assertEquals("inference_error", service.current("test").get("status").asText());
         assertTrue(service.current("test").get("speaker_id").isNull());
         engine.fail = false; assertEquals(6, service.ingest("test", frame(6)).get("sequence").asInt());
     }
     @Test void staleAndEndedSessionsNeverReportCurrentSpeaker() {
-        service.init(initRequest("test")); warmup(); clock.now += 2000;
+        PrivacyTestSupport.init(service, initRequest("test")); warmup(); clock.now += 2000;
         assertEquals("stale", service.current("test").get("status").asText());
         assertEquals("buffering", service.ingest("test", frame(6)).get("status").asText());
-        service.end("test"); assertEquals("ended", service.current("test").get("status").asText());
+        service.end("test"); assertEquals(403, assertThrows(ApiException.class, () -> service.current("test")).status);
         assertThrows(ApiException.class, () -> service.ingest("test", frame(7)));
     }
     @Test void correctionChangesPersistedProfileAndFutureMatchWithoutDoubleCounting() {
-        service.init(initRequest("test")); engine.vector = new double[]{.8, .6}; var original = warmup();
+        PrivacyTestSupport.init(service, initRequest("test")); engine.vector = new double[]{.8, .6}; var original = warmup();
         double[] before = store.profiles("test").get(1).vector().clone();
         var correction = Json.obj().put("segment_id", original.get("segment_id").asText()).put("actual_speaker", "b");
         assertTrue(service.correct("test", correction).get("profile_updated").asBoolean());
@@ -86,7 +86,7 @@ class SpeakerServiceTest {
         assertArrayEquals(before, store.profiles("test").get(1).vector(), 1e-10);
     }
     @Test void overlapAbstainsAndCannotContaminateProfile() {
-        service.init(initRequest("test")); engine.overlap = "detected"; var result = warmup();
+        PrivacyTestSupport.init(service, initRequest("test")); engine.overlap = "detected"; var result = warmup();
         assertEquals("overlap", result.get("status").asText()); assertTrue(result.get("speaker_id").isNull());
         assertEquals(2, result.get("candidates").size());
         double[] before = store.profiles("test").get(1).vector().clone();
@@ -95,13 +95,13 @@ class SpeakerServiceTest {
         assertArrayEquals(before, store.profiles("test").get(1).vector());
     }
     @Test void silenceAndSpeakerChangeDoNotGuessIdentity() {
-        service.init(initRequest("test")); engine.speech = false;
+        PrivacyTestSupport.init(service, initRequest("test")); engine.speech = false;
         assertEquals("silence", warmup().get("status").asText());
         engine.speech = true; engine.change = true;
         assertTrue(service.ingest("test", frame(6)).get("speaker_id").isNull());
     }
     @Test void calibrationThresholdAndHumanCorrectionDoNotReuseOldProbability() {
-        service.init(initRequest("test")); engine.probability = .59;
+        PrivacyTestSupport.init(service, initRequest("test")); engine.probability = .59;
         assertTrue(warmup().get("uncertain").asBoolean()); engine.probability = .94;
         var result = service.ingest("test", frame(6)); assertTrue(result.get("trusted").asBoolean());
         var response = service.correct("test", Json.obj().put("segment_id", result.get("segment_id").asText()).put("actual_speaker", "b"));
@@ -109,9 +109,9 @@ class SpeakerServiceTest {
         assertEquals(.94, response.path("attribution").get("original_confidence").asDouble());
     }
     @Test void persistenceAndScopedQueriesSurviveRestart() throws Exception {
-        service.init(initRequest("test")); var result = warmup();
+        PrivacyTestSupport.init(service, initRequest("test")); var result = warmup();
         service.correct("test", Json.obj().put("segment_id", result.get("segment_id").asText()).put("actual_speaker", "b"));
-        store.close(); store = new Store(temp.resolve("test.sqlite")); service = new SpeakerService(store, engine, clock);
+        store.close(); store = new Store(temp.resolve("test.sqlite")); service = new SpeakerService(store, engine, clock, PrivacyTestSupport.POLICY);
         assertEquals(1, service.transcript("test", "b", -1, 100).get("transcript").size());
         assertEquals(1, service.corrections("test", 0, 100).get("corrections").size());
         assertEquals("buffering", service.ingest("test", frame(6)).get("status").asText());
@@ -119,7 +119,7 @@ class SpeakerServiceTest {
         service.delete("test"); assertThrows(ApiException.class, () -> service.current("test"));
     }
     @Test void utterancesStoreExternalTextOrderedByIdWithCompactLines() {
-        service.init(initRequest("test"));
+        PrivacyTestSupport.init(service, initRequest("test"));
         assertEquals(1, service.utter("test", Json.obj().put("speaker_id", "b").put("start_ms", 4000).put("end_ms", 6500).put("text", "second words")).get("utterance_id").asLong());
         service.utter("test", Json.obj().put("speaker_id", "a").put("start_ms", 1000).put("end_ms", 3500).put("text", "first words"));
         service.utter("test", Json.obj().putNull("speaker_id").put("start_ms", 7000).put("end_ms", 8000).put("text", "mystery"));
@@ -144,7 +144,7 @@ class SpeakerServiceTest {
         assertEquals("overlap", SpeakerService.label(null, null, null, null, null, 2));
         assertEquals("unknown", SpeakerService.label(null, null, null, null, null, 0));
         assertEquals("unknown", SpeakerService.label("a", null, null, 0.0, 0.0, 0));
-        service.init(initRequest("test"));
+        PrivacyTestSupport.init(service, initRequest("test"));
         service.utter("test", Json.obj().put("speaker_id", "a").put("start_ms", 0).put("end_ms", 2000).put("text", "clean").put("similarity", .7).put("margin", .4).put("overlap_ratio", 0).put("abstain_ratio", 0));
         var overlap = Json.obj().putNull("speaker_id").put("start_ms", 2000).put("end_ms", 3000).put("text", "both").put("overlap_ratio", 1.0);
         overlap.putArray("candidates").add("a").add("b");
@@ -173,12 +173,14 @@ class SpeakerServiceTest {
             s.execute("INSERT INTO utterances(session_id,speaker_id,start_ms,end_ms,text,source,created_ms) VALUES('old','a',0,1000,'legacy','x',1)");
             s.execute("PRAGMA user_version=2");
         }
-        store = new Store(temp.resolve("old.sqlite")); service = new SpeakerService(store, engine, clock);
-        assertEquals("#1 0:00.0-0:01.0 Alice [unknown]: legacy\n", service.utterances("old", 0, 100, null).get("text").asText());
-        try (var s = store.db.createStatement(); var r = s.executeQuery("PRAGMA user_version")) { assertEquals(4, r.getInt(1)); }
+        store = new Store(temp.resolve("old.sqlite")); service = new SpeakerService(store, engine, clock, PrivacyTestSupport.POLICY);
+        assertEquals("legacy", store.utterances("old", 0, 100, 0).get(0).path("text").asText());
+        assertEquals("legacy_blocked", service.consentStatus("old").path("state").asText());
+        assertEquals(403, assertThrows(ApiException.class, () -> service.utterances("old", 0, 100, null)).status);
+        try (var s = store.db.createStatement(); var r = s.executeQuery("PRAGMA user_version")) { assertEquals(5, r.getInt(1)); }
     }
     @Test void malformedAudioAndNonintegralSequenceRejected() {
-        service.init(initRequest("test"));
+        PrivacyTestSupport.init(service, initRequest("test"));
         assertThrows(ApiException.class, () -> service.ingest("test", frame(0).put("audio_base64", "bad")));
         assertThrows(ApiException.class, () -> service.ingest("test", frame(0).put("sequence", .1)));
     }

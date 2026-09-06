@@ -11,17 +11,48 @@ final class SpeakerService {
     private final Store store;
     private final SpeechEngine engine;
     private final Clock clock;
+    private final PrivacyGate privacy;
+    private Runnable destructionWakeup = () -> {};
     private final Map<String, byte[]> buffers = new HashMap<>();
     private final Map<String, String> failures = new HashMap<>();
-    SpeakerService(Store store, SpeechEngine engine, Clock clock) { this.store = store; this.engine = engine; this.clock = clock; }
+    SpeakerService(Store store, SpeechEngine engine, Clock clock) { this(store, engine, clock, PrivacyPolicy.environment()); }
+    SpeakerService(Store store, SpeechEngine engine, Clock clock, PrivacyPolicy policy) {
+        this.store = store; this.engine = engine; this.clock = clock; this.privacy = new PrivacyGate(store, clock, policy);
+    }
+    synchronized ObjectNode privacyNotice() { return privacy.policy.notice(); }
+    synchronized ObjectNode privacyRooms() { return privacy.rooms(); }
+    synchronized ObjectNode createPrivacyRoom(JsonNode request) { return privacy.create(request); }
+    synchronized ObjectNode consentStatus(String session) { return privacy.status(session); }
+    synchronized ObjectNode consentChallenge(String session, String participant) { return privacy.challenge(session, participant); }
+    synchronized ObjectNode consentRelease(String session, String participant, JsonNode request) { return privacy.release(session, participant, request); }
+    synchronized ObjectNode consentRevoke(String session, String participant) {
+        var result = privacy.revoke(session, participant);
+        buffers.remove(session); failures.remove(session); notifyAll(); destructionWakeup.run(); return result;
+    }
+    synchronized ObjectNode destructionStatus(String session) { return privacy.destruction(session); }
+    synchronized void requireConsent(String session, String scope) { privacy.require(session, scope); }
+    synchronized void setDestructionWakeup(Runnable wakeup) { destructionWakeup = wakeup; }
+    synchronized void sweepPrivacy() {
+        for (String session : privacy.expiredRooms()) { buffers.remove(session); failures.remove(session); }
+        privacy.sweep(); notifyAll();
+    }
+    synchronized void authorizeHosted(String tool, JsonNode arguments) {
+        if (!privacy.policy.openaiReviewed() || !privacy.policy.cloudflareReviewed()) throw new ApiException(403, "vendor_review_required", "Hosted MCP requires reviewed OpenAI and Cloudflare agreements and settings.");
+        if (tool.equals("list_sessions")) {
+            for (var row : sessions(200, true).path("sessions")) markHosted(row.path("session_id").asText());
+        } else { String session = Json.id(arguments, "session_id"); privacy.require(session, "hosted_mcp"); markHosted(session); }
+    }
+    private void markHosted(String session) { store.transaction(() -> { privacy.markHosted(session); return null; }); }
 
     synchronized ObjectNode init(JsonNode request) {
         String session = Json.id(request, "session_id");
+        privacy.require(session, "local_processing");
         if (Json.integer(request, "sample_rate", 16000, 16000) != 16000 || !"pcm_s16le".equals(Json.text(request, "audio_format", 20)))
             throw new ApiException(400, "invalid_audio_format", "Expected mono 16 kHz pcm_s16le.");
         JsonNode participants = request.path("participants");
         if (!participants.isArray() || participants.size() < 2 || participants.size() > 4)
             throw new ApiException(400, "invalid_participants", "Enroll 2–4 participants.");
+        privacy.validateRoster(session, participants);
         try { store.session(session); throw new ApiException(409, "session_exists", "Session already exists."); }
         catch (ApiException e) { if (e.status != 404) throw e; }
         try (var p = store.prepare("SELECT count(*) FROM sessions WHERE status='active'"); var r = p.executeQuery()) {
@@ -35,6 +66,7 @@ final class SpeakerService {
         }
         var results = new ArrayList<SpeechEngine.Result>();
         for (byte[] pcm : audio) {
+            privacy.require(session, "local_processing");
             var result = engine.analyze(pcm, true);
             if (!result.speech() || result.embedding() == null || result.overlap().equals("detected") || result.speakerChange())
                 throw new ApiException(422, "invalid_enrollment", "Each opening statement must contain one participant speaking clearly.");
@@ -42,12 +74,14 @@ final class SpeakerService {
                 throw new ApiException(503, "model_mismatch", "The speech model changed during enrollment.");
             results.add(result);
         }
+        privacy.require(session, "local_processing");
         return store.transaction(() -> {
             store.execute("INSERT INTO sessions(id,status,created_ms) VALUES(?,'active',?)", session, clock.millis());
             for (int i = 0; i < participants.size(); i++) {
                 var p = participants.get(i); var result = results.get(i); String vector = Store.vectorJson(Audio.normalize(result.embedding()));
                 store.execute("INSERT INTO profiles VALUES(?,?,?,?,?,?)", session, p.get("id").asText(), p.get("name").asText(), result.modelId(), vector, vector);
                 store.execute("INSERT INTO participants VALUES(?,?,?,'human',NULL,?)", session, p.get("id").asText(), p.get("name").asText(), result.modelId());
+                privacy.linkOpening(session, p.get("id").asText(), audio.get(i));
             }
             return Json.obj().put("session_id", session).put("profiles_created", participants.size()).put("status", "ready")
                 .put("confidence_kind", "uncalibrated").put("chunk_ms", 250).put("context_ms", 1500);
@@ -55,6 +89,7 @@ final class SpeakerService {
     }
 
     synchronized ObjectNode ingest(String session, JsonNode request) {
+        privacy.require(session, "local_processing");
         var s = store.session(session);
         long sequence = Json.integer(request, "sequence", 0, Integer.MAX_VALUE);
         String encoded = Json.text(request, "audio_base64", 12000);
@@ -85,6 +120,7 @@ final class SpeakerService {
         try { attribution = attribute(session, sequence, s.elapsedMs(), context.length / 32, result, inferenceMs); }
         catch (ApiException e) { failures.put(session, e.code); throw e; }
         attribution.put("text", text).put("text_source", text == null ? null : "client_supplied");
+        privacy.require(session, "local_processing");
         SpeechEngine.Result completed = result;
         store.transaction(() -> {
             boolean eligible = completed != null && completed.embedding() != null && completed.speech() && completed.profileEligible()
@@ -93,6 +129,7 @@ final class SpeakerService {
                 attribution.path("speaker_id").isNull() ? null : attribution.path("speaker_id").asText(), attribution.toString(),
                 completed == null || completed.embedding() == null ? null : Store.vectorJson(completed.embedding()), eligible);
             store.execute("UPDATE sessions SET next_sequence=next_sequence+1,elapsed_ms=elapsed_ms+250 WHERE id=?", session);
+            if (completed != null && completed.speech() && !attribution.path("speaker_id").isNull()) privacy.humanInteraction(session, attribution.path("speaker_id").asText());
             return null;
         });
         buffers.put(session, context); failures.remove(session);
@@ -140,6 +177,7 @@ final class SpeakerService {
     }
 
     synchronized ObjectNode current(String session) {
+        privacy.require(session, "local_processing");
         var s = store.session(session);
         ObjectNode last = s.nextSequence() == 0 ? null : store.segment(session, s.nextSequence() - 1);
         if (!s.status().equals("active") || failures.containsKey(session) || last == null || clock.millis() - last.path("timestamp_ms").asLong() > 1500) {
@@ -154,18 +192,21 @@ final class SpeakerService {
     }
 
     synchronized ObjectNode transcript(String session, String speaker, long after, int limit) {
+        privacy.require(session, "local_processing");
         store.session(session); validatePage(after, limit);
         if (speaker != null && store.profiles(session).stream().noneMatch(p -> p.id().equals(speaker))) throw new ApiException(404, "speaker_not_found", "Speaker is not enrolled in this session.");
         ArrayNode rows = store.transcript(session, speaker, after, limit);
         return Json.obj().put("session_id", session).put("next_after_sequence", rows.isEmpty() ? after : rows.get(rows.size() - 1).path("sequence").asLong()).set("transcript", rows);
     }
     synchronized ObjectNode profiles(String session) {
+        privacy.require(session, "local_processing");
         store.session(session); var profiles = Json.arr();
         for (var p : store.profiles(session)) profiles.add(Json.obj().put("id", p.id()).put("name", p.name()).put("model_id", p.model()));
         return Json.obj().put("session_id", session).set("participants", profiles);
     }
     record Registration(boolean created, ObjectNode response) {}
     synchronized Registration register(String session, JsonNode request) {
+        privacy.require(session, "local_processing");
         if (!store.session(session).status().equals("active")) throw new ApiException(409, "session_ended", "This session has ended.");
         String id = Json.id(request, "id"), name = Json.text(request, "name", 200);
         if (!"agent".equals(Json.text(request, "kind", 20))) throw new ApiException(400, "invalid_participant", "Register agents here; humans require voice enrollment.");
@@ -181,6 +222,7 @@ final class SpeakerService {
         return new Registration(true, response);
     }
     synchronized ObjectNode participants(String session) {
+        privacy.require(session, "local_processing");
         store.session(session);
         return Json.obj().put("session_id", session).set("participants", store.participants(session));
     }
@@ -200,6 +242,7 @@ final class SpeakerService {
         return lease;
     }
     synchronized ObjectNode claimFloor(String session, JsonNode request) {
+        privacy.require(session, "local_processing");
         if (!store.session(session).status().equals("active")) throw new ApiException(409, "session_ended", "This session has ended.");
         String participant = Json.id(request, "participant_id");
         if (!store.participant(session, participant).path("kind").asText().equals("agent")) throw new ApiException(400, "invalid_participant", "Only registered agents can claim the floor.");
@@ -219,6 +262,7 @@ final class SpeakerService {
         return result;
     }
     synchronized ObjectNode floor(String session) {
+        privacy.require(session, "local_processing");
         store.session(session);
         ObjectNode result = store.transaction(() -> {
             long now = clock.millis();
@@ -228,6 +272,7 @@ final class SpeakerService {
         return result;
     }
     synchronized ObjectNode releaseFloor(String session, String participant) {
+        privacy.require(session, "local_processing");
         store.session(session);
         Json.id(Json.obj().put("participant_id", participant), "participant_id");
         ObjectNode result = store.transaction(() -> {
@@ -249,6 +294,7 @@ final class SpeakerService {
             throw new ApiException(400, "invalid_pagination", "Use after_id >= 0, limit 1–200, and wait_ms 0–10000.");
         long deadline = System.nanoTime() + waitMs * 1_000_000;
         while (true) {
+            privacy.require(session, "local_processing");
             store.session(session);
             var lease = store.transaction(() -> activeLease(session, clock.millis()));
             var rows = store.events(session, after, limit);
@@ -266,35 +312,53 @@ final class SpeakerService {
         String requestedSession = arguments.path("session_id").isTextual() ? arguments.path("session_id").asText() : null;
         String session = null, participant = null;
         if (requestedSession != null) {
-            try { store.session(requestedSession); session = requestedSession; }
-            catch (ApiException e) { if (e.status != 404) throw e; }
+            try { privacy.require(requestedSession, "local_processing"); store.session(requestedSession); session = requestedSession; }
+            catch (ApiException e) { if (e.status != 404 && e.status != 403) throw e; }
         }
         if (session != null && participantTag != null) {
             try { if (store.participant(session, participantTag).path("kind").asText().equals("agent")) participant = participantTag; }
             catch (ApiException e) { if (e.status != 404) throw e; }
         }
         String recordedSession = session, recordedParticipant = participant;
+        ObjectNode safeArguments = safeMcpArguments(arguments);
         store.transaction(() -> {
             long now = clock.millis();
-            store.execute("INSERT INTO mcp_calls(session_id,timestamp_ms,caller_ip,participant_id,tool,arguments,bytes,failed) VALUES(?,?,?,?,?,?,?,?)", recordedSession, now, caller, recordedParticipant, tool, arguments.toString(), bytes, failed);
+            store.execute("INSERT INTO mcp_calls(session_id,timestamp_ms,caller_ip,participant_id,tool,arguments,bytes,failed) VALUES(?,?,?,?,?,?,?,?)", recordedSession, now, caller, recordedParticipant, tool, safeArguments.toString(), bytes, failed);
             long id = store.lastInsertId();
             var data = Json.obj().put("call_id", id).put("session_id", recordedSession).put("timestamp_ms", now).put("caller_ip", caller).put("participant_id", recordedParticipant)
-                .put("tool", tool).put("bytes", bytes).put("failed", failed).set("arguments", arguments);
+                .put("tool", tool).put("bytes", bytes).put("failed", failed).set("arguments", safeArguments);
             if (recordedSession != null) store.event(recordedSession, now, "mcp_call", data);
             return null;
         });
         notifyAll();
     }
+    static ObjectNode safeMcpArguments(JsonNode arguments) {
+        var safe = Json.obj();
+        for (String key : List.of("session_id", "speaker_id", "segment_id", "actual_speaker")) if (arguments.has(key)) safe.put(key, "[redacted]");
+        for (String key : List.of("limit", "after_id", "after_sequence")) if (arguments.path(key).isIntegralNumber()) safe.set(key, arguments.path(key));
+        if (Set.of("high", "medium", "low").contains(arguments.path("min_label").asText())) safe.put("min_label", arguments.path("min_label").asText());
+        return safe;
+    }
     synchronized ObjectNode corrections(String session, long after, int limit) {
+        privacy.require(session, "local_processing");
         store.session(session); validatePage(after, limit);
         ArrayNode rows = store.corrections(session, after, limit);
         return Json.obj().put("session_id", session).put("next_after_id", rows.isEmpty() ? after : rows.get(rows.size() - 1).path("correction_id").asLong()).set("corrections", rows);
     }
     synchronized ObjectNode sessions(int limit) {
-        return Json.obj().set("sessions", store.sessions(limit));
+        return sessions(limit, false);
+    }
+    synchronized ObjectNode sessions(int limit, boolean hosted) {
+        var allowed = Json.arr();
+        for (var row : store.sessions(limit)) {
+            try { privacy.require(row.path("session_id").asText(), hosted ? "hosted_mcp" : "local_processing"); allowed.add(row); }
+            catch (ApiException ignored) { /* Legacy, withdrawn and unsigned rooms expose no protected metadata. */ }
+        }
+        return Json.obj().set("sessions", allowed);
     }
     /** Stores one externally transcribed utterance; the API never transcribes audio itself. */
     synchronized ObjectNode utter(String session, JsonNode request) {
+        privacy.require(session, "local_processing");
         store.session(session);
         String speaker = null;
         boolean agent = false;
@@ -325,6 +389,7 @@ final class SpeakerService {
                 session, who, start, end, text, source, now, similarity, margin, overlapRatio, abstainRatio, label, candidates.isEmpty() ? null : candidates.toString());
             long id = store.lastInsertId();
             store.event(session, now, "utterance", store.utterance(session, id));
+            if (!source.equals("agent")) privacy.humanInteraction(session, who);
             return Json.obj().put("utterance_id", id).put("session_id", session).put("speaker_id", who).put("start_ms", start).put("end_ms", end).put("label", label).put("stored", true);
         });
         notifyAll();
@@ -354,6 +419,7 @@ final class SpeakerService {
         return switch (minLabel) { case "high" -> 3; case "medium" -> 2; case "low" -> 1; default -> throw new ApiException(400, "invalid_query", "min_label must be high, medium or low."); };
     }
     synchronized ObjectNode utterances(String session, long after, int limit, String minLabel) {
+        privacy.require(session, "local_processing");
         store.session(session); validatePage(after, limit);
         ArrayNode rows = store.utterances(session, after, limit, labelRank(minLabel));
         var text = new StringBuilder();
@@ -381,6 +447,7 @@ final class SpeakerService {
     }
 
     synchronized ObjectNode correct(String session, JsonNode request) {
+        privacy.require(session, "local_processing");
         store.session(session);
         String segmentId = Json.id(request, "segment_id"), actual = Json.id(request, "actual_speaker");
         if (store.profiles(session).stream().noneMatch(p -> p.id().equals(actual))) throw new ApiException(404, "speaker_not_found", "Speaker is not enrolled in this session.");
@@ -410,25 +477,16 @@ final class SpeakerService {
     }
 
     synchronized ObjectNode end(String session) {
-        store.session(session);
-        store.transaction(() -> {
-            long now = clock.millis();
-            if (activeLease(session, now) != null) {
-                store.execute("DELETE FROM floor WHERE session_id=?", session);
-                store.event(session, now, "floor", floorData(null, now).put("action", "released"));
-            }
-            store.execute("UPDATE sessions SET status='ended' WHERE id=?", session); return null;
-        });
+        privacy.schedule(session, "purpose_completed", null);
         buffers.remove(session); failures.remove(session);
-        notifyAll();
-        return Json.obj().put("session_id", session).put("status", "ended");
+        notifyAll(); destructionWakeup.run();
+        return Json.obj().put("session_id", session).put("status", "ended").put("state", "destroying");
     }
     synchronized ObjectNode delete(String session) {
-        store.session(session);
-        store.transaction(() -> { store.execute("DELETE FROM sessions WHERE id=?", session); return null; });
+        privacy.schedule(session, "deletion_requested", null);
         buffers.remove(session); failures.remove(session);
-        notifyAll();
-        return Json.obj().put("session_id", session).put("deleted", true);
+        notifyAll(); destructionWakeup.run();
+        return Json.obj().put("session_id", session).put("deleted", false).put("state", "destroying");
     }
     private static String hash(byte[] pcm, String text) {
         try { var digest = MessageDigest.getInstance("SHA-256"); digest.update(pcm); digest.update((text == null ? "" : text).getBytes(java.nio.charset.StandardCharsets.UTF_8)); return HexFormat.of().formatHex(digest.digest()); }
