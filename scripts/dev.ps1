@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('build', 'api', 'worker', 'mcp', 'tunnel', 'token')][string]$Mode = 'build',
+    [ValidateSet('build', 'api', 'worker', 'mcp', 'tunnel', 'token', 'api-token')][string]$Mode = 'build',
     [Parameter(ValueFromRemainingArguments = $true)][string[]]$ForwardArgs
 )
 $ErrorActionPreference = 'Stop'
@@ -17,6 +17,48 @@ try {
         $env:VOICEPRINT_MCP_TOKEN = (Get-Content -LiteralPath $tokenFile -Raw).Trim()
     }
     if ($Mode -eq 'token') { Write-Output $env:VOICEPRINT_MCP_TOKEN; exit 0 }
+    # Distinct credentials: the operator API token is not the worker's service credential.
+    # Only the explicit api-token mode prints the operator token. Never print the worker token.
+    function Get-PrivateLocalToken([string]$FileName) {
+        New-Item -ItemType Directory -Force (Join-Path $projectRoot 'data') | Out-Null
+        $privatePath = Join-Path $projectRoot ('data\' + $FileName)
+        if (-not (Test-Path -LiteralPath $privatePath)) {
+            $randomBytes = New-Object byte[] 32
+            $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+            try { $rng.GetBytes($randomBytes) } finally { $rng.Dispose() }
+            $secret = ([System.BitConverter]::ToString($randomBytes) -replace '-', '').ToLower()
+            # CreateNew avoids overwriting a token generated concurrently by another terminal.
+            $stream = $null
+            try {
+                $stream = [System.IO.File]::Open($privatePath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+                $encoded = [System.Text.Encoding]::UTF8.GetBytes($secret)
+                $stream.Write($encoded, 0, $encoded.Length)
+            } catch [System.IO.IOException] {
+                if (-not (Test-Path -LiteralPath $privatePath)) { throw }
+            } finally { if ($stream) { $stream.Dispose() } }
+        }
+        # Local development trusts the current Windows operator. Production service-account
+        # isolation is a separate deployment requirement; this ACL does not isolate same-user processes.
+        $acl = New-Object System.Security.AccessControl.FileSecurity
+        $acl.SetAccessRuleProtection($true, $false)
+        $ownerSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+        $systemSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
+        foreach ($sid in @($ownerSid, $systemSid)) {
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'Allow')
+            $acl.AddAccessRule($rule)
+        }
+        Set-Acl -LiteralPath $privatePath -AclObject $acl
+        $value = (Get-Content -LiteralPath $privatePath -Raw).Trim()
+        if ($value.Length -lt 32) { throw "Invalid local credential file: $FileName" }
+        return $value
+    }
+    if ($Mode -in @('api', 'mcp', 'api-token') -and -not $env:VOICEPRINT_API_TOKEN) {
+        $env:VOICEPRINT_API_TOKEN = Get-PrivateLocalToken 'api-token.txt'
+    }
+    if ($Mode -eq 'api-token') { Write-Output $env:VOICEPRINT_API_TOKEN; exit 0 }
+    if ($Mode -in @('api', 'worker') -and -not $env:VOICEPRINT_WORKER_TOKEN) {
+        $env:VOICEPRINT_WORKER_TOKEN = Get-PrivateLocalToken 'worker-token.txt'
+    }
     if ($Mode -eq 'tunnel') {
         $port = if ($env:VOICEPRINT_MCP_PORT) { $env:VOICEPRINT_MCP_PORT } else { '8082' }
         $found = Get-Command cloudflared.exe -ErrorAction SilentlyContinue
