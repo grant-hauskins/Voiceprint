@@ -239,6 +239,8 @@ async def main(args):
                 td = event["session"].get("audio", {}).get("input", {}).get("turn_detection") or {}
                 print(f"Realtime session configured: model={event['session'].get('model')} tools=voiceprint(mcp) vad={td.get('type')} auto_response={td.get('create_response')}", flush=True)
                 break
+        await ws.send(json.dumps({"type": "conversation.item.create", "item": {"type": "message", "role": "user", "content": [{"type": "input_text",
+            "text": f"(system) This room's Voiceprint session_id is {session_id}. Participants: " + ", ".join(f"{n} (id {pid})" for pid, n in names.items()) + "."}]}}))
         print("Press Enter to start the conversation; SPACE = one reply now, H = hold/release (mutes and cuts off), C = cancel current reply, Q = quit.", flush=True)
         input()
         threading.Thread(target=mic_thread, daemon=True).start()
@@ -284,9 +286,14 @@ async def main(args):
                 if decision == "wait":
                     continue
                 responding["active"] = True
-                extra = "" if decision == "speak" else " The last attribution was uncertain: ask who just spoke before answering."
                 print(f"  [gate: {decision}]", flush=True)
-                await ws.send(json.dumps({"type": "response.create", "response": {"instructions": "Respond now." + extra}}))
+                # response.instructions would REPLACE the session instructions (and the session id), so the nudge goes
+                # in as a conversation item instead and response.create stays bare.
+                note = f"(system) Voiceprint session_id is {session_id}. Call get_transcript with after_id from your last call before replying."
+                if decision == "clarify":
+                    note += " The latest attribution is uncertain: ask who just spoke instead of answering."
+                await ws.send(json.dumps({"type": "conversation.item.create", "item": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": note}]}}))
+                await ws.send(json.dumps({"type": "response.create"}))
 
         tasks = [asyncio.create_task(sender()), asyncio.create_task(receiver()), asyncio.create_task(gate_loop())]
         try:
