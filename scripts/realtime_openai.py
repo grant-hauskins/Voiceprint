@@ -248,7 +248,8 @@ async def main(args):
         input()
         threading.Thread(target=mic_thread, daemon=True).start()
         threading.Thread(target=key_thread, daemon=True).start()
-        responding = {"active": False, "continuations": 0}
+        responding = {"active": False, "continuations": 0, "continue_pending": False}
+        tool_calls = {"in_progress": 0}
         MAX_CONTINUATIONS = 3   # tool call -> continue -> (tool call -> continue ...) before we give up on a turn
 
         async def sender():
@@ -265,17 +266,23 @@ async def main(args):
                     player.play(base64.b64decode(event["delta"]))
                 elif kind == "response.output_audio_transcript.done":
                     print(f"[{args.agent_name} said] {event.get('transcript')}", flush=True)
+                elif kind == "response.mcp_call.in_progress":
+                    tool_calls["in_progress"] += 1
+                elif kind in ("response.mcp_call.completed", "response.mcp_call.failed"):
+                    tool_calls["in_progress"] = max(0, tool_calls["in_progress"] - 1)
                 elif kind == "response.output_item.done" and event.get("item", {}).get("type") == "mcp_call":
                     item = event["item"]
-                    print(f"  mcp_call {item.get('name')}({item.get('arguments')}) -> {('ERROR ' + str(item.get('error'))) if item.get('error') else 'ok'}", flush=True)
+                    outcome = ("ERROR " + str(item.get("error"))) if item.get("error") else f"ok ({len(str(item.get('output') or ''))} chars)"
+                    print(f"  mcp_call {item.get('name')}({item.get('arguments')}) -> {outcome}", flush=True)
                 elif kind == "response.done":
                     output = event.get("response", {}).get("output", [])
                     spoke = any(item.get("type") == "message" for item in output)
                     called_tool = any(item.get("type") == "mcp_call" for item in output)
                     if called_tool and not spoke and responding["continuations"] < MAX_CONTINUATIONS:
-                        # Realtime ends the response after a tool call; ask for the follow-up that uses the result.
+                        # Realtime ends the response after a tool call; the gate loop asks for the follow-up once
+                        # the call has actually completed, so the model answers from the result.
                         responding["continuations"] += 1
-                        await ws.send(json.dumps({"type": "response.create"}))
+                        responding["continue_pending"] = True
                     else:
                         responding["active"] = False; responding["continuations"] = 0
                         if spoke:
@@ -294,8 +301,15 @@ async def main(args):
                         await ws.send(json.dumps({"type": "response.cancel"}))
                     player.flush(); responding["active"] = False
                     continue
+                if responding["continue_pending"]:
+                    if tool_calls["in_progress"] == 0:
+                        responding["continue_pending"] = False
+                        await ws.send(json.dumps({"type": "response.create"}))
+                    continue
                 if responding["active"] or player.busy():
                     continue
+                if not transcriber.idle():
+                    continue    # someone's last words are still being transcribed; the tool would miss them
                 decision = tg.decide(state, time.monotonic(), status["current"], last_end["at"])
                 if decision == "wait":
                     continue

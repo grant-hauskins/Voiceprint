@@ -76,8 +76,13 @@ class Transcriber:
         self.model = WhisperModel(model_name, device="cpu", compute_type="int8")
         self.base, self.session, self.names, self.log, self.on_utterance = base, session, names, log, on_utterance
         self.jobs = queue.Queue()
+        self.in_flight = 0
         self.thread = threading.Thread(target=self.loop, daemon=True)
         self.thread.start()
+
+    def idle(self):
+        """True when nothing is queued or being transcribed; the gate waits for this before letting the agent speak."""
+        return self.jobs.empty() and self.in_flight == 0
 
     def submit(self, utterance, pcm):
         self.jobs.put((utterance, pcm))
@@ -99,6 +104,7 @@ class Transcriber:
             if job is None:
                 return
             utterance, pcm = job
+            self.in_flight += 1
             try:
                 text = self.transcribe(pcm)
                 if not text:
@@ -113,6 +119,8 @@ class Transcriber:
                     self.on_utterance(utterance)
             except Exception as error:  # keep streaming even if one transcription fails
                 print(f'transcription failed for {clock(utterance["start_ms"])}-{clock(utterance["end_ms"])}: {error}', file=sys.stderr, flush=True)
+            finally:
+                self.in_flight -= 1
 
 
 class Turns:
