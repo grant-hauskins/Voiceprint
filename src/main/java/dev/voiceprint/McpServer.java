@@ -14,6 +14,7 @@ final class McpServer {
     static final String VERSION = "2025-11-25";
     static final Set<String> VERSIONS = Set.of("2025-03-26", "2025-06-18", "2025-11-25");
     static final Set<String> TOOLS = Set.of("list_sessions", "get_transcript", "get_current_speaker", "get_participant_statements", "correct_attribution");
+    static final String LABEL_NOTICE = "Human labels high/medium/low are similarity-based, not calibrated probabilities. Agent labels are declared by their registered producer. Null confidence is unavailable, not zero.";
 
     /** Per-connection state for stdio, where the lifecycle handshake is enforced. HTTP is stateless and skips it. */
     static final class Session { boolean initialized, ready; }
@@ -38,6 +39,9 @@ final class McpServer {
      * the stdio lifecycle is enforced (initialize before tools); with null every request stands alone.
      */
     static ObjectNode dispatch(JsonNode request, HttpClient client, String api, String token, Session session) {
+        return dispatch(request, client, api, token, session, false);
+    }
+    static ObjectNode dispatch(JsonNode request, HttpClient client, String api, String token, Session session, boolean hosted) {
         JsonNode id = request == null ? null : request.get("id");
         if (request == null || !request.isObject() || !request.path("jsonrpc").asText().equals("2.0") || !request.path("method").isTextual()
             || (id != null && !(id.isTextual() || id.isIntegralNumber())))
@@ -65,17 +69,19 @@ final class McpServer {
                 var params = request.path("params"); String name = Json.text(params, "name", 80);
                 if (!TOOLS.contains(name)) throw new ApiException(-32602, "protocol", "Unknown tool");
                 JsonNode arguments = params.path("arguments");
-                try { result = call(client, api, token, name, arguments); }
+                try { result = call(client, api, token, name, arguments, hosted); }
                 catch (Exception e) {
                     if (e instanceof InterruptedException) Thread.currentThread().interrupt();
                     String message = e instanceof ApiException ? e.getMessage() : "Voiceprint API is unavailable.";
                     result = toolResult(Json.error("tool_error", message), true);
                 }
+                result.put("label_kind", "similarity_based_uncalibrated").put("notice", LABEL_NOTICE);
+                ((ArrayNode) result.withArray("content")).add(Json.obj().put("type", "text").put("text", LABEL_NOTICE));
             } else throw new ApiException(-32601, "protocol", "Method not found");
             var response = Json.obj().put("jsonrpc", "2.0"); response.set("id", id); response.set("result", result); return response;
         } catch (ApiException e) { return error(id, e.status < 0 ? e.status : -32602, e.getMessage()); }
     }
-    private static ObjectNode call(HttpClient client, String base, String token, String tool, JsonNode args) throws Exception {
+    private static ObjectNode call(HttpClient client, String base, String token, String tool, JsonNode args, boolean hosted) throws Exception {
         String path; String body = null;
         if (tool.equals("list_sessions")) path = "/speaker/sessions?limit=" + (args.has("limit") ? Json.integer(args, "limit", 1, 200) : 10);
         else path = "/speaker/session/" + Json.id(args, "session_id");
@@ -102,6 +108,7 @@ final class McpServer {
         }
         var builder = HttpRequest.newBuilder(URI.create(base + path)).timeout(Duration.ofSeconds(10));
         if (token != null) builder.header("Authorization", "Bearer " + token);
+        if (hosted) builder.header("X-Voiceprint-Hosted-MCP", "true");
         if (body != null) builder.header("Content-Type", "application/json").POST(HttpRequest.BodyPublishers.ofString(body));
         var response = client.send(builder.build(), HttpResponse.BodyHandlers.ofString());
         JsonNode value = Json.parse(response.body());
@@ -133,7 +140,7 @@ final class McpServer {
         var sessions = tool("list_sessions", "List recent Voiceprint sessions (newest first) with status and enrolled participants. Call first to find a session_id.", true);
         ((ObjectNode) sessions.path("inputSchema").path("properties")).set("limit", Json.obj().put("type", "integer").put("minimum", 1).put("maximum", 200));
         result.add(sessions);
-        var transcript = tool("get_transcript", "Get the attributed transcript as compact lines '#id m:ss.s-m:ss.s Name [label]: words'. Labels high/medium/low are similarity-based, NOT calibrated probabilities; 'OVERLAP A+B' lines are people talking over each other and their words cannot be attributed. Pass after_id from the previous call to fetch only new lines; min_label=high returns only trusted lines.", true, "session_id");
+        var transcript = tool("get_transcript", "Get the attributed transcript as compact lines '#id m:ss.s-m:ss.s Name [label]: words'. Labels high/medium/low are similarity-based, NOT calibrated probabilities; 'OVERLAP A+B' lines are people talking over each other and their words cannot be attributed. Agent labels are declared by their registered producer. Pass after_id from the previous call to fetch only new lines; min_label=high returns high human labels and all agent lines.", true, "session_id");
         ObjectNode tp = (ObjectNode) transcript.path("inputSchema").path("properties");
         ObjectNode minLabel = Json.obj().put("type", "string");
         minLabel.putArray("enum").add("high").add("medium").add("low");

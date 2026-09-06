@@ -11,11 +11,11 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class TransportTest {
     @TempDir Path temp;
-    Store store; RestServer server; String base;
+    Store store; RestServer server; String base; SpeakerService service;
     @BeforeEach void setup() throws Exception {
         store = new Store(temp.resolve("transport.sqlite"));
-        var service = new SpeakerService(store, new SpeakerServiceTest.FakeEngine(), new SpeakerServiceTest.MutableClock());
-        service.init(SpeakerServiceTest.initRequest("test"));
+        service = new SpeakerService(store, new SpeakerServiceTest.FakeEngine(), new SpeakerServiceTest.MutableClock(), PrivacyTestSupport.POLICY);
+        PrivacyTestSupport.init(service, SpeakerServiceTest.initRequest("test"));
         server = new RestServer(service, 0, "test-secret"); server.start(); base = "http://127.0.0.1:" + server.port();
     }
     @AfterEach void close() throws Exception { server.close(); store.close(); }
@@ -47,7 +47,7 @@ class TransportTest {
         assertTrue(lines.get(3).path("result").path("isError").asBoolean());
     }
     @Test void mcpStreamableHttpIsStatelessAndGuarded() throws Exception {
-        try (var mcp = new McpHttpServer(0, base, "test-secret", "mcp-secret")) {
+        try (var mcp = new McpHttpServer(0, base, "test-secret", "mcp-secret", service)) {
             mcp.start(); String url = "http://127.0.0.1:" + mcp.port() + "/mcp";
             var client = HttpClient.newHttpClient();
             java.util.function.Function<String, HttpRequest.Builder> post = body -> HttpRequest.newBuilder(URI.create(url)).header("Content-Type", "application/json")
