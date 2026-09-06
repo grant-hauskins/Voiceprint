@@ -61,9 +61,9 @@ class GateTest(unittest.TestCase):
         self.assertEqual(tg.decide(state, 15, "speaking", 10), "speak")
         state.manual = "hold"; state.note_utterance(utt("Ava, now?"), now=16)
         self.assertEqual(tg.decide(state, 17, "silence", 16), "wait")
-        self.assertEqual(tg.decide(state, 30, "silence", 16), "wait")   # hold is sticky
+        self.assertEqual(tg.decide(state, 19, "silence", 16), "wait")   # hold is sticky
         state.manual = None
-        self.assertEqual(tg.decide(state, 30, "silence", 16), "speak")
+        self.assertEqual(tg.decide(state, 20, "silence", 16), "speak")   # released within the address window
 
     def test_agent_own_voice_is_ignored(self):
         state = tg.GateState(agent_names=("Ava",), agent_speaker_id="participant_3")
