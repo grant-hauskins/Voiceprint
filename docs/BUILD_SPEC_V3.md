@@ -32,6 +32,8 @@ The natural read of "agents negotiate for their principals" is two advocate agen
 
 This is the load-bearing decision for the whole feature set: it turns the leak-prevention problem from "trust two adversarial agents not to slip" into "one enforcement point on one neutral node." Everything in §3-4 assumes this topology.
 
+**Decided:** the Arbitrator is always a text-only model — a plain Responses-style API call, never a live voice/realtime session. It has no independent voice presence in the room. It reads the human transcript through the same MCP tools (`get_transcript`, etc.) the Advocates already use, not a special access path — the Arbitrator is a distinguished consumer of the same tool surface, not a differently-privileged one. Advocates keep their existing voice presence (they're the ones actually speaking in the room, per §5); the Arbitrator's output is always text (notes board, prompts to an advocate, the closing summary in §6).
+
 ## 2. Objectives: structured, private, versioned
 
 **Decided:** an objective is a structured record, not free text pasted into a prompt — because the redaction guard (§4) needs to check agent output against *known values*, and a value can only be checked if it was captured as data, not buried in prose.
@@ -55,6 +57,16 @@ Minimum shape (extend as needed, don't over-fit this now):
 - **Public notes board** — the Arbitrator's curated output: agreed points, open points, suggested compromise ranges. Never contains either party's private constraint values by construction (it's written by the one role bound not to disclose them). **Default visible** to both users — it's safe by design, not by discipline.
 - **Raw agent-to-agent stream** — whatever the advocates and Arbitrator actually say to each other, if that's exposed at all. **Default hidden.** A toggle reveals it, but only takes effect once *both* users consent — same mutual-consent shape as the rest of the app's release model.
 
+### 3.1 Transport: an MCP tool, not a new protocol
+
+**Decided:** build the agent-to-agent channel as a new tool on the same MCP server, the same way the human transcript is exposed — not Google's A2A protocol. A2A solves a problem this system doesn't have: independently-hosted agents, built by different parties, discovering and calling each other at runtime. Every agent here — both Advocates and the Arbitrator — already runs inside Voiceprint's own runtime behind the same auth boundary, so there's no discovery or cross-vendor handshake to do. Standing up a second protocol stack next to the MCP-everything architecture would duplicate the auth and proof-logging work `get_transcript` already has, for no interoperability benefit yet.
+
+Build it the same shape as `get_transcript`: a new tool (e.g. `get_agent_channel(after_id)`) that returns new agent-to-agent lines since a cursor. Agents poll it on a loop exactly the way Advocates already poll `get_transcript` ([TURN_TAKING.md](TURN_TAKING.md) §5) — one tool call, only the new lines, no new transport paradigm to learn. Redaction (§4) happens before a line is ever stored or served through this tool, so there's no separate "redact on read" step to keep in sync.
+
+**Open:** the exact tool name/schema, and whether Advocate-to-Advocate messages route directly or always pass through the Arbitrator — §1 already puts the Arbitrator between them for the negotiation logic; whether that also holds at the transport level is an implementation detail, not a new decision to make from scratch.
+
+**Reconsider later, not now:** A2A becomes worth it the moment a real third-party or externally-hosted agent needs to join a room — a genuine interoperability problem. Nothing in this version's scope (§8) creates that case yet.
+
 ## 4. The redaction guard
 
 Do not rely on instructions alone to keep an advocate or the Arbitrator from stating a value it's holding. A single leaked number in a visible channel is irreversible the instant it renders, and "don't reveal your principal's floor" is one adversarial phrasing away from failing under pressure from the other agent.
@@ -74,10 +86,10 @@ This extends the existing floor gate ([TURN_TAKING.md](TURN_TAKING.md), `scripts
 | Conversation type | Role | Default mode |
 |---|---|---|
 | Negotiation | Advocate | Raise-hand — wait for the floor |
-| Arbitration | Arbitrator | May interject proactively |
+| Arbitration | Arbitrator | May post to the notes board / trigger an announcement proactively |
 | Casual/general | Any | Low-threshold, can speak more freely |
 
-Direct address always overrides the default (existing rule, unchanged).
+Direct address always overrides the default (existing rule, unchanged). The Arbitrator has no voice (§1), so "interject" for it never means taking the floor itself — it means writing to the notes board, or, for something that needs to be heard, prompting the relevant Advocate to say it.
 
 **Decided:** separately, any agent's speak-request carries a self-declared category tag, most are ordinary and just enter the table above. One category is confirmed and should exist from the start: **`OBJECTIVE_ACHIEVED`** — a deal or conversation objective has been reached — which should let an agent (most naturally the Arbitrator) skip the queue and announce a summary of what was agreed. Do not build a whole taxonomy around a single illustrative example; add categories as real cases come up rather than speculatively.
 
