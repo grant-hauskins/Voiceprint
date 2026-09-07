@@ -15,7 +15,7 @@ import threading
 import time
 import urllib.request
 import wave
-from collections import Counter
+from collections import Counter, deque
 from pathlib import Path
 
 CHUNK_BYTES = 8000          # 250 ms of mono 16 kHz PCM16
@@ -356,12 +356,15 @@ class Stream:
         self.consent = consent
         self.base, self.session, self.turns, self.log, self.on_chunk, self.verbose = base, session, turns, log, on_chunk, verbose
         self.sequence = 0
-        self.latencies = []
+        self.latencies = deque(maxlen=120)
 
     def feed(self, pcm, captured_at=None):
+        started = time.monotonic()
         require_consent(self.consent)
+        authorized = time.monotonic()
         attribution = api(self.base, f"/speaker/session/{self.session}/audio", {"sequence": self.sequence, "audio_base64": base64.b64encode(pcm).decode()})
-        elapsed = None if captured_at is None else (time.monotonic() - captured_at) * 1000
+        responded = time.monotonic()
+        elapsed = None if captured_at is None else (responded - captured_at) * 1000
         self.turns.observe(self.sequence, pcm, attribution)
         if self.verbose:
             print(f'{attribution["start_ms"] / 1000:6.2f}s  {attribution["speaker_id"] or "-":16} {attribution["status"]:10} {attribution.get("overlap"):9} {"" if elapsed is None else f"{elapsed:.0f} ms"}  segment={attribution["segment_id"]}', flush=True)
@@ -369,8 +372,27 @@ class Stream:
             self.log.write(json.dumps({"attribution": attribution, "capture_end_to_response_ms": elapsed}) + "\n"); self.log.flush()
         if self.on_chunk:
             self.on_chunk(pcm, attribution)
+        finished = time.monotonic()
+        self.latencies.append({
+            "queue_ms": None if captured_at is None else (started - captured_at) * 1000,
+            "consent_ms": (authorized - started) * 1000,
+            "api_ms": (responded - authorized) * 1000,
+            "consumer_ms": (finished - responded) * 1000,
+            "processing_ms": (finished - started) * 1000,
+        })
         self.sequence += 1
         return attribution
+
+    def timing_summary(self):
+        """Bounded numeric diagnostics only; no audio, identity, or transcript content."""
+        if not self.latencies:
+            return "Audio timing: no completed chunks."
+        parts = []
+        for key in ("processing_ms", "queue_ms", "consent_ms", "api_ms", "consumer_ms"):
+            values = sorted(row[key] for row in self.latencies if row[key] is not None)
+            if values:
+                parts.append(f"{key.removesuffix('_ms')} avg={sum(values) / len(values):.0f} max={max(values):.0f} ms")
+        return f"Audio timing (last {len(self.latencies)} chunks; {CHUNK_MS} ms/chunk budget): " + "; ".join(parts)
 
     def end(self):
         self.turns.flush()
@@ -434,7 +456,9 @@ class Microphone:
         try:
             self.chunks.put_nowait((bytes(data), time.monotonic()))
         except queue.Full:
-            self.failed.append("Inference cannot keep up with capture; stopping instead of silently dropping audio"); raise sd.CallbackAbort
+            self.failed.append(f"Audio processing fell behind capture: {self.chunks.maxsize} queued chunks "
+                               f"({self.chunks.maxsize * CHUNK_MS} ms buffer full); stopped to avoid an audio gap")
+            raise sd.CallbackAbort
 
     def __enter__(self):
         require_consent(self.consent)

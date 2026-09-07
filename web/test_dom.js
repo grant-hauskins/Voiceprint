@@ -74,6 +74,16 @@ async function main() {
   assert.equal(calls.at(-1).url,"/speaker/session/room/consents/person_1/revoke");
   ui.feed.apply(fixture); ui.disconnect(); assert.equal(ui.token,""); assert.equal(ui.feed.utterances.size,0);
 
+  const preEnrollment = new Console(new Document(), async (url) => {
+    if (url.endsWith("/consent")) return {ok:true,status:200,json:async()=>({session_id:"room",state:"active",allowed:true,participants:[],scopes:{local_processing:true}})};
+    if (url.includes("/events?")) return {ok:false,status:404,json:async()=>({message:"Session does not exist."})};
+    return {ok:true,status:200,json:async()=>({})};
+  }, {hostname:"127.0.0.1",protocol:"http:"});
+  preEnrollment.token = "synthetic_operator_credential"; preEnrollment.session = "room";
+  await preEnrollment.poll();
+  assert.match(preEnrollment.$("feed-state").textContent,/Awaiting runtime enrollment/);
+  assert.match(preEnrollment.$("runtime-state").textContent,/Start enrollment/);
+
   const noConfig = new Console(new Document(), async()=>({ok:true,status:200,json:async()=>({configured:false})}), {hostname:"127.0.0.1",protocol:"http:"});
   await noConfig.loadNotice(); assert(!noConfig.noticeReady); assert(noConfig.$("create-room").disabled);
   console.log("DOM/mock API checks passed: 4 replay rows, 2 calls, dedupe, XSS text, effective gates, unchecked releases, nonce binding, withdrawal clearing.");

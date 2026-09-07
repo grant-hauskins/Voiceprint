@@ -2,6 +2,8 @@
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import voiceprint_client as vp  # noqa: E402
@@ -91,6 +93,59 @@ class TurnsTest(unittest.TestCase):
         names = {"participant_1": "Grant", "participant_2": "Kyle"}
         self.assertEqual(vp.format_line({"speaker_id": "participant_1", "start_ms": 12500, "end_ms": 18000, "text": "hi", "label": "high", "utterance_id": 7}, names), "#7 [Grant 0:12.5-0:18.0 high] hi")
         self.assertEqual(vp.format_line({"speaker_id": None, "candidates": ["participant_1", "participant_2"], "start_ms": 0, "end_ms": 1500, "text": "x", "label": "overlap"}, names), "   [OVERLAP Grant+Kyle 0:00.0-0:01.5 overlap] x")
+
+
+class StreamTimingTest(unittest.TestCase):
+    def test_timing_separates_backlog_consent_api_and_consumers(self):
+        stream = vp.Stream("local", "synthetic", Mock(), consent=Mock())
+        with patch.object(vp.time, "monotonic", side_effect=[10, 10.02, 10.12, 10.15]), \
+                patch.object(vp, "api", return_value=chunk(0)):
+            stream.feed(b"\x00" * vp.CHUNK_BYTES, captured_at=9.7)
+        row = stream.latencies[0]
+        for key, expected in {"queue_ms": 300, "consent_ms": 20, "api_ms": 100,
+                              "consumer_ms": 30, "processing_ms": 150}.items():
+            self.assertAlmostEqual(row[key], expected)
+        self.assertIn("250 ms/chunk budget", stream.timing_summary())
+        self.assertNotIn("synthetic", stream.timing_summary())
+
+    def test_timings_are_bounded_and_replay_without_capture_time_works(self):
+        stream = vp.Stream("local", "synthetic", Mock(), consent=Mock())
+        self.assertIn("no completed chunks", stream.timing_summary())
+        with patch.object(vp, "api", return_value=chunk(0)):
+            for _ in range(125):
+                stream.feed(b"\x00" * vp.CHUNK_BYTES)
+        self.assertEqual(len(stream.latencies), 120)
+        self.assertNotIn("queue avg", stream.timing_summary())
+        self.assertEqual(stream.sequence, 125)
+
+
+class CaptureBacklogTest(unittest.TestCase):
+    def test_full_buffer_stops_without_overwriting_queued_audio(self):
+        class Abort(Exception):
+            pass
+        consent = Mock(valid_until=float("inf"))
+        consent.failed.is_set.return_value = False
+        capture = vp.Microphone(consent=consent)
+        with patch.dict(sys.modules, {"sounddevice": SimpleNamespace(CallbackAbort=Abort)}):
+            for i in range(4):
+                capture._callback(bytes([i]) * vp.CHUNK_BYTES, 4000, None, None)
+            with self.assertRaises(Abort):
+                capture._callback(b"\x00" * vp.CHUNK_BYTES, 4000, None, None)
+        with self.assertRaisesRegex(RuntimeError, "1000 ms buffer full"):
+            capture.get()
+        self.assertEqual([capture.chunks.get_nowait()[0][0] for _ in range(4)], [0, 1, 2, 3])
+
+    def test_revoked_consent_still_stops_before_queueing(self):
+        class Abort(Exception):
+            pass
+        consent = Mock(valid_until=float("inf"))
+        consent.failed.is_set.return_value = True
+        capture = vp.Microphone(consent=consent)
+        with patch.dict(sys.modules, {"sounddevice": SimpleNamespace(CallbackAbort=Abort)}):
+            with self.assertRaises(Abort):
+                capture._callback(b"\x00" * vp.CHUNK_BYTES, 4000, None, None)
+        self.assertTrue(capture.chunks.empty())
+        self.assertIn("Consent stale or revoked", capture.failed[0])
 
 
 if __name__ == "__main__":

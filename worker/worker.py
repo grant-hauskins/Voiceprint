@@ -72,7 +72,10 @@ class Models:
         from speechbrain.inference.speaker import EncoderClassifier
         from speechbrain.utils.fetching import LocalStrategy
 
-        torch.set_num_threads(int(os.environ.get("VOICEPRINT_ML_THREADS", "2")))
+        # Small streaming windows can be slower with thread-pool coordination.
+        # Keep the override for machines benchmarked with a different CPU budget.
+        threads = int(os.environ.get("VOICEPRINT_ML_THREADS", "1"))
+        torch.set_num_threads(threads)
         self.torch = torch
         # Local-only model loading: setup_models.py performs the explicit downloads.
         self.encoder = EncoderClassifier.from_hparams(
@@ -81,7 +84,7 @@ class Models:
             run_opts={"device": "cpu"}, local_strategy=LocalStrategy.COPY,
         )
         options = ort.SessionOptions()
-        options.intra_op_num_threads = int(os.environ.get("VOICEPRINT_ML_THREADS", "2"))
+        options.intra_op_num_threads = threads
         options.inter_op_num_threads = 1
         self.segmentation = ort.InferenceSession(str(root / "segmentation.onnx"), options, providers=["CPUExecutionProvider"])
         # SincNet kernels [251,5,5], strides [1,1,1], max pools [3,3,3],

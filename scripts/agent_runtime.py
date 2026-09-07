@@ -790,6 +790,8 @@ async def main(args):
             server.server_close()
         if capture_thread:
             await asyncio.to_thread(capture_thread.join, 45)
+        if stream:
+            print(stream.timing_summary(), flush=True)
         if stream and not consent.failed.is_set():
             try:
                 stream.turns.flush()

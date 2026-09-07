@@ -142,7 +142,7 @@ Other providers: xAI Responses and Speech-to-Speech accept the same remote MCP s
 - `VOICEPRINT_WORKER_URL`: default `http://127.0.0.1:8091`.
 - `VOICEPRINT_DB`: default `data/voiceprint.sqlite`.
 - `VOICEPRINT_API_TOKEN`: optional bearer token; set the same value in the API, microphone client and MCP adapter environments.
-- `VOICEPRINT_ML_THREADS`: Python CPU inference threads, default `2`.
+- `VOICEPRINT_ML_THREADS`: Python CPU inference threads, default `1`. More threads can slow these small streaming windows; benchmark before overriding.
 - Worker `--calibration PATH`: load an eligible calibration artifact; fails startup if invalid.
 
 Both servers bind to loopback. They are intended for a single trusted local user. Network deployment requires a separate authenticated TLS boundary and tenant isolation; it is not part of this spike. Browser-origin API requests are rejected.

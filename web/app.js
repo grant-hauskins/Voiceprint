@@ -203,6 +203,13 @@
         if (events.status === "fulfilled") {
           this.feed.apply(events.value); this.$("feed-state").textContent = "Live · server feed";
           this.$("call-count").textContent = this.feed.callIds.size; this.$("utterance-count").textContent = this.feed.utterances.size;
+        } else if (/^404: Session does not exist\.?$/.test(events.reason.message || "")) {
+          // Releases authorize enrollment but deliberately do not create a speaker session.
+          // Do not present that safe pre-capture state as a protected-feed failure.
+          this.clearProtected();
+          this.$("feed-state").textContent = "Awaiting runtime enrollment · microphone remains closed";
+          this.$("runtime-state").textContent = "Start enrollment in the runtime after every participant has released.";
+          return;
         } else { this.clearProtected(); this.say(`Protected feed unavailable: ${events.reason.message}`); return; }
         if (roster.status === "fulfilled") this.renderRoster(roster.value.participants || []);
         if (current.status === "fulfilled") this.renderCurrent(current.value);

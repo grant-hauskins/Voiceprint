@@ -1,5 +1,15 @@
 # Verification record
 
+## Capture backlog investigation — 2026-09-07
+
+`conversation_test_004` stopped when its four-chunk microphone queue filled (one second of audio). The old error blamed inference without measuring the full consumer path. The supplied run output has incomplete playback evidence and zero independent server MCP samples; it does not establish successful agent replies or zero floor violations.
+
+An isolated local CPU benchmark used generated random input for the speaker encoder and zeros for segmentation, without microphone capture, human recording replay, or provider calls. With the prepared models, median encoder time was about 160 ms with two threads versus 94 ms with one; segmentation was about 23 ms versus 34 ms respectively. These isolated measurements suggest useful processing headroom, but exclude API, consent, transcription and concurrent runtime load. They do not identify the exact delay in the ended run or validate live accuracy.
+
+The worker now defaults to one CPU thread, with `VOICEPRINT_ML_THREADS` still overriding it. Restart the worker to apply this change; an existing environment override must also be updated. Runtime shutdown prints average/maximum queue age, consent-check time, audio API time, downstream consumer time and total processing time for up to the last 120 completed chunks. Queue age includes time spent awaiting the capture read's authorization; API time includes server coordination and worker inference. The 250 ms processing budget excludes queue age. In-flight failed requests are not included. These bounded numeric diagnostics contain no audio or transcript text.
+
+The one-second buffer and fresh-consent checks remain enforced. A full buffer still aborts capture before a gap can be silently accepted, now reporting the queue capacity accurately. A new consented live run is required to establish whether the default resolves the reported stop under full load.
+
 ## Real-model two-speaker integration run
 
 Executed locally on 2026-09-05 with Java 21, Python 3.12, Torch 2.6 CPU, SpeechBrain 1.0.3 and ONNX Runtime 1.22.1. Models were downloaded from the public repositories linked below, pinned by revision and hashed in local `models/manifest.json`.
