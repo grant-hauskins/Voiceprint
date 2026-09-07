@@ -280,6 +280,7 @@ class Agent:
         self.pending_posts = 0
         self.transcript_ids = set()
         self.start_ms = 0
+        self.mcp = {"list_tools": "unknown", "tools": [], "calls": 0, "failed": 0, "last_error": None}
 
     @property
     def floor_path(self):
@@ -292,7 +293,36 @@ class Agent:
         return {"name": self.config.name, "participant_id": self.participant_id,
                 "provider": self.config.provider, "model": self.config.model, "voice": self.config.voice,
                 "eagerness": self.gate.eagerness, "held": self.gate.manual == "hold",
-                "responding": self.active or self.player.busy()}
+                "responding": self.active or self.player.busy(), "mcp": dict(self.mcp)}
+
+    @staticmethod
+    def safe_error(item):
+        error = item.get("error")
+        if error is None:
+            return None
+        text = error if isinstance(error, str) else json.dumps(error, sort_keys=True)
+        return re.sub(r"[^\x20-\x7e]", "?", text)[:200]
+
+    def note_tool_item(self, item):
+        """Provider-declared MCP outcomes. This is what OpenAI says it did; the server's own proof rows are the evidence.
+        A failed tools listing means the model has no tool and will only talk about fetching the transcript."""
+        kind = item.get("type")
+        if kind == "mcp_list_tools":
+            error = self.safe_error(item)
+            tools = [t.get("name") for t in item.get("tools") or [] if isinstance(t, dict)]
+            self.mcp["list_tools"] = "failed" if error or item.get("status") == "failed" else "ok"
+            self.mcp["tools"] = [t for t in tools if t in ("get_transcript", "get_current_speaker")]
+            self.mcp["last_error"] = error or (item.get("status") if item.get("status") == "failed" else None)
+            print(f"{self.config.name}: provider {'FAILED to list' if self.mcp['list_tools'] == 'failed' else 'listed'} the MCP tools"
+                  + (f" ({self.mcp['last_error']})" if self.mcp["last_error"] else f" {self.mcp['tools']}") + "; the server log is the independent record", flush=True)
+        elif kind == "mcp_call":
+            error = self.safe_error(item)
+            name = item.get("name") if item.get("name") in ("get_transcript", "get_current_speaker") else "other"
+            self.mcp["calls"] += 1
+            if error:
+                self.mcp["failed"] += 1
+                self.mcp["last_error"] = error
+            print(f"{self.config.name}: provider reports MCP {name} -> {'failed: ' + error if error else 'ok'}", flush=True)
 
     async def claim(self, renew=False):
         sent_at = time.monotonic()
@@ -432,6 +462,8 @@ class Agent:
             self.tool_calls += 1
         elif kind in ("response.mcp_call.completed", "response.mcp_call.failed"):
             self.tool_calls = max(0, self.tool_calls - 1)
+        elif kind == "response.output_item.done":
+            self.note_tool_item(event.get("item") or {})
         elif kind == "response.done":
             response = event.get("response", {})
             output = response.get("output", [])
@@ -563,7 +595,7 @@ class Runtime:
                     "participants": [dict(p, enrollment=self.enrollment.get(p["id"], {"state": "pending", "peak": None}))
                                      for p in self.participants],
                     "awaiting": self.awaiting, "needs_openai_key": self.needs_openai_key(),
-                    "mcp_configured": bool(self.mcp_url), "gui": self.gui}
+                    "mcp_configured": bool(self.mcp_url), "mcp_url": self.mcp_url, "gui": self.gui}
 
     def bootstrap(self):
         """Loopback-GUI convenience: only a runtime started with --gui hands the operator token to the page

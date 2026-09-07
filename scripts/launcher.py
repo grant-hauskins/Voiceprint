@@ -139,6 +139,22 @@ def worker_accepts_token(url, token):
         return False
 
 
+def mcp_tools_listed(url, token, timeout=8):
+    """None when a JSON-RPC tools/list through `url` returns our two tools; otherwise a short reason."""
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}).encode()
+    request = urllib.request.Request(url, body, {"Content-Type": "application/json", "Accept": "application/json, text/event-stream",
+                                                 "Authorization": "Bearer " + token}, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.load(response)
+    except urllib.error.HTTPError as error:
+        return f"HTTP {error.code}"
+    except Exception as error:
+        return type(error).__name__
+    names = {t.get("name") for t in (payload.get("result") or {}).get("tools", []) if isinstance(t, dict)}
+    return None if {"get_transcript", "get_current_speaker"} <= names else f"unexpected tools {sorted(names)}"
+
+
 class KillOnClose:
     """Windows job object: every process assigned to it dies when this launcher dies, however it dies."""
 
@@ -237,6 +253,7 @@ def main(argv=None):
     parser.add_argument("--control-port", type=int, default=int(os.environ.get("VOICEPRINT_CONTROL_PORT", "0") or 0))
     parser.add_argument("--device", default=os.environ.get("VOICEPRINT_DEVICE"), help="microphone preference passed to the runtime")
     parser.add_argument("--once", action="store_true", help="exit when the first conversation ends instead of offering another")
+    parser.add_argument("--skip-tunnel-check", action="store_true", help="do not verify tools/list through the public MCP URL before starting the runtime")
     parser.add_argument("--replace-services", action="store_true", help="stop whatever already listens on the worker/API/MCP ports and start fresh")
     parser.add_argument("--reuse-services", action="store_true", help="keep already-running worker/API if their credentials and notice match this launcher")
     args = parser.parse_args(argv)
@@ -312,6 +329,11 @@ def main(argv=None):
             children.append(Child("tunnel", [cloudflared, "tunnel", "--url", f"http://127.0.0.1:{mcp_port}"], env, watch=watch))
             wait_for(lambda: bool(tunnel["url"]), 60, "the cloudflared quick tunnel URL")
         print(f"Hosted MCP for OpenAI: {tunnel['url']} (port {mcp_port} only; the API and GUI are never tunnelled)", flush=True)
+        if not args.skip_tunnel_check:
+            # The hostname came from our own cloudflared moments ago (or from the operator's env), so probing it with our
+            # token is safe, and it is the only way to know that OpenAI will be able to list the tools at all.
+            wait_for(lambda: mcp_tools_listed(tunnel["url"], env["VOICEPRINT_MCP_TOKEN"]) is None, 45, "tools/list to succeed through the tunnel")
+            print("Tunnel verified: tools/list answered through the public URL.", flush=True)
         control_port = args.control_port or free_port(8090)
         first = True
         while True:

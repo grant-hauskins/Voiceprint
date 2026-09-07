@@ -70,6 +70,34 @@ class LauncherHelpersTest(unittest.TestCase):
             if process.poll() is None:
                 process.kill()
 
+    def test_mcp_tools_listed_reports_reasons(self):
+        import http.server, json, threading
+        answers = {"status": 200, "tools": ["get_transcript", "get_current_speaker", "list_sessions"]}
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                assert json.loads(body)["method"] == "tools/list"
+                assert self.headers.get("Authorization") == "Bearer tok"
+                payload = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"tools": [{"name": n} for n in answers["tools"]]}}).encode()
+                self.send_response(answers["status"]); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(payload))); self.end_headers(); self.wfile.write(payload)
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            url = f"http://127.0.0.1:{server.server_port}/mcp"
+            self.assertIsNone(launcher.mcp_tools_listed(url, "tok"))
+            answers["tools"] = ["get_transcript"]
+            self.assertIn("unexpected tools", launcher.mcp_tools_listed(url, "tok"))
+            answers["status"] = 401
+            self.assertEqual(launcher.mcp_tools_listed(url, "tok"), "HTTP 401")
+        finally:
+            server.shutdown(); server.server_close()
+        self.assertEqual(launcher.mcp_tools_listed("http://127.0.0.1:1/mcp", "tok", timeout=2), "URLError")
+
     def test_main_refuses_without_local_credentials(self):
         env = {k: v for k, v in dict(**__import__("os").environ).items() if not k.startswith("VOICEPRINT_")}
         result = subprocess.run([sys.executable, str(Path(launcher.__file__)), "--no-browser"], env=env, capture_output=True, text=True, timeout=30)

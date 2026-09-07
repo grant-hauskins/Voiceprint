@@ -147,6 +147,23 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(agent.provider.replies), 2)
         self.assertTrue(agent.floor_owned)
 
+    async def test_provider_declared_mcp_outcomes_are_tracked_without_content(self):
+        room = make_room()
+        agent = room.agents[0]
+        await agent.begin("speak")
+        self.assertEqual(agent.state()["mcp"], {"list_tools": "unknown", "tools": [], "calls": 0, "failed": 0, "last_error": None})
+        await agent.event({"type": "response.output_item.done", "response_id": "r1", "item": {"type": "mcp_list_tools", "status": "failed", "error": {"type": "http_error", "code": 502, "message": "Bad gateway☃"}}})
+        mcp = agent.state()["mcp"]
+        self.assertEqual(mcp["list_tools"], "failed"); self.assertIn("502", mcp["last_error"]); self.assertNotIn("☃", mcp["last_error"])
+        await agent.event({"type": "response.output_item.done", "response_id": "r1", "item": {"type": "mcp_list_tools", "status": "completed", "tools": [{"name": "get_transcript"}, {"name": "get_current_speaker"}, {"name": "secret_tool"}]}})
+        mcp = agent.state()["mcp"]
+        self.assertEqual((mcp["list_tools"], mcp["tools"], mcp["last_error"]), ("ok", ["get_transcript", "get_current_speaker"], None))
+        await agent.event({"type": "response.output_item.done", "response_id": "r1", "item": {"type": "mcp_call", "name": "get_transcript", "arguments": "{\"session_id\":\"room\"}", "output": "#1 lines"}})
+        await agent.event({"type": "response.output_item.done", "response_id": "r1", "item": {"type": "mcp_call", "name": "get_transcript", "error": "Tool call failed: 403"}})
+        mcp = agent.state()["mcp"]
+        self.assertEqual((mcp["calls"], mcp["failed"], mcp["last_error"]), (2, 1, "Tool call failed: 403"))
+        self.assertNotIn("#1 lines", json.dumps(agent.state()))          # outputs never reach the control API
+
     async def test_floor_released_only_after_done_and_drain(self):
         room = make_room()
         agent = room.agents[0]

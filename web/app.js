@@ -191,6 +191,7 @@
       const phase = r ? (r.phase || "live") : null;
       this.$("phase").textContent = !this.token ? "Connect first" : !r ? `Runtime unavailable on ${this.control.slice(7)}` : phase;
       this.$("phase-detail").textContent = r && r.detail ? r.detail : !r && this.token ? "Start it with Voiceprint.cmd (or scripts\\dev.ps1 up) and this page will connect on its own." : "";
+      this.$("mcp-url").textContent = r && r.mcp_url ? `Hosted MCP URL given to the provider: ${r.mcp_url}` : "";
       this.$("setup-form").hidden = phase !== "setup";
       this.$("key-label").hidden = !(r && r.needs_openai_key);
       // Without both review flags the API computes the hosted scopes as false, so a room created now would fail after everyone signed.
@@ -420,6 +421,9 @@
         const label = node(this.doc, "label", "Eagerness"), select = node(this.doc, "select");
         for (const value of ["quiet", "balanced", "eager"]) { const option = node(this.doc, "option", value); option.value = value; select.append(option); }
         select.value = a.eagerness; select.disabled = !enabled; select.addEventListener("change", async () => { try { await this.control(a.name, {action:"eagerness",value:select.value}); } catch (e) { this.say(e.message); } }); label.append(select);
+        const m = a.mcp || {};
+        const listing = m.list_tools === "failed" ? `Provider FAILED to list our MCP tools${m.last_error ? `: ${m.last_error}` : ""}. The agent cannot call get_transcript; check the tunnel URL and token.` : m.list_tools === "ok" ? `Provider listed tools ${JSON.stringify(m.tools || [])}` : "Provider has not listed our MCP tools yet (happens on its first reply).";
+        card.append(node(this.doc, "p", `${listing} Provider-declared calls: ${m.calls || 0}${m.failed ? ` (${m.failed} failed: ${m.last_error || "no detail"})` : ""}.`, m.list_tools === "failed" || m.failed ? "warn" : "muted"));
         const call = this.feed.lastCalls.get(a.participant_id);
         card.append(actions, label, node(this.doc, "p", call ? `Last declared MCP call: ${call.tool} · ${call.bytes} bytes · ${stamp(call.timestamp_ms)}` : "No server call attributed to this agent.", "muted")); this.$("agents").append(card);
       }
