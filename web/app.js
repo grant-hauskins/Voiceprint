@@ -115,7 +115,7 @@
       const run = fn => async event => { event.preventDefault(); try { await fn(); } catch (e) { this.say(e.message); } };
       this.$("connect-form").addEventListener("submit", run(async () => {
         const token = this.$("token").value.trim(); this.disconnect(); this.token = token;
-        await this.loadNotice(); await this.loadRooms(); this.$("connection").textContent = "Operator connected"; this.say("");
+        await this.loadNotice(); await this.loadRooms(); this.$("connection").textContent = "Operator connected"; this.say(""); this.renderStage();
       }));
       this.$("disconnect").addEventListener("click", () => { this.disconnect(); this.$("token").value = ""; });
       this.$("refresh").addEventListener("click", run(() => this.loadRooms()));

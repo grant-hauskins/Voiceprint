@@ -1,10 +1,10 @@
 /* Slate console. No storage, analytics, microphone API, or external assets. API enforces authority. */
 @property --orb-angle { syntax: "<angle>"; inherits: false; initial-value: 0deg; }
-:root{color-scheme:dark;--bg:#0f172a;--bg-2:#131c31;--panel:#1e293b;--panel-2:#243247;--ink:#e2e8f0;--muted:#94a3b8;--line:#334155;--accent:#38bdf8;--accent-2:#a78bfa;--soft:#1f3a4d;--warn:#fbbf24;--danger:#fb7185;--ok:#34d399;--radius:14px}
-@media(prefers-color-scheme:light){:root.light{--bg:#e2e8f0;--bg-2:#f1f5f9;--panel:#f8fafc;--panel-2:#e2e8f0;--ink:#0f172a;--muted:#475569;--line:#cbd5e1;--soft:#dbeafe}}
+:root{color-scheme:dark;--bg:#0f172a;--bg-2:#131c31;--panel:#1e293b;--panel-2:#243247;--ink:#e2e8f0;--muted:#94a3b8;--line:#334155;--accent:#38bdf8;--accent-2:#a78bfa;--soft:#1f3a4d;--warn:#fbbf24;--danger:#fb7185;--ok:#34d399;--glow-1:#1e3a5f;--glow-2:#312e5a;--scrim:rgba(2,6,23,.72);--radius:14px}
+@media(prefers-color-scheme:light){:root{color-scheme:light;--bg:#e2e8f0;--bg-2:#f1f5f9;--panel:#f8fafc;--panel-2:#e2e8f0;--ink:#0f172a;--muted:#475569;--line:#cbd5e1;--accent:#0284c7;--accent-2:#7c3aed;--soft:#dbeafe;--warn:#b45309;--danger:#be123c;--ok:#047857;--glow-1:#bfdbfe;--glow-2:#ddd6fe;--scrim:rgba(15,23,42,.55)}}
 *{box-sizing:border-box}
 html{background:var(--bg)}
-body{margin:0;min-height:100vh;color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;background:radial-gradient(1200px 600px at 10% -10%,#1e3a5f 0%,transparent 60%),radial-gradient(900px 500px at 100% 0%,#312e5a 0%,transparent 55%),linear-gradient(180deg,var(--bg-2),var(--bg) 40%)}
+body{margin:0;min-height:100vh;color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;background:radial-gradient(1200px 600px at 10% -10%,var(--glow-1) 0%,transparent 60%),radial-gradient(900px 500px at 100% 0%,var(--glow-2) 0%,transparent 55%),linear-gradient(180deg,var(--bg-2),var(--bg) 40%)}
 h1,h2,h3,h4{margin:0;font-weight:700;letter-spacing:-.01em}h2{font-size:19px}h3{font-size:15px;margin-top:14px}h4{font-size:13px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin:18px 0 6px}
 p{margin:8px 0}
 a{color:var(--accent);text-decoration:none}
@@ -33,7 +33,7 @@ input,select,textarea,button{font:inherit;border:1px solid var(--line);border-ra
 input:not([type=checkbox]):not([type=file]),select,textarea{display:block;width:100%;max-width:520px}textarea{max-width:760px}
 input[type=checkbox]{width:19px;height:19px;vertical-align:middle;margin-right:10px;accent-color:var(--accent)}input[type=file]{padding:6px}
 button{cursor:pointer;font-weight:650;background:var(--panel-2);display:inline-flex;align-items:center;gap:8px}button:hover:enabled{border-color:var(--accent)}button:disabled{opacity:.45;cursor:not-allowed}
-button.primary{background:linear-gradient(135deg,var(--accent),var(--accent-2));color:#0b1220;border-color:transparent}button.big{font-size:17px;padding:12px 20px}
+button.primary{background:linear-gradient(135deg,var(--accent),var(--accent-2));color:#fff;border-color:transparent}button.big{font-size:17px;padding:12px 20px}
 button.danger{color:var(--danger)}button.ghost{background:transparent}
 .ico{font-size:14px;line-height:1}
 .inline{display:flex;align-items:flex-end;gap:12px;flex-wrap:wrap}.inline label{margin:0}
@@ -77,7 +77,7 @@ meter{width:100%;display:block}meter[hidden]{display:none}
 .release-feedback{color:var(--ok)}
 details{margin-top:14px}summary{cursor:pointer;font-weight:650;color:var(--muted)}
 address{font-style:normal;font-weight:650}
-.gate{position:fixed;inset:0;z-index:20;display:flex;align-items:flex-start;justify-content:center;padding:28px 16px;overflow:auto;background:rgba(2,6,23,.72);backdrop-filter:blur(6px)}
+.gate{position:fixed;inset:0;z-index:20;display:flex;align-items:flex-start;justify-content:center;padding:28px 16px;overflow:auto;background:var(--scrim);backdrop-filter:blur(6px)}
 .gate[hidden]{display:none}
 .gate-card{width:min(1100px,100%);background:var(--panel);border:1px solid var(--line);border-radius:18px;box-shadow:0 30px 80px rgba(0,0,0,.5);padding:22px 26px}
 .gate-head{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;border-bottom:1px solid var(--line);padding-bottom:14px}
