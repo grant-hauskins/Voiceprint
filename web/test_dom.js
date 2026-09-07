@@ -96,6 +96,7 @@ async function main() {
     if (url === "http://127.0.0.1:8123/bootstrap") { assert(!options.headers.Authorization); data = {phase, session_id:sessionId, gui:true, api_token:"launcher_token"}; }
     else if (url === "http://127.0.0.1:8123/agents") data = {session_id:sessionId, agents:[], phase, detail:`in ${phase}`, awaiting, needs_openai_key:phase === "setup",
       agent_configs:[{name:"Ava", voice:"marin", model:"m", eagerness:"balanced", instructions:"Answer in haiku.", speaks_for:""}, {name:"Ben", voice:"cedar", model:"m", eagerness:"quiet", instructions:"", speaks_for:""}],
+      voices:["marin","cedar","sage"], eagerness_levels:["quiet","balanced","eager"], max_agents:3,
       participants: sessionId ? [{id:"participant_1", name:"Synthetic One", enrollment:{state:awaiting === "participant_1" ? "waiting" : "recorded", peak:awaiting ? null : 9000}}] : []};
     else if (url === "http://127.0.0.1:8123/setup") { phase = "consent"; sessionId = "room_auto"; }
     else if (url === "http://127.0.0.1:8123/enrollment/record") { awaiting = null; phase = "ready"; }
@@ -131,10 +132,19 @@ async function main() {
   agentCards[1].querySelector('[name="speaks_for"]').value = "Synthetic Two"; agentCards[1].querySelector('[name="instructions"]').value = "Only words starting with A.";
   launched.$("openai-key").value = "sk-synthetic-key-value-0000000000";
   await launched.pollRuntime(); assert.equal(launched.$("setup-agents").children[1].querySelector('[name="instructions"]').value, "Only words starting with A.");   // polling keeps typed text
+  launched.addAgentCard(); launched.addAgentCard();
+  assert.equal(launched.$("setup-agents").children.length, 3); assert.match(launched.$("message").textContent, /At most 3 agents/);   // runtime's cap
+  const third = launched.$("setup-agents").children[2];
+  third.querySelector('[name="name"]').value = "Synthetic Two";                                          // collides with a human
+  await assert.rejects(() => launched.submitSetup(), /distinct from the other agents and from the people/);
+  third.querySelector('[name="name"]').value = "Cy"; third.querySelector('[name="voice"]').value = "sage"; third.querySelector('[name="eagerness"]').value = "eager";
+  third.querySelector('[name="speaks_for"]').value = "Synthetic One"; third.querySelector('[name="instructions"]').value = "Speak only in questions.";
+  launched.$("openai-key").value = "sk-synthetic-key-value-0000000000";
   await launched.submitSetup();
   const setup = runtimeCalls.find(c => c.url.endsWith("/setup"));
   assert.deepEqual(JSON.parse(setup.options.body), {participants:[{name:"Synthetic One",contact:"one@example.invalid"},{name:"Synthetic Two",contact:"555-0100"}],
-    agents:[{name:"Ava", speaks_for:"", instructions:"Answer in haiku."}, {name:"Ben", speaks_for:"Synthetic Two", instructions:"Only words starting with A."}], openai_api_key:"sk-synthetic-key-value-0000000000"});
+    agents:[{name:"Ava", voice:"marin", eagerness:"balanced", speaks_for:"", instructions:"Answer in haiku."}, {name:"Ben", voice:"cedar", eagerness:"quiet", speaks_for:"Synthetic Two", instructions:"Only words starting with A."},
+      {name:"Cy", voice:"sage", eagerness:"eager", speaks_for:"Synthetic One", instructions:"Speak only in questions."}], openai_api_key:"sk-synthetic-key-value-0000000000"});
   assert.equal(setup.options.headers.Authorization, "Bearer launcher_token");
   assert.equal(launched.$("openai-key").value, "");                       // key never lingers in the page
   assert.equal(launched.session, "room_auto");                            // runtime's room opened automatically

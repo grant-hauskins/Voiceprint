@@ -14,6 +14,7 @@ import argparse
 import dataclasses
 import asyncio
 import base64
+import hashlib
 import hmac
 import json
 import os
@@ -64,25 +65,77 @@ def clean_instructions(text):
     return text
 
 
+VOICES = ("alloy", "ash", "ballad", "cedar", "coral", "echo", "marin", "sage", "shimmer", "verse")
+MAX_AGENTS = 4
+
+
 def persona_path(name):
-    return PERSONA_DIR / (re.sub(r"[^A-Za-z0-9_-]", "_", name) + ".md")
+    """Collision-free per-agent file: readable slug plus a hash of the exact name, so 'A B' and 'A_B' never share."""
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:10]
+    return PERSONA_DIR / (re.sub(r"[^A-Za-z0-9_-]", "_", name)[:40] + "-" + digest + ".json")
 
 
-def load_persona(name):
-    """Persisted standing instructions for an agent (operator text, not participant data); empty when none."""
+def persona_record(config):
+    return {"name": config.name, "voice": config.voice, "eagerness": config.eagerness, "speaks_for": config.speaks_for, "instructions": config.instructions_extra}
+
+
+def load_personas():
+    """Every persisted agent (operator text, not participant data), keyed by exact name. An explicit empty
+    instructions value is kept as empty, so clearing a TOML default sticks between runs."""
+    result = {}
     try:
-        return clean_instructions(persona_path(name).read_text(encoding="utf-8"))
-    except (FileNotFoundError, ValueError):
-        return ""
+        files = sorted(PERSONA_DIR.glob("*.json"))
+    except OSError:
+        return result
+    for path in files:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            name = data.get("name")
+            if not isinstance(name, str) or not NAME_RE.match(name) or persona_path(name) != path:
+                continue
+            result[name] = {"name": name, "voice": data.get("voice") if data.get("voice") in VOICES else None,
+                            "eagerness": data.get("eagerness") if data.get("eagerness") in tg.SILENCE_AFTER_TURN_S else None,
+                            "speaks_for": data.get("speaks_for") if isinstance(data.get("speaks_for"), str) else "",
+                            "instructions": clean_instructions(data.get("instructions", ""))}
+        except (OSError, ValueError):
+            continue
+    return result
 
 
-def save_persona(name, text):
+def save_personas(configs):
+    """The setup panel is what is saved: files for these agents are written, files for agents no longer listed are removed."""
     PERSONA_DIR.mkdir(parents=True, exist_ok=True)
-    path = persona_path(name)
-    if text:
-        path.write_text(text + "\n", encoding="utf-8")
-    elif path.exists():
-        path.unlink()
+    keep = set()
+    for config in configs:
+        path = persona_path(config.name)
+        path.write_text(json.dumps(persona_record(config), ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+        keep.add(path)
+    for path in PERSONA_DIR.glob("*.json"):
+        if path not in keep:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
+def merge_personas(configs):
+    """agents.toml defaults with persisted values on top, plus persisted agents that are not in the file."""
+    saved = load_personas()
+    result, seen = [], set()
+    for config in configs:
+        record = saved.get(config.name)
+        seen.add(config.name)
+        if record is None:
+            result.append(config)
+        else:
+            result.append(dataclasses.replace(config, voice=record["voice"] or config.voice, eagerness=record["eagerness"] or config.eagerness,
+                                              speaks_for=record["speaks_for"], instructions_extra=record["instructions"]))
+    template = configs[0] if configs else AgentConfig("template")
+    for name, record in saved.items():
+        if name not in seen:
+            result.append(dataclasses.replace(template, name=name, voice=record["voice"] or template.voice, eagerness=record["eagerness"] or template.eagerness,
+                                              speaks_for=record["speaks_for"], instructions_extra=record["instructions"]))
+    return result[:MAX_AGENTS]
 
 
 def load_config(path):
@@ -604,9 +657,9 @@ class Runtime:
         self.lock = threading.Lock()
         self.room = room
         self.gui = gui
-        # Persisted standing instructions win over agents.toml so each person's agent keeps its flavor between runs.
-        self.configs = [dataclasses.replace(c, instructions_extra=load_persona(c.name) or c.instructions_extra) for c in configs]
-        self.agent_overrides = {}
+        # Persisted personas win over agents.toml so each person's agent keeps its flavor between runs.
+        self.configs = merge_personas(list(configs))
+        self.session_configs = None
         self.mcp_url, self.api_token = mcp_url, api_token
         self.phase = "live" if room is not None else "setup"
         self.detail = ""
@@ -637,7 +690,8 @@ class Runtime:
                                      for p in self.participants],
                     "awaiting": self.awaiting, "needs_openai_key": self.needs_openai_key(),
                     "agent_configs": [{"name": c.name, "voice": c.voice, "model": c.model, "eagerness": c.eagerness,
-                                       "instructions": c.instructions_extra, "speaks_for": c.speaks_for} for c in self.configs],
+                                       "instructions": c.instructions_extra, "speaks_for": c.speaks_for} for c in (self.session_configs or self.configs)],
+                    "voices": list(VOICES), "eagerness_levels": list(tg.SILENCE_AFTER_TURN_S), "max_agents": MAX_AGENTS,
                     "mcp_configured": bool(self.mcp_url), "mcp_url": self.mcp_url, "gui": self.gui}
 
     def bootstrap(self):
@@ -672,36 +726,54 @@ class Runtime:
             raise ValueError("Invalid provider key")
         if self.needs_openai_key() and not key:
             raise ValueError("The OpenAI API key is required to start the agents")
-        overrides = {}
-        agents = body.get("agents", [])
-        if not isinstance(agents, list):
-            raise ValueError("Invalid agents")
-        for row in agents:
-            if not isinstance(row, dict) or not any(c.name == row.get("name") for c in self.configs):
-                raise ValueError("Unknown agent")
-            speaks_for = row.get("speaks_for", "")
-            if not isinstance(speaks_for, str):
-                raise ValueError("speaks_for must be a name")
-            speaks_for = speaks_for.strip()
-            if speaks_for and speaks_for.casefold() not in {n.casefold() for n in names}:
-                raise ValueError(f"{row['name']} can only speak for a person in the room")
-            overrides[row["name"]] = {"instructions": clean_instructions(row.get("instructions", "")), "speaks_for": speaks_for}
+        session_configs = self.configs
+        if "agents" in body:
+            session_configs = self.build_agents(body.get("agents"), names)
         if key:
             # Held only in this process's environment for the provider transport; never logged or written.
             os.environ["OPENAI_API_KEY"] = key.strip()
         with self.lock:
-            self.agent_overrides = overrides
-            self.configs = self.apply_overrides(self.configs)
-        for name, override in overrides.items():
-            save_persona(name, override["instructions"])
+            self.session_configs = session_configs
+        if "agents" in body:
+            save_personas(session_configs)
         self.setup.put({"names": names, "contacts": contacts, "session_id": session})
 
-    def apply_overrides(self, configs):
-        result = []
-        for config in configs:
-            override = self.agent_overrides.get(config.name)
-            result.append(dataclasses.replace(config, instructions_extra=override["instructions"], speaks_for=override["speaks_for"]) if override else config)
+    def build_agents(self, rows, human_names):
+        """One separate agent instance per row, each with its own prompt. Unknown names become new agents based on the
+        first configured one (provider, model, output device); nothing carries over from another agent's instructions."""
+        if not isinstance(rows, list) or not 1 <= len(rows) <= MAX_AGENTS:
+            raise ValueError(f"Configure one to {MAX_AGENTS} agents")
+        by_name = {c.name: c for c in self.configs}
+        template = self.configs[0] if self.configs else AgentConfig("template")
+        humans = {n.casefold() for n in human_names}
+        result, seen = [], set()
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ValueError("Invalid agent")
+            name = row.get("name")
+            if not isinstance(name, str) or not NAME_RE.match(name.strip()) or len(name.strip()) > 60:
+                raise ValueError("Each agent needs a name of at most 60 characters")
+            name = name.strip()
+            if name.casefold() in seen or name.casefold() in humans:
+                raise ValueError(f"Agent name {name} must be distinct from the other agents and from the people in the room")
+            seen.add(name.casefold())
+            base = by_name.get(name, dataclasses.replace(template, name=name, speaks_for="", instructions_extra=""))
+            voice = row.get("voice", base.voice)
+            eagerness = row.get("eagerness", base.eagerness)
+            if voice not in VOICES or eagerness not in tg.SILENCE_AFTER_TURN_S:
+                raise ValueError(f"{name}: voice must be one of {', '.join(VOICES)} and eagerness quiet, balanced or eager")
+            speaks_for = row.get("speaks_for", "")
+            if not isinstance(speaks_for, str):
+                raise ValueError("speaks_for must be a name")
+            speaks_for = speaks_for.strip()
+            if speaks_for and speaks_for.casefold() not in humans:
+                raise ValueError(f"{name} can only speak for a person in the room")
+            result.append(dataclasses.replace(base, name=name, voice=voice, eagerness=eagerness, speaks_for=speaks_for,
+                                              instructions_extra=clean_instructions(row.get("instructions", base.instructions_extra))))
         return result
+
+    def active_configs(self):
+        return list(self.session_configs if self.session_configs is not None else self.configs)
 
     def request_record(self, participant_id):
         with self.lock:
@@ -850,7 +922,7 @@ def control_server(target, port=8090, api_origin="http://127.0.0.1:8080", token=
                 return
             try:
                 if self.path == "/setup":
-                    runtime.submit_setup(self.body(8192))
+                    runtime.submit_setup(self.body(262144))
                     self.answer(200, {"ok": True})
                     return
                 if self.path == "/enrollment/record":
@@ -950,7 +1022,7 @@ async def run_session(args, configs, runtime, server, microphone, mcp_token, sto
     with runtime.lock:
         runtime.session_id = session_id
         runtime.participants = [{"id": f"participant_{i}", "name": name} for i, name in enumerate(names, 1)]
-    configs = runtime.apply_overrides(runtime.configs)
+    configs = runtime.active_configs()
     for config in configs:
         if config.speaks_for and config.speaks_for.casefold() not in {n.casefold() for n in names}:
             raise RuntimeError(f"{config.name} is configured to speak for {config.speaks_for}, who is not in this room")

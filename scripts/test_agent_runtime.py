@@ -1,6 +1,7 @@
 """No provider key, hardware, or human fixtures: floor, transport, controls and prior-consent regression tests."""
 import asyncio
 import base64
+import dataclasses
 import json
 import os
 import tempfile
@@ -516,33 +517,43 @@ class LifecycleHttpTest(unittest.TestCase):
         self.runtime.set_phase("consent")
         self.assertEqual(self.request("/setup", "POST", {"participants": people})[0], 409)        # only during setup
 
-    def test_setup_applies_agent_persona_and_persists_it(self):
-        configs = [ar.AgentConfig("Ava", instructions_extra="from toml"), ar.AgentConfig("Ben", voice="cedar")]
+    def test_setup_builds_separate_agents_and_persists_the_panel(self):
+        configs = [ar.AgentConfig("Ava", instructions_extra="from toml"), ar.AgentConfig("Ben", voice="cedar", output_device="Speakers X")]
         with tempfile.TemporaryDirectory() as tmp, patch.object(ar, "PERSONA_DIR", Path(tmp)):
-            (Path(tmp) / "Ava.md").write_text("persisted haiku rule\n", encoding="utf-8")
+            ar.save_personas([dataclasses.replace(configs[0], instructions_extra="")])                  # an explicitly cleared default
             runtime = ar.Runtime(gui=True, mcp_url="https://example.invalid/mcp", api_token="operator-token", configs=configs)
-            self.assertEqual(runtime.state()["agent_configs"][0]["instructions"], "persisted haiku rule")     # file beats agents.toml
+            shown = runtime.state()
+            self.assertEqual(shown["agent_configs"][0]["instructions"], "")                              # cleared stays cleared, TOML does not come back
+            self.assertEqual(shown["voices"][0], "alloy"); self.assertEqual(shown["max_agents"], ar.MAX_AGENTS)
             server = ar.control_server(runtime, port=0, token="operator-token")
             try:
                 base = self.base; self.base = f"http://127.0.0.1:{server.server_port}"
                 people = [{"name": "Synthetic One", "contact": "one@example.invalid"}, {"name": "Synthetic Two", "contact": "555-0100"}]
                 key = {"openai_api_key": "k" * 40}
-                self.assertEqual(self.request("/setup", "POST", {"participants": people, "agents": [{"name": "Zed"}], **key})[0], 409)
-                self.assertEqual(self.request("/setup", "POST", {"participants": people, "agents": [{"name": "Ben", "speaks_for": "Nobody"}], **key})[0], 409)
-                self.assertEqual(self.request("/setup", "POST", {"participants": people, "agents": [{"name": "Ben", "instructions": "x" * 6001}], **key})[0], 409)
+                bad = [[], [{"name": "Ben", "speaks_for": "Nobody"}], [{"name": "Ben", "instructions": "x" * 6001}], [{"name": "Ben", "voice": "robot"}],
+                       [{"name": "Synthetic One"}], [{"name": "Ben"}, {"name": "ben"}], [{"name": f"A{i}"} for i in range(ar.MAX_AGENTS + 1)]]
+                for agents in bad:
+                    self.assertEqual(self.request("/setup", "POST", {"participants": people, "agents": agents, **key})[0], 409, agents)
+                self.assertIsNone(runtime.session_configs)
+                big = "\u00e9" * 6000                                                                  # non-ASCII at the limit, two agents: well over 8 KiB
                 status, _ = self.request("/setup", "POST", {"participants": people, "agents": [
-                    {"name": "Ben", "speaks_for": "synthetic two", "instructions": "Only words that start with A.\r\n\x00Be brief."},
-                    {"name": "Ava", "instructions": ""}], **key})
+                    {"name": "Ben", "speaks_for": "synthetic two", "voice": "sage", "eagerness": "eager", "instructions": "Only words that start with A.\r\n\x00Be brief."},
+                    {"name": "Cy", "instructions": big}], **key})
                 self.assertEqual(status, 200)
                 self.base = base
             finally:
                 server.shutdown(); server.server_close()
             runtime.wait_setup()
-            applied = {c.name: c for c in runtime.apply_overrides(runtime.configs)}
-            self.assertEqual((applied["Ben"].speaks_for, applied["Ben"].instructions_extra), ("synthetic two", "Only words that start with A.\nBe brief."))
-            self.assertEqual(applied["Ava"].instructions_extra, "")
-            self.assertEqual((Path(tmp) / "Ben.md").read_text(encoding="utf-8"), "Only words that start with A.\nBe brief.\n")
-            self.assertFalse((Path(tmp) / "Ava.md").exists())                                              # cleared instructions remove the file
+            active = {c.name: c for c in runtime.active_configs()}
+            self.assertEqual(sorted(active), ["Ben", "Cy"])                                              # Ava was removed from this room
+            self.assertEqual((active["Ben"].speaks_for, active["Ben"].voice, active["Ben"].eagerness, active["Ben"].instructions_extra, active["Ben"].output_device),
+                             ("synthetic two", "sage", "eager", "Only words that start with A.\nBe brief.", "Speakers X"))
+            self.assertEqual((active["Cy"].instructions_extra, active["Cy"].speaks_for, active["Cy"].provider), (big, "", "openai_realtime"))
+            files = sorted(p.name for p in Path(tmp).glob("*.json"))
+            self.assertEqual(len(files), 2); self.assertTrue(any(f.startswith("Ben-") for f in files)); self.assertTrue(any(f.startswith("Cy-") for f in files))
+            self.assertNotEqual(ar.persona_path("Agent One"), ar.persona_path("Agent_One"))              # distinct names never share a file
+            fresh = ar.Runtime(gui=True, configs=configs)
+            self.assertEqual([(c.name, c.voice, c.instructions_extra[:4]) for c in fresh.configs], [("Ava", "marin", "from"), ("Ben", "sage", "Only"), ("Cy", "marin", "\u00e9\u00e9\u00e9\u00e9")])
             self.assertNotIn("Only words", json.dumps(runtime.bootstrap()))
 
     def test_enrollment_start_and_stop_follow_phases(self):

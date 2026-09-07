@@ -122,6 +122,7 @@
       this.$("create-form").addEventListener("submit", run(() => this.createRoom()));
       this.$("end-room").addEventListener("click", run(() => this.endRoom()));
       this.$("setup-add").addEventListener("click", () => this.addSetupPerson());
+      this.$("agent-add").addEventListener("click", () => this.addAgentCard());
       this.$("setup-form").addEventListener("submit", run(() => this.submitSetup()));
       this.$("start").addEventListener("click", run(() => this.runtimeAction("/start")));
       this.$("stop-runtime").addEventListener("click", run(() => this.runtimeAction("/stop")));
@@ -152,7 +153,7 @@
       if (r && r.session_id && r.phase !== "setup" && r.session_id !== this.session && this.autoOpened !== r.session_id && ID.test(r.session_id)) {
         this.autoOpened = r.session_id;
         // The runtime reports the room a moment before the API has it; retry on the next tick instead of giving up.
-        try { await this.loadRooms(); await this.open(r.session_id); } catch (e) { this.autoOpened = ""; this.say(e.message); }
+        try { await this.loadRooms(); await this.open(r.session_id); this.say(""); } catch (e) { this.autoOpened = ""; this.say(e.message); }
       }
     }
     addSetupPerson() {
@@ -168,32 +169,39 @@
       const v = this.notice && this.notice.vendors;
       return Boolean(v && v.openai_reviewed === true && v.cloudflare_reviewed === true);
     }
-    renderAgentSetup(configs) {
+    renderAgentSetup(configs, options) {
       // Rebuilt only when the runtime's agent list changes, so typing in the boxes survives polling.
-      const key = JSON.stringify(configs);
+      const key = JSON.stringify([configs, options]);
       if (key === this.agentSetupKey) return; this.agentSetupKey = key;
-      const box = this.$("setup-agents"); box.replaceChildren();
-      for (const a of configs) {
-        const card = node(this.doc, "div", undefined, "agent-card"); card.name = a.name;
-        card.append(node(this.doc, "h3", `${a.name} · ${a.voice} · ${a.eagerness}`));
-        const who = node(this.doc, "label", "Speaks for (a full name from the roster, optional)"); const whoInput = node(this.doc, "input");
-        whoInput.name = "speaks_for"; whoInput.value = a.speaks_for || ""; whoInput.maxLength = 200; whoInput.autocomplete = "off"; who.append(whoInput);
-        const how = node(this.doc, "label", "Standing instructions (how this agent should respond)"); const text = node(this.doc, "textarea");
-        text.name = "instructions"; text.value = a.instructions || ""; text.rows = 5; text.maxLength = 6000; how.append(text);
-        const file = node(this.doc, "label", "Load instructions from a text file"); const picker = node(this.doc, "input");
-        picker.type = "file"; picker.name = "file"; picker.accept = ".txt,.md,text/plain,text/markdown";
-        picker.addEventListener("change", () => {
-          const chosen = picker.files && picker.files[0]; if (!chosen) return;
-          if (chosen.size > 65536) { this.say("Instruction files are limited to 64 KB."); picker.value = ""; return; }
-          const reader = new FileReader(); reader.onload = () => { text.value = String(reader.result || "").slice(0, 6000); }; reader.readAsText(chosen);
-        });
-        file.append(picker);
-        card.append(who, how, file, node(this.doc, "p", "Saved on this computer under data\\agents so the agent keeps its flavor next time. The room rules (who spoke, when to speak) still apply.", "muted"));
-        box.append(card);
-      }
+      this.agentOptions = options; const box = this.$("setup-agents"); box.replaceChildren();
+      for (const a of configs) this.addAgentCard(a);
+    }
+    addAgentCard(a = {}) {
+      const options = this.agentOptions || {voices:["marin"], eagerness_levels:["quiet","balanced","eager"], max_agents:4};
+      const box = this.$("setup-agents");
+      if (box.children.length >= options.max_agents) { this.say(`At most ${options.max_agents} agents per room.`); return; }
+      const doc = this.doc, card = node(doc, "div", undefined, "agent-card");
+      const field = (title, name, value, max) => { const label = node(doc, "label", title), input = node(doc, "input"); input.name = name; input.value = value || ""; input.maxLength = max; input.autocomplete = "off"; label.append(input); return label; };
+      const choice = (title, name, values, value) => { const label = node(doc, "label", title), select = node(doc, "select"); select.name = name; for (const v of values) { const option = node(doc, "option", v); option.value = v; select.append(option); } select.value = values.includes(value) ? value : values[0]; label.append(select); return label; };
+      card.append(field("Agent name (its own separate instance and prompt)", "name", a.name, 60),
+        choice("Voice", "voice", options.voices, a.voice), choice("Eagerness", "eagerness", options.eagerness_levels, a.eagerness),
+        field("Speaks for (a full name from the roster, optional)", "speaks_for", a.speaks_for, 200));
+      const how = node(doc, "label", "Standing instructions (how this agent should respond)"); const text = node(doc, "textarea");
+      text.name = "instructions"; text.value = a.instructions || ""; text.rows = 5; text.maxLength = 6000; how.append(text);
+      const file = node(doc, "label", "Load instructions from a text file"); const picker = node(doc, "input");
+      picker.type = "file"; picker.name = "file"; picker.accept = ".txt,.md,text/plain,text/markdown";
+      picker.addEventListener("change", () => {
+        const chosen = picker.files && picker.files[0]; if (!chosen) return;
+        if (chosen.size > 65536) { this.say("Instruction files are limited to 64 KB."); picker.value = ""; return; }
+        const reader = new FileReader(); reader.onload = () => { text.value = String(reader.result || "").slice(0, 6000); }; reader.readAsText(chosen);
+      });
+      file.append(picker);
+      const remove = node(doc, "button", "Remove agent"); remove.type = "button"; remove.addEventListener("click", () => card.remove());
+      card.append(how, file, remove, node(doc, "p", "Each agent is its own provider session with only its own instructions. What is listed here is what gets saved on this computer under data\\agents. The room rules (who spoke, when to speak) still apply.", "muted"));
+      box.append(card);
     }
     agentSetup() {
-      return [...this.$("setup-agents").children].map(card => ({name: card.name, speaks_for: card.querySelector('[name="speaks_for"]').value.trim(), instructions: card.querySelector('[name="instructions"]').value}));
+      return [...this.$("setup-agents").children].map(card => Object.fromEntries(["name", "voice", "eagerness", "speaks_for", "instructions"].map(k => [k, card.querySelector(`[name="${k}"]`).value.trim()])));
     }
     async submitSetup() {
       if (!this.runtime || this.runtime.phase !== "setup") throw new Error("The runtime is not waiting for setup.");
@@ -202,7 +210,14 @@
       if (participants.length < 2 || participants.length > 4 || participants.some(p => !p.name || !p.contact)) throw new Error("Enter a full name and an email or phone for each of the two to four people within microphone range.");
       const agents = this.agentSetup();
       const names = new Set(participants.map(p => p.name.toLowerCase()));
-      for (const a of agents) if (a.speaks_for && !names.has(a.speaks_for.toLowerCase())) throw new Error(`${a.name} can only speak for a person on the roster (exact full name).`);
+      if (!agents.length) throw new Error("Add at least one agent.");
+      const agentNames = new Set();
+      for (const a of agents) {
+        if (!a.name) throw new Error("Every agent needs a name.");
+        if (agentNames.has(a.name.toLowerCase()) || names.has(a.name.toLowerCase())) throw new Error(`Agent name ${a.name} must be distinct from the other agents and from the people in the room.`);
+        agentNames.add(a.name.toLowerCase());
+        if (a.speaks_for && !names.has(a.speaks_for.toLowerCase())) throw new Error(`${a.name} can only speak for a person on the roster (exact full name).`);
+      }
       const body = {participants, agents};
       const key = this.$("openai-key").value.trim(); this.$("openai-key").value = "";
       if (this.runtime.needs_openai_key) { if (!key) throw new Error("Paste the OpenAI API key."); body.openai_api_key = key; }
@@ -223,7 +238,7 @@
       this.$("phase-detail").textContent = r && r.detail ? r.detail : !r && this.token ? "Start it with Voiceprint.cmd (or scripts\\dev.ps1 up) and this page will connect on its own." : "";
       this.$("mcp-url").textContent = r && r.mcp_url ? `Hosted MCP URL given to the provider: ${r.mcp_url}` : "";
       this.$("setup-form").hidden = phase !== "setup";
-      if (phase === "setup") this.renderAgentSetup(r.agent_configs || []);
+      if (phase === "setup") this.renderAgentSetup(r.agent_configs || [], {voices:r.voices || ["marin"], eagerness_levels:r.eagerness_levels || ["quiet","balanced","eager"], max_agents:r.max_agents || 4});
       this.$("key-label").hidden = !(r && r.needs_openai_key);
       // Without both review flags the API computes the hosted scopes as false, so a room created now would fail after everyone signed.
       const reviewed = this.vendorsReviewed();

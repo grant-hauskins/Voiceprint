@@ -1,6 +1,6 @@
 # Start with the tested Realtime provider. Voices are selected before the first reply.
 # instructions_extra: standing instructions (how to respond); speaks_for: full name of the person this agent represents.
-# Both are defaults only. The /ui setup panel edits them per session and saves instructions to data\agents\NAME.md, which wins.
+# These are defaults only. The /ui setup panel adds, removes and edits agents per session and saves them under data\agents, which wins.
 [[agents]]
 name = "Ava"
 provider = "openai_realtime"
