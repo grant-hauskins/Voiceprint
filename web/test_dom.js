@@ -95,6 +95,7 @@ async function main() {
     let data = {};
     if (url === "http://127.0.0.1:8123/bootstrap") { assert(!options.headers.Authorization); data = {phase, session_id:sessionId, gui:true, api_token:"launcher_token"}; }
     else if (url === "http://127.0.0.1:8123/agents") data = {session_id:sessionId, agents:[], phase, detail:`in ${phase}`, awaiting, needs_openai_key:phase === "setup",
+      agent_configs:[{name:"Ava", voice:"marin", model:"m", eagerness:"balanced", instructions:"Answer in haiku.", speaks_for:""}, {name:"Ben", voice:"cedar", model:"m", eagerness:"quiet", instructions:"", speaks_for:""}],
       participants: sessionId ? [{id:"participant_1", name:"Synthetic One", enrollment:{state:awaiting === "participant_1" ? "waiting" : "recorded", peak:awaiting ? null : 9000}}] : []};
     else if (url === "http://127.0.0.1:8123/setup") { phase = "consent"; sessionId = "room_auto"; }
     else if (url === "http://127.0.0.1:8123/enrollment/record") { awaiting = null; phase = "ready"; }
@@ -123,9 +124,17 @@ async function main() {
   await assert.rejects(() => launched.submitSetup(), /two to four people/);          // one person is not a room
   rowTwo.querySelector('[name="name"]').value = "Synthetic Two"; rowTwo.querySelector('[name="contact"]').value = "555-0100";
   launched.$("openai-key").value = "sk-synthetic-key-value-0000000000";
+  const agentCards = launched.$("setup-agents").children;
+  assert.equal(agentCards.length, 2); assert.equal(agentCards[0].querySelector('[name="instructions"]').value, "Answer in haiku.");   // prefilled from the runtime
+  agentCards[1].querySelector('[name="speaks_for"]').value = "Nobody Here";
+  await assert.rejects(() => launched.submitSetup(), /speak for a person on the roster/);
+  agentCards[1].querySelector('[name="speaks_for"]').value = "Synthetic Two"; agentCards[1].querySelector('[name="instructions"]').value = "Only words starting with A.";
+  launched.$("openai-key").value = "sk-synthetic-key-value-0000000000";
+  await launched.pollRuntime(); assert.equal(launched.$("setup-agents").children[1].querySelector('[name="instructions"]').value, "Only words starting with A.");   // polling keeps typed text
   await launched.submitSetup();
   const setup = runtimeCalls.find(c => c.url.endsWith("/setup"));
-  assert.deepEqual(JSON.parse(setup.options.body), {participants:[{name:"Synthetic One",contact:"one@example.invalid"},{name:"Synthetic Two",contact:"555-0100"}], openai_api_key:"sk-synthetic-key-value-0000000000"});
+  assert.deepEqual(JSON.parse(setup.options.body), {participants:[{name:"Synthetic One",contact:"one@example.invalid"},{name:"Synthetic Two",contact:"555-0100"}],
+    agents:[{name:"Ava", speaks_for:"", instructions:"Answer in haiku."}, {name:"Ben", speaks_for:"Synthetic Two", instructions:"Only words starting with A."}], openai_api_key:"sk-synthetic-key-value-0000000000"});
   assert.equal(setup.options.headers.Authorization, "Bearer launcher_token");
   assert.equal(launched.$("openai-key").value, "");                       // key never lingers in the page
   assert.equal(launched.session, "room_auto");                            // runtime's room opened automatically

@@ -233,6 +233,20 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
 
 
 class GateAndConfigTest(unittest.TestCase):
+    def test_persona_prompt_and_toml_fields(self):
+        from realtime_openai import persona
+        self.assertEqual(persona("Ava"), "")
+        text = persona("Ben", "Grant Hauskins", "Answer in haiku.")
+        self.assertIn("Grant Hauskins's personal agent", text); self.assertIn("Do not speak for anyone else", text); self.assertTrue(text.endswith("Answer in haiku."))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "agents.toml"
+            path.write_text('[[agents]]\nname = "Ava"\nspeaks_for = "Grant Hauskins"\ninstructions_extra = "Be terse."\n', encoding="utf-8")
+            config = ar.load_config(path)[0]
+            self.assertEqual((config.speaks_for, config.instructions_extra), ("Grant Hauskins", "Be terse."))
+            path.write_text('[[agents]]\nname = "Ava"\nspeaks_for = 3\n', encoding="utf-8")
+            with self.assertRaises(ValueError):
+                ar.load_config(path)
+
     def test_default_configuration(self):
         configs = ar.load_config(Path(ar.__file__).with_name("agents.toml"))
         self.assertEqual([(c.name, c.voice, c.eagerness) for c in configs], [("Ava", "marin", "balanced"), ("Ben", "cedar", "quiet")])
@@ -501,6 +515,35 @@ class LifecycleHttpTest(unittest.TestCase):
         self.assertFalse(self.request("/agents")[1]["needs_openai_key"])
         self.runtime.set_phase("consent")
         self.assertEqual(self.request("/setup", "POST", {"participants": people})[0], 409)        # only during setup
+
+    def test_setup_applies_agent_persona_and_persists_it(self):
+        configs = [ar.AgentConfig("Ava", instructions_extra="from toml"), ar.AgentConfig("Ben", voice="cedar")]
+        with tempfile.TemporaryDirectory() as tmp, patch.object(ar, "PERSONA_DIR", Path(tmp)):
+            (Path(tmp) / "Ava.md").write_text("persisted haiku rule\n", encoding="utf-8")
+            runtime = ar.Runtime(gui=True, mcp_url="https://example.invalid/mcp", api_token="operator-token", configs=configs)
+            self.assertEqual(runtime.state()["agent_configs"][0]["instructions"], "persisted haiku rule")     # file beats agents.toml
+            server = ar.control_server(runtime, port=0, token="operator-token")
+            try:
+                base = self.base; self.base = f"http://127.0.0.1:{server.server_port}"
+                people = [{"name": "Synthetic One", "contact": "one@example.invalid"}, {"name": "Synthetic Two", "contact": "555-0100"}]
+                key = {"openai_api_key": "k" * 40}
+                self.assertEqual(self.request("/setup", "POST", {"participants": people, "agents": [{"name": "Zed"}], **key})[0], 409)
+                self.assertEqual(self.request("/setup", "POST", {"participants": people, "agents": [{"name": "Ben", "speaks_for": "Nobody"}], **key})[0], 409)
+                self.assertEqual(self.request("/setup", "POST", {"participants": people, "agents": [{"name": "Ben", "instructions": "x" * 6001}], **key})[0], 409)
+                status, _ = self.request("/setup", "POST", {"participants": people, "agents": [
+                    {"name": "Ben", "speaks_for": "synthetic two", "instructions": "Only words that start with A.\r\n\x00Be brief."},
+                    {"name": "Ava", "instructions": ""}], **key})
+                self.assertEqual(status, 200)
+                self.base = base
+            finally:
+                server.shutdown(); server.server_close()
+            runtime.wait_setup()
+            applied = {c.name: c for c in runtime.apply_overrides(runtime.configs)}
+            self.assertEqual((applied["Ben"].speaks_for, applied["Ben"].instructions_extra), ("synthetic two", "Only words that start with A.\nBe brief."))
+            self.assertEqual(applied["Ava"].instructions_extra, "")
+            self.assertEqual((Path(tmp) / "Ben.md").read_text(encoding="utf-8"), "Only words that start with A.\nBe brief.\n")
+            self.assertFalse((Path(tmp) / "Ava.md").exists())                                              # cleared instructions remove the file
+            self.assertNotIn("Only words", json.dumps(runtime.bootstrap()))
 
     def test_enrollment_start_and_stop_follow_phases(self):
         self.runtime.participants = [{"id": "participant_1", "name": "Synthetic One"}]

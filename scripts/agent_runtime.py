@@ -11,6 +11,7 @@ Keys: 1/2 select an agent, Space speaks once, H toggles hold, C cancels, Q quits
 Local controls: http://127.0.0.1:8090/agents. Provider keys are never written to logs.
 """
 import argparse
+import dataclasses
 import asyncio
 import base64
 import hmac
@@ -46,6 +47,42 @@ class AgentConfig:
     eagerness: str = "balanced"
     output_device: str = "HD 4.40,BenQ"
     instructions_extra: str = ""
+    speaks_for: str = ""          # full name of the person in the room this agent represents, or empty
+
+
+MAX_INSTRUCTIONS = 6000
+PERSONA_DIR = Path(__file__).resolve().parents[1] / "data" / "agents"
+
+
+def clean_instructions(text):
+    """Operator-authored standing instructions: plain text, bounded, no control characters except newlines and tabs."""
+    if not isinstance(text, str):
+        raise ValueError("Instructions must be text")
+    text = re.sub(r"[^\t\n\x20-\x7e\u00a0-\uffff]", "", text.replace("\r\n", "\n")).strip()
+    if len(text) > MAX_INSTRUCTIONS:
+        raise ValueError(f"Instructions are limited to {MAX_INSTRUCTIONS} characters")
+    return text
+
+
+def persona_path(name):
+    return PERSONA_DIR / (re.sub(r"[^A-Za-z0-9_-]", "_", name) + ".md")
+
+
+def load_persona(name):
+    """Persisted standing instructions for an agent (operator text, not participant data); empty when none."""
+    try:
+        return clean_instructions(persona_path(name).read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError):
+        return ""
+
+
+def save_persona(name, text):
+    PERSONA_DIR.mkdir(parents=True, exist_ok=True)
+    path = persona_path(name)
+    if text:
+        path.write_text(text + "\n", encoding="utf-8")
+    elif path.exists():
+        path.unlink()
 
 
 def load_config(path):
@@ -69,8 +106,9 @@ def load_config(path):
             raise ValueError("Unknown provider")
         if config.eagerness not in tg.SILENCE_AFTER_TURN_S:
             raise ValueError("Eagerness must be quiet, balanced, or eager")
-        if not isinstance(config.output_device, str) or not isinstance(config.instructions_extra, str):
-            raise ValueError("output_device and instructions_extra must be strings")
+        if not isinstance(config.output_device, str) or not isinstance(config.instructions_extra, str) or not isinstance(config.speaks_for, str):
+            raise ValueError("output_device, instructions_extra and speaks_for must be strings")
+        clean_instructions(config.instructions_extra)
         names.add(config.name.casefold())
         configs.append(config)
     return configs
@@ -562,10 +600,13 @@ class Runtime:
     the start of the conversation, and shutdown. Consent itself is still signed by each person in the GUI
     against the API; this object never bypasses that check."""
 
-    def __init__(self, room=None, gui=False, mcp_url=None, api_token=None):
+    def __init__(self, room=None, gui=False, mcp_url=None, api_token=None, configs=()):
         self.lock = threading.Lock()
         self.room = room
         self.gui = gui
+        # Persisted standing instructions win over agents.toml so each person's agent keeps its flavor between runs.
+        self.configs = [dataclasses.replace(c, instructions_extra=load_persona(c.name) or c.instructions_extra) for c in configs]
+        self.agent_overrides = {}
         self.mcp_url, self.api_token = mcp_url, api_token
         self.phase = "live" if room is not None else "setup"
         self.detail = ""
@@ -595,6 +636,8 @@ class Runtime:
                     "participants": [dict(p, enrollment=self.enrollment.get(p["id"], {"state": "pending", "peak": None}))
                                      for p in self.participants],
                     "awaiting": self.awaiting, "needs_openai_key": self.needs_openai_key(),
+                    "agent_configs": [{"name": c.name, "voice": c.voice, "model": c.model, "eagerness": c.eagerness,
+                                       "instructions": c.instructions_extra, "speaks_for": c.speaks_for} for c in self.configs],
                     "mcp_configured": bool(self.mcp_url), "mcp_url": self.mcp_url, "gui": self.gui}
 
     def bootstrap(self):
@@ -629,10 +672,36 @@ class Runtime:
             raise ValueError("Invalid provider key")
         if self.needs_openai_key() and not key:
             raise ValueError("The OpenAI API key is required to start the agents")
+        overrides = {}
+        agents = body.get("agents", [])
+        if not isinstance(agents, list):
+            raise ValueError("Invalid agents")
+        for row in agents:
+            if not isinstance(row, dict) or not any(c.name == row.get("name") for c in self.configs):
+                raise ValueError("Unknown agent")
+            speaks_for = row.get("speaks_for", "")
+            if not isinstance(speaks_for, str):
+                raise ValueError("speaks_for must be a name")
+            speaks_for = speaks_for.strip()
+            if speaks_for and speaks_for.casefold() not in {n.casefold() for n in names}:
+                raise ValueError(f"{row['name']} can only speak for a person in the room")
+            overrides[row["name"]] = {"instructions": clean_instructions(row.get("instructions", "")), "speaks_for": speaks_for}
         if key:
             # Held only in this process's environment for the provider transport; never logged or written.
             os.environ["OPENAI_API_KEY"] = key.strip()
+        with self.lock:
+            self.agent_overrides = overrides
+            self.configs = self.apply_overrides(self.configs)
+        for name, override in overrides.items():
+            save_persona(name, override["instructions"])
         self.setup.put({"names": names, "contacts": contacts, "session_id": session})
+
+    def apply_overrides(self, configs):
+        result = []
+        for config in configs:
+            override = self.agent_overrides.get(config.name)
+            result.append(dataclasses.replace(config, instructions_extra=override["instructions"], speaks_for=override["speaks_for"]) if override else config)
+        return result
 
     def request_record(self, participant_id):
         with self.lock:
@@ -839,7 +908,7 @@ async def main(args):
     if not mcp_token and token_path.exists():
         mcp_token = token_path.read_text(encoding="utf-8").strip()
     gui = bool(getattr(args, "gui", False))
-    runtime = Runtime(gui=gui, mcp_url=args.mcp_url, api_token=vp.api_token())
+    runtime = Runtime(gui=gui, mcp_url=args.mcp_url, api_token=vp.api_token(), configs=configs)
     server = control_server(runtime, args.control_port, args.api.rstrip("/"), vp.api_token())
     api_ui = args.api.rstrip("/") + "/ui" + (f"?control={server.server_port}" if server.server_port != 8090 else "")
     print(f"GUI {api_ui}; controls 127.0.0.1:{server.server_port}.", flush=True)
@@ -881,6 +950,10 @@ async def run_session(args, configs, runtime, server, microphone, mcp_token, sto
     with runtime.lock:
         runtime.session_id = session_id
         runtime.participants = [{"id": f"participant_{i}", "name": name} for i, name in enumerate(names, 1)]
+    configs = runtime.apply_overrides(runtime.configs)
+    for config in configs:
+        if config.speaks_for and config.speaks_for.casefold() not in {n.casefold() for n in names}:
+            raise RuntimeError(f"{config.name} is configured to speak for {config.speaks_for}, who is not in this room")
     runtime.set_phase("consent", "Each person signs their written release in the GUI; microphone closed")
     try:
         consent = await asyncio.to_thread(vp.prepare_room, args.api, session_id, names, contacts, True, runtime.stop)

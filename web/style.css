@@ -2,3 +2,4 @@
 #phase-detail:empty{display:none}#enrollment .chip{margin-left:8px}#enrollment strong{min-width:140px}form[hidden],div[hidden],button[hidden],label[hidden]{display:none}
 #setup-blocked:empty{display:none}#setup-blocked{color:var(--warn)}
 #mcp-url:empty{display:none}.warn{color:var(--warn)}
+textarea{font:inherit;border:1px solid var(--line);border-radius:6px;padding:9px 12px;color:inherit;background:var(--panel);display:block;width:100%;max-width:750px}
