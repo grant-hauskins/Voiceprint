@@ -12,6 +12,8 @@ class Element {
   append(...nodes) { this.children.push(...nodes); }
   replaceChildren(...nodes) { this.children = nodes; this._text = ""; }
   setAttribute(key, value) { this[key] = value; }
+  getAttribute(key) { return this[key]; }
+  prepend(...nodes) { this.children.unshift(...nodes); }
   addEventListener(type, fn) { this.listeners[type] = fn; }
   querySelector(selector) { const key = selector.match(/\[name="(.+)"\]/)?.[1]; return walk(this).find(e => e.name === key); }
 }
@@ -114,6 +116,8 @@ async function main() {
   await launched.bootstrap(); assert.equal(launched.token, "launcher_token");
   await launched.pollRuntime();
   assert.equal(launched.$("phase").textContent, "setup"); assert(!launched.$("setup-form").hidden); assert(!launched.$("key-label").hidden);
+  assert(!launched.$("gate").hidden); assert(launched.$("gate-close").hidden); assert(!launched.$("room-section").hidden);   // inescapable setup gate
+  assert.equal(launched.$("mic").getAttribute("data-state"), "off");
   // Unreviewed vendor settings block room creation up front instead of failing after everyone has signed.
   assert(launched.$("setup-submit").disabled); assert.match(launched.$("setup-blocked").textContent, /VOICEPRINT_OPENAI_REVIEWED=true/);
   await assert.rejects(() => launched.submitSetup(), /vendor review flags/);
@@ -152,11 +156,25 @@ async function main() {
   phase = "enrollment"; awaiting = "participant_1"; await launched.pollRuntime();
   const recordButton = walk(launched.$("enrollment")).find(e => e.tagName === "button");
   assert.match(recordButton.textContent, /Record Synthetic One now/); assert(!recordButton.disabled); assert(launched.$("start").hidden);
+  assert(!launched.$("gate").hidden); assert(!launched.$("enrollment-section").hidden); assert(launched.$("room-section").hidden);   // still gated during enrollment
   await launched.recordParticipant("participant_1");
   assert.deepEqual(JSON.parse(runtimeCalls.find(c => c.url.endsWith("/enrollment/record")).options.body), {participant_id:"participant_1"});
   assert.equal(launched.$("phase").textContent, "ready"); assert(!launched.$("start").hidden);
+  assert(launched.$("gate").hidden); assert.equal(launched.$("mic").getAttribute("data-state"), "ready");                         // gate lifts once enrolled
+  launched.gateForced = true; launched.renderStage(); assert(!launched.$("gate").hidden); assert(!launched.$("gate-close").hidden); // review is escapable
+  launched.gateForced = false; launched.renderStage(); assert(launched.$("gate").hidden);
   assert.match(launched.$("enrollment").textContent, /peak 9000/);
   await launched.runtimeAction("/start"); assert.equal(launched.$("phase").textContent, "live"); assert(launched.$("start").hidden);
+  assert.equal(launched.$("mic").getAttribute("data-state"), "on");
+  launched.session = "room_auto"; launched.consent = {allowed:true, state:"active", scopes:{openai_audio:true, hosted_mcp:true}};
+  launched.runtime = {session_id:"room_auto", phase:"live", agents:[{name:"Ava", participant_id:"agent_1", provider:"p", model:"m", voice:"marin", eagerness:"balanced", held:false, responding:true},
+    {name:"Ben", participant_id:"agent_2", provider:"p", model:"m", voice:"cedar", eagerness:"quiet", held:true, responding:false}]};
+  launched.renderAgents();
+  const cards = launched.$("agents").children;
+  assert.match(cards[0].className, /speaking/); assert.match(cards[1].className, /held/);
+  assert.match(walk(cards[0]).find(e => e.className === "orb").style, /--h:\d+/);
+  assert.notEqual(walk(cards[0]).find(e => e.className === "orb").style, walk(cards[1]).find(e => e.className === "orb").style);   // unique gradient per agent
+  assert.equal(walk(cards[0]).filter(e => e.tagName === "button").length, 3);
   assert.match(launched.$("stop-runtime").textContent, /End conversation/);
   await launched.runtimeAction("/stop"); assert.equal(launched.$("phase").textContent, "ended"); assert(launched.$("stop-runtime").hidden);
   const manual = new Console(new Document(), async (url) => { if (url.endsWith("/bootstrap")) throw new Error("no runtime"); return {ok:true,status:200,json:async()=>({})}; }, {hostname:"127.0.0.1",protocol:"http:"});

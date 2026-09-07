@@ -12,6 +12,9 @@
     if (cls) el.className = cls;
     return el;
   }
+  const GLYPHS = {speak: "\u{1F5E3}", hold: "\u23F8", release: "\u25B6", cancel: "\u2715", start: "\u25B6", stop: "\u25A0"};
+  function icon(doc, name) { const el = node(doc, "span", GLYPHS[name] || "", "ico"); el.setAttribute("aria-hidden", "true"); return el; }
+  function hue(name) { let h = 0; for (const ch of String(name)) h = (h * 31 + ch.codePointAt(0)) % 360; return h; }
   function allowedControls(consent, runtime, session) {
     return Boolean(consent && consent.allowed === true && !terminal(consent.state) &&
       consent.scopes && consent.scopes.openai_audio === true && consent.scopes.hosted_mcp === true &&
@@ -65,7 +68,7 @@
       this.doc = doc; this.fetch = fetcher; this.location = location;
       this.token = ""; this.session = ""; this.epoch = 0; this.notice = null; this.consent = null; this.runtime = null;
       this.consentKey = ""; this.agentKey = ""; this.polling = false; this.floor = null; this.busy = false;
-      this.runtimeKey = ""; this.autoOpened = ""; this.pollingRuntime = false; this.agentSetupKey = "";
+      this.runtimeKey = ""; this.autoOpened = ""; this.pollingRuntime = false; this.agentSetupKey = ""; this.gateForced = false;
       // The launcher opens /ui?control=PORT when 8090 is busy on this computer; the origin stays the loopback API.
       const control = String(new URLSearchParams(location && location.search || "").get("control") || "");
       this.control = `http://127.0.0.1:${/^\d{2,5}$/.test(control) ? control : "8090"}`;
@@ -125,6 +128,9 @@
       this.$("agent-add").addEventListener("click", () => this.addAgentCard());
       this.$("setup-form").addEventListener("submit", run(() => this.submitSetup()));
       this.$("start").addEventListener("click", run(() => this.runtimeAction("/start")));
+      this.$("gate-stop").addEventListener("click", run(() => this.runtimeAction("/stop")));
+      this.$("gate-close").addEventListener("click", () => { this.gateForced = false; this.renderStage(); });
+      this.$("review-releases").addEventListener("click", () => { this.gateForced = true; this.renderStage(); });
       this.$("stop-runtime").addEventListener("click", run(() => this.runtimeAction("/stop")));
       this.addPerson(); this.addPerson(); this.addSetupPerson(); this.addSetupPerson(); this.loadNotice();
       this.bootstrap().then(() => this.pollRuntime());
@@ -230,6 +236,35 @@
     async runtimeAction(path) {
       await this.request(path, {runtime:true, body:{}}); await this.pollRuntime();
     }
+    stage() {
+      // Which view the operator should be in. The gate (setup, releases, enrollment) is inescapable until the room is
+      // enrolled; afterwards it can be reopened to review or withdraw releases.
+      const r = this.runtime, phase = r ? (r.phase || "live") : null;
+      if (!this.token) return {gate: true, step: "room", required: true};
+      if (phase && ["setup", "consent", "enrollment", "connecting"].includes(phase)) return {gate: true, step: phase === "setup" ? "room" : phase === "consent" ? "releases" : "enrollment", required: true};
+      if (phase && ["ready", "live", "ending", "ended", "failed"].includes(phase)) return {gate: this.gateForced, step: "enrollment", required: false};
+      if (this.session && this.consent && this.consent.allowed) return {gate: this.gateForced, step: "enrollment", required: false};
+      return {gate: true, step: this.session ? "releases" : "room", required: true};
+    }
+    renderStage() {
+      const {gate, step, required} = this.stage(), r = this.runtime, phase = r ? (r.phase || "live") : null;
+      this.$("gate").hidden = !gate;
+      this.$("gate-close").hidden = required;
+      this.$("gate-stop").hidden = !(r && required && !["ended", "failed"].includes(phase));
+      this.$("gate-stop").disabled = !this.token;
+      const order = ["room", "releases", "enrollment"];
+      for (const li of this.$("steps").children || []) { const name = li.getAttribute ? li.getAttribute("data-step") : li["data-step"]; li.className = name === step ? "active" : order.indexOf(name) < order.indexOf(step) ? "done" : ""; }
+      this.$("connect-section").hidden = Boolean(this.token) && this.$("connection").textContent.includes("launcher");
+      this.$("room-section").hidden = step !== "room";
+      this.$("notice-section").hidden = step === "room" && !this.session;
+      this.$("releases-section").hidden = step === "room" && !this.session;
+      this.$("enrollment-section").hidden = step !== "enrollment";
+      this.$("gate-title").textContent = step === "room" ? "Set up this conversation" : step === "releases" ? "Each person signs their written release" : phase === "connecting" ? "Connecting the agents" : "Record each person's enrollment statement";
+      const mic = this.$("mic"); const state = phase === "live" ? "on" : phase === "ready" ? "ready" : "off";
+      mic.setAttribute("data-state", state);
+      this.$("mic-label").textContent = state === "on" ? "Microphone open · shared by everyone in the room" : state === "ready" ? "Ready · press Start to open the microphone" : "Microphone closed";
+      this.$("app-message").textContent = !this.token ? "Local room console" : !r ? "Monitoring" : phase === "live" ? `Live · ${r.session_id || ""}` : phase === "ready" ? "Enrolled · ready to start" : phase === "ended" ? "Conversation ended" : phase === "failed" ? "Runtime stopped" : "Setting up";
+    }
     renderRuntime() {
       const r = this.runtime, key = JSON.stringify([this.token ? 1 : 0, this.vendorsReviewed(), r]);
       if (key === this.runtimeKey) return; this.runtimeKey = key;
@@ -258,6 +293,8 @@
       this.$("start").hidden = phase !== "ready";
       this.$("stop-runtime").hidden = !r || ["ended"].includes(phase);
       this.$("stop-runtime").textContent = phase === "failed" ? "Dismiss failed runtime" : phase === "live" ? "End conversation & close microphone" : "Stop runtime";
+      this.$("stop-runtime").prepend(icon(this.doc, "stop"));
+      this.renderStage();
     }
     disconnect() {
       this.token = ""; this.session = ""; this.epoch++; this.consent = null; this.runtime = null; this.consentKey = ""; this.agentKey = "";
@@ -267,7 +304,7 @@
       this.$("enrollment-help").textContent = ""; this.$("capture-status").textContent = "Microphone capture requires a current release from everyone.";
       this.$("destruction").textContent = ""; this.$("room-id").value = "";
       this.$("token").value = ""; this.$("new-room-id").value = ""; this.$("new-roster").replaceChildren(); this.addPerson();
-      this.$("openai-key").value = ""; this.runtimeKey = ""; this.renderRuntime();
+      this.$("openai-key").value = ""; this.runtimeKey = ""; this.gateForced = false; this.renderRuntime();
     }
     clearProtected() {
       this.feed.reset(); this.floor = null; this.$("participants").replaceChildren(); this.$("agents").replaceChildren();
@@ -321,7 +358,7 @@
       try {
         const consent = await this.request(this.path("consent", session));
         if (epoch !== this.epoch) return;
-        this.consent = consent; this.renderConsent();
+        this.consent = consent; this.renderConsent(); this.renderStage();
         if (!consent.allowed || terminal(consent.state)) {
           this.clearProtected();
           if (["revoked", "destroying", "destroyed"].includes(consent.state)) await this.loadDestruction(epoch, session);
@@ -457,21 +494,26 @@
       const key = JSON.stringify([this.runtime, enabled, [...this.feed.lastCalls]]);
       if (key === this.agentKey) return; this.agentKey = key; this.$("agents").replaceChildren();
       for (const a of this.runtime?.agents || []) {
-        const card = node(this.doc, "div", undefined, "agent-card");
-        card.append(node(this.doc, "h3", a.name), node(this.doc, "p", `${a.provider} · ${a.model} · ${a.voice}`, "muted"), node(this.doc, "p", a.held ? "Held" : a.responding ? "Responding" : "Listening"));
-        const actions = node(this.doc, "div", undefined, "inline");
+        const card = node(this.doc, "div", undefined, `agent-card${a.held ? " held" : a.responding ? " speaking" : ""}`);
+        const wrap = node(this.doc, "div", undefined, "orb-wrap"), orb = node(this.doc, "div", undefined, "orb");
+        orb.setAttribute("style", `--h:${hue(a.name)}`); orb.setAttribute("aria-hidden", "true"); wrap.append(orb);
+        card.append(wrap, node(this.doc, "h3", a.name), node(this.doc, "p", a.held ? "Held" : a.responding ? "Speaking" : "Listening", "state"),
+          node(this.doc, "p", `${a.provider} · ${a.model} · ${a.voice}`, "meta"));
+        const actions = node(this.doc, "div", undefined, "actions");
         for (const action of ["speak", "hold", "cancel"]) {
-          const button = node(this.doc, "button", action === "hold" && a.held ? "Release hold" : action[0].toUpperCase() + action.slice(1)); button.type = "button"; button.disabled = !enabled;
+          const text = action === "hold" && a.held ? "Release hold" : action[0].toUpperCase() + action.slice(1);
+          const button = node(this.doc, "button", undefined); button.type = "button"; button.disabled = !enabled; button.title = text;
+          button.append(icon(this.doc, action === "hold" && a.held ? "release" : action), node(this.doc, "span", text));
           button.addEventListener("click", async () => { try { await this.control(a.name, {action}); } catch (e) { this.say(e.message); } }); actions.append(button);
         }
         const label = node(this.doc, "label", "Eagerness"), select = node(this.doc, "select");
         for (const value of ["quiet", "balanced", "eager"]) { const option = node(this.doc, "option", value); option.value = value; select.append(option); }
         select.value = a.eagerness; select.disabled = !enabled; select.addEventListener("change", async () => { try { await this.control(a.name, {action:"eagerness",value:select.value}); } catch (e) { this.say(e.message); } }); label.append(select);
         const m = a.mcp || {};
-        const listing = m.list_tools === "failed" ? `Provider FAILED to list our MCP tools${m.last_error ? `: ${m.last_error}` : ""}. The agent cannot call get_transcript; check the tunnel URL and token.` : m.list_tools === "ok" ? `Provider listed tools ${JSON.stringify(m.tools || [])}` : m.calls ? "Provider is calling our MCP tools (no separate listing event from this provider)." : "Provider has not reported any MCP activity yet.";
-        card.append(node(this.doc, "p", `${listing} Provider-declared calls: ${m.calls || 0}${m.failed ? ` (${m.failed} failed: ${m.last_error || "no detail"})` : ""}.`, m.list_tools === "failed" || m.failed ? "warn" : "muted"));
+        const listing = m.list_tools === "failed" ? `Provider FAILED to list our MCP tools${m.last_error ? `: ${m.last_error}` : ""}. The agent cannot call get_transcript; check the tunnel URL and token.` : m.list_tools === "ok" ? `Provider listed tools ${JSON.stringify(m.tools || [])}` : m.calls ? "Provider is calling our MCP tools." : "No MCP activity reported by the provider yet.";
         const call = this.feed.lastCalls.get(a.participant_id);
-        card.append(actions, label, node(this.doc, "p", call ? `Last declared MCP call: ${call.tool} · ${call.bytes} bytes · ${stamp(call.timestamp_ms)}` : "No server call attributed to this agent.", "muted")); this.$("agents").append(card);
+        card.append(actions, label, node(this.doc, "p", `${listing} Provider-declared calls: ${m.calls || 0}${m.failed ? ` (${m.failed} failed: ${m.last_error || "no detail"})` : ""}. ${call ? `Last server-recorded call: ${call.tool} · ${call.bytes} bytes · ${stamp(call.timestamp_ms)}.` : "No server call attributed to this agent."}`, m.list_tools === "failed" || m.failed ? "warn meta" : "meta"));
+        this.$("agents").append(card);
       }
     }
     async control(name, body) {
