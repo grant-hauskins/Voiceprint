@@ -40,6 +40,36 @@ class LauncherHelpersTest(unittest.TestCase):
         self.assertEqual(launcher.tunnel_url(seen[-1]), "https://abc-def.trycloudflare.com/mcp")
         child.stop()
 
+    def test_netstat_parse_and_config_mismatch(self):
+        line = "  TCP    127.0.0.1:8080         0.0.0.0:0              LISTENING       60056"
+        self.assertEqual(launcher.parse_netstat_line(line, {8080, 8091}), {8080: 60056})
+        self.assertEqual(launcher.parse_netstat_line(line.replace("LISTENING", "ESTABLISHED"), {8080}), {})
+        self.assertEqual(launcher.parse_netstat_line("  TCP    0.0.0.0:8090  0.0.0.0:0  LISTENING  22880", {8080}), {})
+        env = {"VOICEPRINT_CONTROLLER_NAME": "Synthetic Controller", "VOICEPRINT_CONTROLLER_ADDRESS": "1 Test St", "VOICEPRINT_CONTROLLER_EMAIL": "c@example.invalid",
+               "VOICEPRINT_OPENAI_REVIEWED": "true", "VOICEPRINT_CLOUDFLARE_REVIEWED": "true"}
+        matching = {"controller_name": "Synthetic Controller", "controller_address": "1 Test St", "controller_email": "c@example.invalid",
+                    "vendors": {"openai_reviewed": True, "cloudflare_reviewed": True}}
+        self.assertIsNone(launcher.api_config_mismatch(matching, env))
+        stale = dict(matching, vendors={"openai_reviewed": False, "cloudflare_reviewed": False})
+        self.assertEqual(launcher.api_config_mismatch(stale, env), "openai_reviewed, cloudflare_reviewed")
+        self.assertIn("controller_name", launcher.api_config_mismatch(dict(matching, controller_name="Someone Else"), env))
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows job objects")
+    def test_children_die_with_the_launcher_job(self):
+        import ctypes
+        job = launcher.KillOnClose()
+        self.assertIsNotNone(job.handle, "job object could not be created")
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            job.add(process)
+            self.assertIsNone(process.poll())
+            ctypes.WinDLL("kernel32").CloseHandle(job.handle)       # what happens when the launcher process ends
+            process.wait(10)
+            self.assertIsNotNone(process.returncode)
+        finally:
+            if process.poll() is None:
+                process.kill()
+
     def test_main_refuses_without_local_credentials(self):
         env = {k: v for k, v in dict(**__import__("os").environ).items() if not k.startswith("VOICEPRINT_")}
         result = subprocess.run([sys.executable, str(Path(launcher.__file__)), "--no-browser"], env=env, capture_output=True, text=True, timeout=30)

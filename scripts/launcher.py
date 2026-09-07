@@ -9,6 +9,7 @@ VOICEPRINT_WORKER_PORT (8091), VOICEPRINT_CONTROL_PORT (8090 or next free), VOIC
 tunnel), VOICEPRINT_DEVICE (microphone preference), OPENAI_API_KEY (otherwise entered in the GUI).
 """
 import argparse
+import json
 import os
 import re
 import shutil
@@ -90,12 +91,106 @@ def health(url, token=None):
         return False
 
 
+def port_owners(ports):
+    """{port: pid} for listening TCP ports, from netstat on Windows (empty elsewhere or on failure)."""
+    owners = {}
+    if sys.platform != "win32":
+        return owners
+    try:
+        output = subprocess.run(["netstat", "-ano", "-p", "TCP"], capture_output=True, text=True, timeout=15).stdout
+    except Exception:
+        return owners
+    for line in output.splitlines():
+        owners.update(parse_netstat_line(line, ports))
+    return owners
+
+
+def parse_netstat_line(line, ports):
+    parts = line.split()
+    if len(parts) >= 5 and parts[0] == "TCP" and parts[3] == "LISTENING" and parts[4].isdigit():
+        port = parts[1].rsplit(":", 1)[-1]
+        if port.isdigit() and int(port) in ports:
+            return {int(port): int(parts[4])}
+    return {}
+
+
+def api_config_mismatch(notice, env):
+    """Why a running API's public notice does not match this launcher's settings, or None when it matches."""
+    problems = []
+    for key, field in (("VOICEPRINT_CONTROLLER_NAME", "controller_name"), ("VOICEPRINT_CONTROLLER_ADDRESS", "controller_address"), ("VOICEPRINT_CONTROLLER_EMAIL", "controller_email")):
+        if (notice.get(field) or "") != env.get(key, ""):
+            problems.append(field)
+    vendors = notice.get("vendors") or {}
+    for key, field in (("VOICEPRINT_OPENAI_REVIEWED", "openai_reviewed"), ("VOICEPRINT_CLOUDFLARE_REVIEWED", "cloudflare_reviewed")):
+        if bool(vendors.get(field)) != (env.get(key) == "true"):
+            problems.append(field)
+    return ", ".join(problems) or None
+
+
+def worker_accepts_token(url, token):
+    """A wrong worker credential answers 401 to any inference call; anything else means the token matched."""
+    request = urllib.request.Request(url + "/analyze", b"{}", {"Content-Type": "application/json", "Authorization": "Bearer " + token}, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=5):
+            return True
+    except urllib.error.HTTPError as error:
+        return error.code != 401
+    except Exception:
+        return False
+
+
+class KillOnClose:
+    """Windows job object: every process assigned to it dies when this launcher dies, however it dies."""
+
+    def __init__(self):
+        self.handle = None
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            handle = kernel.CreateJobObjectW(None, None)
+            if not handle:
+                return
+
+            class Limits(ctypes.Structure):
+                _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64), ("LimitFlags", wintypes.DWORD),
+                            ("MinimumWorkingSetSize", ctypes.c_size_t), ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                            ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD), ("SchedulingClass", wintypes.DWORD)]
+
+            class Counters(ctypes.Structure):
+                _fields_ = [("ReadOperationCount", ctypes.c_uint64), ("WriteOperationCount", ctypes.c_uint64), ("OtherOperationCount", ctypes.c_uint64),
+                            ("ReadTransferCount", ctypes.c_uint64), ("WriteTransferCount", ctypes.c_uint64), ("OtherTransferCount", ctypes.c_uint64)]
+
+            class Extended(ctypes.Structure):
+                _fields_ = [("BasicLimitInformation", Limits), ("IoInfo", Counters), ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                            ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+            info = Extended()
+            info.BasicLimitInformation.LimitFlags = 0x2000          # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            if kernel.SetInformationJobObject(handle, 9, ctypes.byref(info), ctypes.sizeof(info)):   # JobObjectExtendedLimitInformation
+                self.kernel, self.handle = kernel, handle
+        except Exception:
+            self.handle = None
+
+    def add(self, process):
+        if self.handle:
+            try:
+                self.kernel.AssignProcessToJobObject(self.handle, int(process._handle))
+            except Exception:
+                pass
+
+
+JOB = KillOnClose()
+
+
 class Child:
     """A child process whose output is echoed with a prefix; `watch` sees each line first."""
 
     def __init__(self, name, args, env=None, cwd=ROOT, stdin=subprocess.DEVNULL, watch=None):
         self.name, self.watch = name, watch
         self.process = subprocess.Popen(args, cwd=str(cwd), env=env, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        JOB.add(self.process)
         self.thread = threading.Thread(target=self.pump, daemon=True)
         self.thread.start()
 
@@ -142,6 +237,8 @@ def main(argv=None):
     parser.add_argument("--control-port", type=int, default=int(os.environ.get("VOICEPRINT_CONTROL_PORT", "0") or 0))
     parser.add_argument("--device", default=os.environ.get("VOICEPRINT_DEVICE"), help="microphone preference passed to the runtime")
     parser.add_argument("--once", action="store_true", help="exit when the first conversation ends instead of offering another")
+    parser.add_argument("--replace-services", action="store_true", help="stop whatever already listens on the worker/API/MCP ports and start fresh")
+    parser.add_argument("--reuse-services", action="store_true", help="keep already-running worker/API if their credentials and notice match this launcher")
     args = parser.parse_args(argv)
     api_port = int(os.environ.get("VOICEPRINT_PORT", "8080"))
     mcp_port = int(os.environ.get("VOICEPRINT_MCP_PORT", "8082"))
@@ -161,12 +258,37 @@ def main(argv=None):
     children, tunnel = [], {"url": os.environ.get("VOICEPRINT_MCP_URL")}
     run_dir = ROOT / "data" / "run" / f"launcher-{os.getpid()}"
     try:
-        if listening(worker_port):
-            print(f"Worker already listening on {worker_port}; reusing it (its VOICEPRINT_WORKER_TOKEN must match this launcher's).", flush=True)
+        occupied = port_owners({worker_port, api_port, mcp_port})
+        if occupied and args.replace_services:
+            for port, pid in sorted(occupied.items()):
+                print(f"Stopping the process on port {port} (PID {pid}) as requested by --replace-services.", flush=True)
+                subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
+            wait_for(lambda: not any(listening(p) for p in (worker_port, api_port, mcp_port)), 30, "the replaced services to release their ports")
+            occupied = {}
+        if occupied and not args.reuse_services:
+            # A leftover from an earlier run keeps its old configuration and credentials, which fails later in
+            # confusing ways (stale vendor flags, worker 401). Say exactly what is there instead of guessing.
+            listing = ", ".join(f"port {port} PID {pid}" for port, pid in sorted(occupied.items()))
+            raise RuntimeError(f"Voiceprint services are already running: {listing}. Close the other launcher window, "
+                               "or rerun with --replace-services to stop them, or --reuse-services to keep them after a configuration check")
+        if worker_port in occupied:
+            worker_url = f"http://127.0.0.1:{worker_port}"
+            if not worker_accepts_token(worker_url, env["VOICEPRINT_WORKER_TOKEN"]):
+                raise RuntimeError(f"The worker on {worker_port} (PID {occupied[worker_port]}) rejects this launcher's VOICEPRINT_WORKER_TOKEN; rerun with --replace-services")
+            print(f"Reusing the worker on {worker_port} (PID {occupied[worker_port]}); its credential matches.", flush=True)
         else:
             children.append(Child("worker", [python(), str(ROOT / "worker" / "worker.py"), "--port", str(worker_port)], env))
-        if listening(api_port):
-            print(f"API already listening on {api_port}; reusing it (its controller identity and operator token apply, not this launcher's).", flush=True)
+        if api_port in occupied:
+            try:
+                with urllib.request.urlopen(urllib.request.Request(api + "/privacy/notice"), timeout=5) as response:
+                    notice = json.load(response)
+            except Exception as error:
+                raise RuntimeError(f"Port {api_port} (PID {occupied[api_port]}) is not a reachable Voiceprint API: {error}") from None
+            mismatch = api_config_mismatch(notice, env)
+            if mismatch:
+                raise RuntimeError(f"The API on {api_port} (PID {occupied[api_port]}) runs with different settings ({mismatch}) than data\\launcher.env; "
+                                   "rerun with --replace-services so it restarts with the current file")
+            print(f"Reusing the API on {api_port} (PID {occupied[api_port]}); its notice matches data\\launcher.env.", flush=True)
         else:
             jar = ROOT / "target" / "voiceprint-0.1.0.jar"
             if not jar.exists():
