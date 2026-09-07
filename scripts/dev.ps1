@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('build', 'api', 'worker', 'mcp', 'tunnel', 'token')][string]$Mode = 'build',
+    [ValidateSet('build', 'api', 'worker', 'mcp', 'tunnel', 'token', 'api-token', 'up')][string]$Mode = 'build',
     [Parameter(ValueFromRemainingArguments = $true)][string[]]$ForwardArgs
 )
 $ErrorActionPreference = 'Stop'
@@ -17,6 +17,48 @@ try {
         $env:VOICEPRINT_MCP_TOKEN = (Get-Content -LiteralPath $tokenFile -Raw).Trim()
     }
     if ($Mode -eq 'token') { Write-Output $env:VOICEPRINT_MCP_TOKEN; exit 0 }
+    # Distinct credentials: the operator API token is not the worker's service credential.
+    # Only the explicit api-token mode prints the operator token. Never print the worker token.
+    function Get-PrivateLocalToken([string]$FileName) {
+        New-Item -ItemType Directory -Force (Join-Path $projectRoot 'data') | Out-Null
+        $privatePath = Join-Path $projectRoot ('data\' + $FileName)
+        if (-not (Test-Path -LiteralPath $privatePath)) {
+            $randomBytes = New-Object byte[] 32
+            $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+            try { $rng.GetBytes($randomBytes) } finally { $rng.Dispose() }
+            $secret = ([System.BitConverter]::ToString($randomBytes) -replace '-', '').ToLower()
+            # CreateNew avoids overwriting a token generated concurrently by another terminal.
+            $stream = $null
+            try {
+                $stream = [System.IO.File]::Open($privatePath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+                $encoded = [System.Text.Encoding]::UTF8.GetBytes($secret)
+                $stream.Write($encoded, 0, $encoded.Length)
+            } catch [System.IO.IOException] {
+                if (-not (Test-Path -LiteralPath $privatePath)) { throw }
+            } finally { if ($stream) { $stream.Dispose() } }
+        }
+        # Local development trusts the current Windows operator. Production service-account
+        # isolation is a separate deployment requirement; this ACL does not isolate same-user processes.
+        $acl = New-Object System.Security.AccessControl.FileSecurity
+        $acl.SetAccessRuleProtection($true, $false)
+        $ownerSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+        $systemSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
+        foreach ($sid in @($ownerSid, $systemSid)) {
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'Allow')
+            $acl.AddAccessRule($rule)
+        }
+        Set-Acl -LiteralPath $privatePath -AclObject $acl
+        $value = (Get-Content -LiteralPath $privatePath -Raw).Trim()
+        if ($value.Length -lt 32) { throw "Invalid local credential file: $FileName" }
+        return $value
+    }
+    if ($Mode -in @('api', 'mcp', 'api-token', 'up') -and -not $env:VOICEPRINT_API_TOKEN) {
+        $env:VOICEPRINT_API_TOKEN = Get-PrivateLocalToken 'api-token.txt'
+    }
+    if ($Mode -eq 'api-token') { Write-Output $env:VOICEPRINT_API_TOKEN; exit 0 }
+    if ($Mode -in @('api', 'worker', 'up') -and -not $env:VOICEPRINT_WORKER_TOKEN) {
+        $env:VOICEPRINT_WORKER_TOKEN = Get-PrivateLocalToken 'worker-token.txt'
+    }
     if ($Mode -eq 'tunnel') {
         $port = if ($env:VOICEPRINT_MCP_PORT) { $env:VOICEPRINT_MCP_PORT } else { '8082' }
         $found = Get-Command cloudflared.exe -ErrorAction SilentlyContinue
@@ -54,6 +96,41 @@ try {
     }
     if (-not $taskJdk) { throw 'Install JDK 21 and set JAVA_HOME.' }
     $env:JAVA_HOME = $taskJdk
+    if ($Mode -eq 'up') {
+        # One window: worker + API + tunnel + GUI-driven runtime, then the browser. Non-secret settings
+        # (controller identity, vendor review flags, ports, microphone) persist in ignored data\launcher.env.
+        # Provider keys are never stored there; enter OPENAI_API_KEY in the GUI or this shell.
+        $settings = Join-Path $projectRoot 'data\launcher.env'
+        if (Test-Path -LiteralPath $settings) {
+            foreach ($line in Get-Content -LiteralPath $settings) {
+                if ($line -match '^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$' -and -not [Environment]::GetEnvironmentVariable($Matches[1])) {
+                    [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2])
+                }
+            }
+        }
+        $prompts = [ordered]@{
+            VOICEPRINT_CONTROLLER_NAME = 'Controller (the person or entity responsible for this collection), e.g. your full name'
+            VOICEPRINT_CONTROLLER_ADDRESS = 'Controller postal address'
+            VOICEPRINT_CONTROLLER_EMAIL = 'Controller contact email'
+        }
+        foreach ($key in $prompts.Keys) {
+            if (-not [Environment]::GetEnvironmentVariable($key)) {
+                Write-Host "First run: this appears verbatim in every participant's written release notice." -ForegroundColor Yellow
+                $value = ''
+                while (-not $value.Trim()) { $value = Read-Host $prompts[$key] }
+                [Environment]::SetEnvironmentVariable($key, $value.Trim())
+                Add-Content -LiteralPath $settings -Value ("$key=" + $value.Trim()) -Encoding UTF8
+            }
+        }
+        if (-not (Test-Path -LiteralPath (Join-Path $projectRoot 'target\voiceprint-0.1.0.jar'))) {
+            Write-Host 'Building the API jar once...'
+            & $PSCommandPath build
+            if ($LASTEXITCODE -ne 0) { throw 'Build failed.' }
+        }
+        $env:VOICEPRINT_JAVA = Join-Path $taskJdk 'bin\java.exe'
+        & (Join-Path $projectRoot '.venv\Scripts\python.exe') scripts\launcher.py @ForwardArgs
+        exit $LASTEXITCODE
+    }
     if ($Mode -eq 'build') {
         $taskMaven = Join-Path $projectRoot '.tools\apache-maven-3.9.11\bin\mvn.cmd'
         if (-not (Test-Path -LiteralPath $taskMaven)) {

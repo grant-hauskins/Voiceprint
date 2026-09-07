@@ -1,0 +1,376 @@
+r"""One-window launcher: worker, API, MCP tunnel and the GUI-driven runtime, then the browser.
+
+Started by Voiceprint.cmd / `scripts\dev.ps1 up`, which resolve the JDK, provision the local credentials and
+export the controller identity. Everything else the operator needs (provider key, roster, releases, enrollment,
+start, controls) happens at http://127.0.0.1:8080/ui. Nothing here writes a provider key to disk.
+
+Environment (all optional): VOICEPRINT_JAVA, VOICEPRINT_PORT (8080), VOICEPRINT_MCP_PORT (8082),
+VOICEPRINT_WORKER_PORT (8091), VOICEPRINT_CONTROL_PORT (8090 or next free), VOICEPRINT_MCP_URL (skip the
+tunnel), VOICEPRINT_DEVICE (microphone preference), OPENAI_API_KEY (otherwise entered in the GUI).
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+import webbrowser
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+TUNNEL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+
+
+def listening(port, host="127.0.0.1"):
+    with socket.socket() as probe:
+        probe.settimeout(.3)
+        return probe.connect_ex((host, port)) == 0
+
+
+def free_port(preferred, limit=20):
+    """First port at or after `preferred` that nothing is bound to on any local address (8090 is often taken)."""
+    for port in range(preferred, preferred + limit):
+        if listening(port):
+            continue
+        try:
+            for address in ("127.0.0.1", "0.0.0.0"):
+                with socket.socket() as probe:
+                    if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                        probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                    probe.bind((address, port))
+            return port
+        except OSError:
+            continue
+    raise RuntimeError(f"No free port in {preferred}-{preferred + limit - 1}")
+
+
+def tunnel_url(line):
+    match = TUNNEL_RE.search(line)
+    return match.group(0) + "/mcp" if match else None
+
+
+def find_cloudflared():
+    found = shutil.which("cloudflared")
+    if found:
+        return found
+    for candidate in (Path(os.environ.get("ProgramFiles", "")) / "cloudflared" / "cloudflared.exe",
+                      Path(os.environ.get("ProgramFiles(x86)", "")) / "cloudflared" / "cloudflared.exe",
+                      Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WinGet" / "Links" / "cloudflared.exe"):
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def wait_for(predicate, timeout, what):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(.5)
+    raise RuntimeError(f"Timed out after {timeout:.0f}s waiting for {what}")
+
+
+def health(url, token=None):
+    """True once the API answers /health; it requires the operator bearer, so a wrong token also reports why."""
+    request = urllib.request.Request(url, headers={"Authorization": "Bearer " + token} if token else {})
+    try:
+        with urllib.request.urlopen(request, timeout=2) as response:
+            return response.status == 200
+    except urllib.error.HTTPError as error:
+        if error.code == 401:
+            raise RuntimeError("The API on this port rejects this launcher's VOICEPRINT_API_TOKEN; stop the other API or use its token") from None
+        return False
+    except Exception:
+        return False
+
+
+def port_owners(ports):
+    """{port: pid} for listening TCP ports, from netstat on Windows (empty elsewhere or on failure)."""
+    owners = {}
+    if sys.platform != "win32":
+        return owners
+    try:
+        output = subprocess.run(["netstat", "-ano", "-p", "TCP"], capture_output=True, text=True, timeout=15).stdout
+    except Exception:
+        return owners
+    for line in output.splitlines():
+        owners.update(parse_netstat_line(line, ports))
+    return owners
+
+
+def parse_netstat_line(line, ports):
+    parts = line.split()
+    if len(parts) >= 5 and parts[0] == "TCP" and parts[3] == "LISTENING" and parts[4].isdigit():
+        port = parts[1].rsplit(":", 1)[-1]
+        if port.isdigit() and int(port) in ports:
+            return {int(port): int(parts[4])}
+    return {}
+
+
+def api_config_mismatch(notice, env):
+    """Why a running API's public notice does not match this launcher's settings, or None when it matches."""
+    problems = []
+    for key, field in (("VOICEPRINT_CONTROLLER_NAME", "controller_name"), ("VOICEPRINT_CONTROLLER_ADDRESS", "controller_address"), ("VOICEPRINT_CONTROLLER_EMAIL", "controller_email")):
+        if (notice.get(field) or "") != env.get(key, ""):
+            problems.append(field)
+    vendors = notice.get("vendors") or {}
+    for key, field in (("VOICEPRINT_OPENAI_REVIEWED", "openai_reviewed"), ("VOICEPRINT_CLOUDFLARE_REVIEWED", "cloudflare_reviewed")):
+        if bool(vendors.get(field)) != (env.get(key) == "true"):
+            problems.append(field)
+    return ", ".join(problems) or None
+
+
+def worker_accepts_token(url, token):
+    """A wrong worker credential answers 401 to any inference call; anything else means the token matched."""
+    request = urllib.request.Request(url + "/analyze", b"{}", {"Content-Type": "application/json", "Authorization": "Bearer " + token}, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=5):
+            return True
+    except urllib.error.HTTPError as error:
+        return error.code != 401
+    except Exception:
+        return False
+
+
+def mcp_tools_listed(url, token, timeout=8):
+    """None when a JSON-RPC tools/list through `url` returns our two tools; otherwise a short reason."""
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}).encode()
+    request = urllib.request.Request(url, body, {"Content-Type": "application/json", "Accept": "application/json, text/event-stream",
+                                                 "Authorization": "Bearer " + token}, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.load(response)
+    except urllib.error.HTTPError as error:
+        return f"HTTP {error.code}"
+    except Exception as error:
+        return type(error).__name__
+    names = {t.get("name") for t in (payload.get("result") or {}).get("tools", []) if isinstance(t, dict)}
+    return None if {"get_transcript", "get_current_speaker"} <= names else f"unexpected tools {sorted(names)}"
+
+
+class KillOnClose:
+    """Windows job object: every process assigned to it dies when this launcher dies, however it dies."""
+
+    def __init__(self):
+        self.handle = None
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            handle = kernel.CreateJobObjectW(None, None)
+            if not handle:
+                return
+
+            class Limits(ctypes.Structure):
+                _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64), ("LimitFlags", wintypes.DWORD),
+                            ("MinimumWorkingSetSize", ctypes.c_size_t), ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                            ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD), ("SchedulingClass", wintypes.DWORD)]
+
+            class Counters(ctypes.Structure):
+                _fields_ = [("ReadOperationCount", ctypes.c_uint64), ("WriteOperationCount", ctypes.c_uint64), ("OtherOperationCount", ctypes.c_uint64),
+                            ("ReadTransferCount", ctypes.c_uint64), ("WriteTransferCount", ctypes.c_uint64), ("OtherTransferCount", ctypes.c_uint64)]
+
+            class Extended(ctypes.Structure):
+                _fields_ = [("BasicLimitInformation", Limits), ("IoInfo", Counters), ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                            ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+            info = Extended()
+            info.BasicLimitInformation.LimitFlags = 0x2000          # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            if kernel.SetInformationJobObject(handle, 9, ctypes.byref(info), ctypes.sizeof(info)):   # JobObjectExtendedLimitInformation
+                self.kernel, self.handle = kernel, handle
+        except Exception:
+            self.handle = None
+
+    def add(self, process):
+        if self.handle:
+            try:
+                self.kernel.AssignProcessToJobObject(self.handle, int(process._handle))
+            except Exception:
+                pass
+
+
+JOB = KillOnClose()
+
+
+class Child:
+    """A child process whose output is echoed with a prefix; `watch` sees each line first."""
+
+    def __init__(self, name, args, env=None, cwd=ROOT, stdin=subprocess.DEVNULL, watch=None):
+        self.name, self.watch = name, watch
+        self.process = subprocess.Popen(args, cwd=str(cwd), env=env, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        JOB.add(self.process)
+        self.thread = threading.Thread(target=self.pump, daemon=True)
+        self.thread.start()
+
+    def pump(self):
+        for raw in iter(self.process.stdout.readline, b""):
+            line = raw.decode("utf-8", "replace").rstrip("\r\n")
+            if self.watch:
+                self.watch(line)
+            print(f"[{self.name}] {line}", flush=True)
+        self.process.stdout.close()
+
+    def alive(self):
+        return self.process.poll() is None
+
+    def stop(self, grace=15):
+        if not self.alive():
+            return
+        try:
+            self.process.terminate()
+            self.process.wait(grace)
+        except Exception:
+            try:
+                self.process.kill()
+            except Exception:
+                pass
+
+
+def python():
+    venv = ROOT / ".venv" / "Scripts" / "python.exe"
+    return str(venv) if venv.exists() else sys.executable
+
+
+def java():
+    for candidate in (os.environ.get("VOICEPRINT_JAVA"), os.environ.get("JAVA_HOME") and str(Path(os.environ["JAVA_HOME"]) / "bin" / "java.exe")):
+        if candidate and Path(candidate).is_file():
+            return candidate
+    raise RuntimeError("JDK 21 not found: start through scripts\\dev.ps1 up, or set VOICEPRINT_JAVA")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--no-tunnel", action="store_true", help="do not start cloudflared (needs VOICEPRINT_MCP_URL)")
+    parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument("--control-port", type=int, default=int(os.environ.get("VOICEPRINT_CONTROL_PORT", "0") or 0))
+    parser.add_argument("--device", default=os.environ.get("VOICEPRINT_DEVICE"), help="microphone preference passed to the runtime")
+    parser.add_argument("--once", action="store_true", help="exit when the first conversation ends instead of offering another")
+    parser.add_argument("--skip-tunnel-check", action="store_true", help="do not verify tools/list through the public MCP URL before starting the runtime")
+    parser.add_argument("--replace-services", action="store_true", help="stop whatever already listens on the worker/API/MCP ports and start fresh")
+    parser.add_argument("--reuse-services", action="store_true", help="keep already-running worker/API if their credentials and notice match this launcher")
+    args = parser.parse_args(argv)
+    api_port = int(os.environ.get("VOICEPRINT_PORT", "8080"))
+    mcp_port = int(os.environ.get("VOICEPRINT_MCP_PORT", "8082"))
+    worker_port = int(os.environ.get("VOICEPRINT_WORKER_PORT", "8091"))
+    api = f"http://127.0.0.1:{api_port}"
+    env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8", VOICEPRINT_PORT=str(api_port),
+               VOICEPRINT_MCP_PORT=str(mcp_port), VOICEPRINT_WORKER_URL=f"http://127.0.0.1:{worker_port}")
+    for name in ("VOICEPRINT_API_TOKEN", "VOICEPRINT_WORKER_TOKEN", "VOICEPRINT_MCP_TOKEN"):
+        if not env.get(name):
+            raise RuntimeError(f"{name} is not set: start through scripts\\dev.ps1 up, which provisions the local credentials")
+    missing = [name for name in ("VOICEPRINT_CONTROLLER_NAME", "VOICEPRINT_CONTROLLER_ADDRESS", "VOICEPRINT_CONTROLLER_EMAIL") if not env.get(name)]
+    if missing:
+        raise RuntimeError("Controller identity is required before any release can be collected: " + ", ".join(missing))
+    if env.get("VOICEPRINT_OPENAI_REVIEWED") != "true" or env.get("VOICEPRINT_CLOUDFLARE_REVIEWED") != "true":
+        print("NOTE: VOICEPRINT_OPENAI_REVIEWED / VOICEPRINT_CLOUDFLARE_REVIEWED are not both 'true' in data\\launcher.env. "
+              "Releases can be collected, but hosted agents stay blocked until the operator has reviewed those vendor settings.", flush=True)
+    children, tunnel = [], {"url": os.environ.get("VOICEPRINT_MCP_URL")}
+    run_dir = ROOT / "data" / "run" / f"launcher-{os.getpid()}"
+    try:
+        occupied = port_owners({worker_port, api_port, mcp_port})
+        if occupied and args.replace_services:
+            for port, pid in sorted(occupied.items()):
+                print(f"Stopping the process on port {port} (PID {pid}) as requested by --replace-services.", flush=True)
+                subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
+            wait_for(lambda: not any(listening(p) for p in (worker_port, api_port, mcp_port)), 30, "the replaced services to release their ports")
+            occupied = {}
+        if occupied and not args.reuse_services:
+            # A leftover from an earlier run keeps its old configuration and credentials, which fails later in
+            # confusing ways (stale vendor flags, worker 401). Say exactly what is there instead of guessing.
+            listing = ", ".join(f"port {port} PID {pid}" for port, pid in sorted(occupied.items()))
+            raise RuntimeError(f"Voiceprint services are already running: {listing}. Close the other launcher window, "
+                               "or rerun with --replace-services to stop them, or --reuse-services to keep them after a configuration check")
+        if worker_port in occupied:
+            worker_url = f"http://127.0.0.1:{worker_port}"
+            if not worker_accepts_token(worker_url, env["VOICEPRINT_WORKER_TOKEN"]):
+                raise RuntimeError(f"The worker on {worker_port} (PID {occupied[worker_port]}) rejects this launcher's VOICEPRINT_WORKER_TOKEN; rerun with --replace-services")
+            print(f"Reusing the worker on {worker_port} (PID {occupied[worker_port]}); its credential matches.", flush=True)
+        else:
+            children.append(Child("worker", [python(), str(ROOT / "worker" / "worker.py"), "--port", str(worker_port)], env))
+        if api_port in occupied:
+            try:
+                with urllib.request.urlopen(urllib.request.Request(api + "/privacy/notice"), timeout=5) as response:
+                    notice = json.load(response)
+            except Exception as error:
+                raise RuntimeError(f"Port {api_port} (PID {occupied[api_port]}) is not a reachable Voiceprint API: {error}") from None
+            mismatch = api_config_mismatch(notice, env)
+            if mismatch:
+                raise RuntimeError(f"The API on {api_port} (PID {occupied[api_port]}) runs with different settings ({mismatch}) than data\\launcher.env; "
+                                   "rerun with --replace-services so it restarts with the current file")
+            print(f"Reusing the API on {api_port} (PID {occupied[api_port]}); its notice matches data\\launcher.env.", flush=True)
+        else:
+            jar = ROOT / "target" / "voiceprint-0.1.0.jar"
+            if not jar.exists():
+                raise RuntimeError("target\\voiceprint-0.1.0.jar is missing: run scripts\\dev.ps1 build")
+            run_dir.mkdir(parents=True, exist_ok=True)
+            private = run_dir / "voiceprint.jar"       # a rebuild under a running JVM breaks lazy class loading
+            shutil.copyfile(jar, private)
+            children.append(Child("api", [java(), "-jar", str(private)], env))
+        wait_for(lambda: health(api + "/health", env["VOICEPRINT_API_TOKEN"]), 90, f"the API on {api_port}")
+        if not tunnel["url"]:
+            if args.no_tunnel:
+                raise RuntimeError("--no-tunnel needs VOICEPRINT_MCP_URL, the public https URL ending /mcp that OpenAI can reach")
+            cloudflared = find_cloudflared()
+            if not cloudflared:
+                raise RuntimeError("Install cloudflared (winget install --id Cloudflare.cloudflared) or set VOICEPRINT_MCP_URL")
+
+            def watch(line):
+                found = tunnel_url(line)
+                if found and not tunnel["url"]:
+                    tunnel["url"] = found
+            children.append(Child("tunnel", [cloudflared, "tunnel", "--url", f"http://127.0.0.1:{mcp_port}"], env, watch=watch))
+            wait_for(lambda: bool(tunnel["url"]), 60, "the cloudflared quick tunnel URL")
+        print(f"Hosted MCP for OpenAI: {tunnel['url']} (port {mcp_port} only; the API and GUI are never tunnelled)", flush=True)
+        if not args.skip_tunnel_check:
+            # The hostname came from our own cloudflared moments ago (or from the operator's env), so probing it with our
+            # token is safe, and it is the only way to know that OpenAI will be able to list the tools at all.
+            wait_for(lambda: mcp_tools_listed(tunnel["url"], env["VOICEPRINT_MCP_TOKEN"]) is None, 45, "tools/list to succeed through the tunnel")
+            print("Tunnel verified: tools/list answered through the public URL.", flush=True)
+        control_port = args.control_port or free_port(8090)
+        first = True
+        while True:
+            command = [python(), str(ROOT / "scripts" / "agent_runtime.py"), "--gui", "--api", api, "--mcp-url", tunnel["url"], "--control-port", str(control_port)]
+            if args.device:
+                command += ["--device", args.device]
+            runtime = Child("runtime", command, env, stdin=None)
+            children.append(runtime)
+            wait_for(lambda: listening(control_port) or not runtime.alive(), 30, "the runtime control port")
+            if not runtime.alive():
+                raise RuntimeError("The runtime stopped before its control port opened; see the [runtime] lines above")
+            url = f"{api}/ui" + (f"?control={control_port}" if control_port != 8090 else "")
+            print(f"Open {url}  (this page connects to the runtime on its own)", flush=True)
+            if first and not args.no_browser:
+                webbrowser.open(url)
+            first = False
+            while runtime.alive():
+                time.sleep(.5)
+            children.remove(runtime)
+            code = runtime.process.returncode
+            print(f"Runtime exited ({'ended' if code == 0 else f'code {code}'}).", flush=True)
+            if args.once:
+                break
+            print("Press Enter to start another conversation in the same services, or Ctrl+C to stop everything.", flush=True)
+            input()
+    except KeyboardInterrupt:
+        print("Stopping.", flush=True)
+    finally:
+        for child in reversed(children):
+            child.stop()
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    try:
+        main()
+    except RuntimeError as error:
+        print(f"Launcher stopped: {error}", file=sys.stderr, flush=True)
+        sys.exit(1)

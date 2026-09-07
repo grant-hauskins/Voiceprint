@@ -16,7 +16,19 @@ interface SpeechEngine {
     final class Remote implements SpeechEngine {
         private final HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(2)).build();
         private final URI uri;
-        Remote(String url) { uri = URI.create(url + "/analyze"); }
+        private final String token;
+        Remote(String url) { this(url, System.getenv("VOICEPRINT_WORKER_TOKEN")); }
+        Remote(String url, String token) {
+            URI base = URI.create(url);
+            if (!"http".equals(base.getScheme()) || !Set.of("127.0.0.1", "localhost", "[::1]").contains(base.getHost())
+                || base.getUserInfo() != null || base.getQuery() != null || base.getFragment() != null || !(base.getPath().isEmpty() || base.getPath().equals("/")))
+                throw new IllegalArgumentException("The inference worker must use a loopback HTTP origin.");
+            uri = base.resolve("/analyze"); this.token = token;
+        }
+        private String authorization() {
+            if (token == null || token.isBlank()) throw new ApiException(503, "worker_auth_required", "Configure the internal worker token before inference.");
+            return "Bearer " + token;
+        }
         public Match match(Result result, List<Store.Profile> profiles) {
             var request = Json.obj().put("model_id", result.modelId());
             request.set("embedding", Json.MAPPER.valueToTree(result.embedding()));
@@ -24,7 +36,7 @@ interface SpeechEngine {
             for (var p : profiles) participants.add(Json.obj().put("id", p.id()).set("embedding", Json.MAPPER.valueToTree(p.vector())));
             try {
                 var response = client.send(HttpRequest.newBuilder(uri.resolve("/match")).timeout(Duration.ofSeconds(2))
-                    .header("Content-Type", "application/json").POST(HttpRequest.BodyPublishers.ofString(request.toString())).build(), HttpResponse.BodyHandlers.ofString());
+                    .header("Authorization", authorization()).header("Content-Type", "application/json").POST(HttpRequest.BodyPublishers.ofString(request.toString())).build(), HttpResponse.BodyHandlers.ofString());
                 if (response.statusCode() != 200) throw new IllegalStateException();
                 var n = Json.parse(response.body()); var candidates = new ArrayList<Candidate>(); var seen = new HashSet<String>();
                 if (!n.path("candidates").isArray() || n.path("candidates").size() != profiles.size()) throw new IllegalStateException();
@@ -47,7 +59,7 @@ interface SpeechEngine {
                 .put("sample_rate", Audio.SAMPLE_RATE).put("enrollment", enrollment);
             try {
                 var response = client.send(HttpRequest.newBuilder(uri).timeout(Duration.ofSeconds(enrollment ? 30 : 5))
-                    .header("Content-Type", "application/json").POST(HttpRequest.BodyPublishers.ofString(request.toString())).build(), HttpResponse.BodyHandlers.ofString());
+                    .header("Authorization", authorization()).header("Content-Type", "application/json").POST(HttpRequest.BodyPublishers.ofString(request.toString())).build(), HttpResponse.BodyHandlers.ofString());
                 if (response.statusCode() != 200) throw new IllegalStateException("Worker returned an error");
                 JsonNode n = Json.parse(response.body());
                 String model = Json.text(n, "model_id", 256), overlap = Json.text(n, "overlap", 32);

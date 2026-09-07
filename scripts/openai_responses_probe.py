@@ -13,6 +13,7 @@ import os
 import sys
 import urllib.request
 from pathlib import Path
+import voiceprint_client as vp
 
 
 def token(explicit):
@@ -37,30 +38,38 @@ def main():
     parser.add_argument("server_url", help="public https URL ending in /mcp")
     parser.add_argument("--token", help="MCP bearer token (default: VOICEPRINT_MCP_TOKEN or data/mcp-token.txt)")
     parser.add_argument("--model", default="gpt-5")
+    parser.add_argument("--api", default="http://127.0.0.1:8080")
+    parser.add_argument("--session", required=True, help="active room whose humans consented to hosted MCP disclosure")
     parser.add_argument("--prompt", default="Use the voiceprint tools: list sessions, then fetch the transcript of the newest session. "
                         "Reply in two short lines: who spoke last, and which lines (if any) were overlap or low confidence.")
     args = parser.parse_args()
     key = os.environ.get("OPENAI_API_KEY")
     if not key:
         sys.exit("Set OPENAI_API_KEY in the environment first.")
-    body = {"model": args.model, "tools": [mcp_tool(args.server_url, token(args.token))], "input": args.prompt}
+    consent = vp.ConsentGuard(args.api, args.session)
+    consent.require("hosted_mcp")
+    body = {"model": args.model, "store": False,
+            "tools": [mcp_tool(args.server_url, token(args.token), ("get_transcript", "get_current_speaker"))],
+            "input": f"Use only Voiceprint session_id {args.session}. " + args.prompt}
     request = urllib.request.Request("https://api.openai.com/v1/responses", json.dumps(body).encode(),
                                      {"Content-Type": "application/json", "Authorization": "Bearer " + key})
     try:
+        consent.require("hosted_mcp")
         with urllib.request.urlopen(request, timeout=120) as response:
             result = json.load(response)
     except urllib.error.HTTPError as error:
-        sys.exit(f"HTTP {error.code}: {error.read().decode('utf-8', 'replace')[:2000]}")
+        sys.exit(f"OpenAI returned HTTP {error.code}; response content suppressed")
+    consent.require("hosted_mcp")
     for item in result.get("output", []):
         kind = item.get("type")
         if kind == "mcp_list_tools":
             print("mcp_list_tools:", [t["name"] for t in item.get("tools", [])])
         elif kind == "mcp_call":
-            print(f"mcp_call {item.get('name')}({item.get('arguments')}) -> {'ERROR ' + str(item.get('error')) if item.get('error') else str(item.get('output'))[:300]}")
+            print(f"mcp_call {item.get('name')} -> {'ERROR' if item.get('error') else 'ok'} ({len(str(item.get('output') or '').encode('utf-8'))} bytes)")
         elif kind == "message":
             for part in item.get("content", []):
                 if part.get("type") == "output_text":
-                    print("ANSWER:", part["text"])
+                    print("ANSWER received (text suppressed in terminal proof log).")
     usage = result.get("usage", {})
     print("tokens in/out:", usage.get("input_tokens"), usage.get("output_tokens"))
 

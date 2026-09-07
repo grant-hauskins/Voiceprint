@@ -2,6 +2,8 @@
 
 Written 2026-09-06 after the first end-to-end live test with a hosted voice agent. This document is the working spec for the next build sessions. It supersedes the phasing section of the original brief; the original problem statement stands.
 
+Later implementation checkpoint: [SESSION_HANDOFF_2026-09-06.md](SESSION_HANDOFF_2026-09-06.md) records the separate v2 branches and verified/unverified work. Historical evidence below does not verify the new runtime or privacy enforcement. [BIPA_V2.md](BIPA_V2.md) governs prior consent and retention; [V2_RESUME_CHECKLIST.md](V2_RESUME_CHECKLIST.md) gives the remaining integration and live-test steps.
+
 ## 1. The business problem, restated
 
 AI agents are being put into rooms with more than one person: negotiations, family decisions, meetings, support calls with a relative on the line. Every hosted voice API (OpenAI Realtime, Gemini Live, xAI speech-to-speech) hears one microphone and treats everything on it as "the user". The agent cannot tell who said what, so it cannot represent one person, cannot weigh one voice over another, and cannot tell when to speak. Voice assistants dodged this with wake words. Agents that act on someone's behalf cannot.

@@ -1,6 +1,6 @@
 # Voice agent turn-taking in group conversations
 
-Brief for the Voiceprint agent client (`scripts/realtime_openai.py`, gate in `scripts/turn_gate.py`).
+Brief for the shared runtime (`scripts/agent_runtime.py`, provider adapters in `scripts/providers/`, gate in `scripts/turn_gate.py`). `realtime_openai.py` remains a single-agent compatibility entry point into the same guarded runtime and supplies the unchanged device/player helpers and instructions.
 
 ## 1. Problem restatement
 
@@ -17,7 +17,7 @@ Signals tiered by reliability, each mapped to what the middleware already emits.
 | Signal | Source | Rule |
 |---|---|---|
 | Direct address ("Ava, what do you think?") | `get_transcript` line text | Agent may respond once the speaker finishes |
-| Push-to-talk / "you may speak" key | client keyboard | Immediate `response.create` |
+| Push-to-talk / "you may speak" key | client keyboard | One response after idle transcription and a floor grant |
 | Hold key | client keyboard | Suppress the next opportunity |
 
 **Soft signals (need to co-occur)**
@@ -61,7 +61,7 @@ Scoreboard printed from `data/realtime-events.jsonl`:
 
 Hybrid, in this order of precedence:
 
-1. **Manual override always wins.** Space = speak now, H = hold. Cheap insurance for demos and for people who dislike surprises.
+1. **Manual controls select an agent.** 1/2 selects Ava/Ben, Space requests one reply, H toggles sticky hold and cancels playback, C cancels the current reply, Q stops the room. `--agent NAME` selects the initial keyboard target. Manual speak still requires the floor, valid consent and idle transcription.
 2. **Address-by-name is the default trigger.** Same mental model as Alexa, but the name is used naturally in a sentence rather than as a wake word, and it works because the gate can see the transcript.
 3. **Context-aware defaults fill the gaps.** A clean, high-label question followed by silence is a fair opportunity in `balanced` mode; `quiet` mode disables this entirely.
 4. **Uncertainty is spoken, not hidden.** When the gate returns `clarify`, the agent asks who spoke instead of guessing. This is the product promise of the confidence labels.
@@ -85,3 +85,23 @@ Known limits: the 1.5 s attribution context means the gate learns who started sp
 3. Enroll the agent's own voice at startup so its echo is labeled and ignored (the `agent_speaker_id` path in the gate).
 4. Add xAI (same endpoint) and a Gemini Live bridge once the OpenAI path is stable.
 5. Move the gate into a small service beside the API when two providers share it.
+
+## 7. Shared room runtime and evidence
+
+The runtime captures one microphone and sends the same accepted chunks to each configured provider. It imports the original resampling and name-based device selection: Seiren input and `HD 4.40,BenQ` output preferences. While any output queue or configured hardware tail is busy, microphone chunks become zeros for both Voiceprint and provider inputs; the accepted-audio clock still advances. This remains half duplex: human speech during playback is lost. No silence, overlap, cooldown, similarity threshold or pre-reply nudge wording changed.
+
+`scripts/agents.toml` starts Ava with `marin`/`balanced` and Ben with `cedar`/`quiet`. OpenAI Realtime supports both voices. `xai_speech` and `gemini_live` implement the adapter interface as explicit unavailable stubs. `--check-config` validates and prints safe settings without opening a device or contacting a provider.
+
+All agents register without embeddings. The runtime polls stored utterances by increasing ID, de-duplicates them and delivers the same rows to each gate. Own agent output suppresses replying again to an older human question. Another agent's line only allows a reply when it names this agent; a human line naming another configured agent is also not a soft opening. Existing direct-address window and per-agent cooldown remain. Agent rows are published only after their transcript POST succeeds; failed storage stops the runtime.
+
+The API floor is mandatory before any initial response, including manual speak. A 15-second lease renews after five seconds and remains held through tool-only responses, completed MCP calls, their continuation, final `response.done`, and actual queued playback plus mute tail. Renewal failure, expired lease or a changed holder cancels generation and aborts audio. Cancellation discards queued audio and continues muting through the hardware tail. A response cannot continue until its in-progress MCP calls finish. The runtime never starts a fresh reply while local transcription is outstanding.
+
+Controls bind only `127.0.0.1:8090`, validate Host and exact local GUI origins, and use the API bearer token. GET `/agents` exposes the agreed state; POST controls enqueue the same operations as the keyboard. The tunnel remains solely the hosted MCP endpoint on 8082.
+
+Disk logs are disabled; an explicit `--events` fails before collection until encrypted artifact registration and verified destruction exist. A bounded in-memory buffer holds allowlisted metadata, prints an aggregate score if the scorer is installed, and clears on shutdown or withdrawal. It reports evicted records and incomplete evidence if the 20,000-record bound is reached. No audio, human names, transcript text, tool arguments/results, session configuration, authorization or keys enter this buffer. Safe provider events preserve tool success/UTF-8 size and response item types. Actual playback start comes from the output callback; drained timing includes the conservative mute tail. The software cannot certify physical erasure of OS memory, swap or snapshots; those remain deployment safeguards.
+
+## 8. Prior written consent is a launch gate
+
+The current `docs/BIPA_V2.md` contract applies before every capture, WAV read, enrollment, transcription, stream dispatch and hosted send. The runtime first creates a pending room from each person's full typed name and contact, then waits with the microphone closed while each person personally signs in the local GUI. The API must have configured controller details and an operator token. Local consent alone cannot enable the provider: effective `openai_audio` and `hosted_mcp` scopes must both be true, incorporating vendor review flags. No API key or loopback address substitutes for a release.
+
+After the written release, each eight-second enrollment begins with the specified spoken corroboration. The API links the exact PCM hash to the earlier written record. A shared ConsentGuard rechecks authoritative status before protected actions, rejects changed policy/roster, and latches failure on revocation, expiry or API outage. Capture callbacks stop once authorization freshness exceeds one second. Withdrawal flushes pending audio and ASR work and cancels providers. Session completion finishes pending permitted transcription before `/end` destroys the session purpose data. The legacy realtime command delegates into this runtime; unconsented legacy replay is blocked pending a provenance workflow. Automated tests use synthetic PCM and fake authority/provider services; a human live test remains required after genuine individual releases.

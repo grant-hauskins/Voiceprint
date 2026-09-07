@@ -1,5 +1,7 @@
 # Voiceprint
 
+**Current v2 checkpoint:** see [September 6 handoff](docs/SESSION_HANDOFF_2026-09-06.md) and [resume checklist](docs/V2_RESUME_CHECKLIST.md). Implementation is in separate worktrees and is not yet integrated or live-verified. The [prior-consent and destruction contract](docs/BIPA_V2.md) supersedes older permissive audio/replay instructions for v2.
+
 A working two-speaker middleware spike: **Python owns ML; Java owns the API, session coordination and SQLite persistence.** The two processes communicate over local REST. A thin Java stdio MCP adapter queries the same API.
 
 The real-model integration path runs. **This is not a launch-qualified MVP:** calibrated confidence and live accuracy still require the explicitly defined validation set in [CALIBRATION.md](docs/CALIBRATION.md). No fixture-derived probabilities are presented to agents.
@@ -19,6 +21,17 @@ The real-model integration path runs. **This is not a launch-qualified MVP:** ca
 - OpenAI Realtime voice agent (`scripts/realtime_openai.py`) with an application-level turn-taking gate (`scripts/turn_gate.py`, design in [TURN_TAKING.md](docs/TURN_TAKING.md)): the provider's VAD only segments audio; the client decides when the agent may speak from speaker labels, overlap and silence.
 
 The API returns `confidence: null`, `confidence_kind: "uncalibrated"`, and `trusted: false` until a validated calibration artifact is loaded. `similarity` is a cosine score, **not a probability**. Text is optional, supplied by an external ASR client; this spike does not transcribe audio.
+
+## Start (one window)
+
+Double-click `Voiceprint.cmd` (or run `scripts\dev.ps1 up`). It provisions the local credentials, asks once for the controller name, address and email (saved to ignored `data\launcher.env`; they appear verbatim in every written release), builds the jar if missing, then starts the worker, the API, the cloudflared MCP tunnel and the runtime in that one window and opens `http://127.0.0.1:8080/ui`. The page connects to the runtime by itself; nothing is pasted. The rest of a session happens in the browser:
+
+1. **Conversation runtime** panel: paste the OpenAI API key (held only in the runtime process; it is never written to disk) and enter each person's full name and email/phone. *Create room* posts the roster; the microphone stays closed.
+2. **Participant releases**: each person reads the notice on the shared screen, types their name, checks the release and the optional OpenAI/MCP disclosures, and signs.
+3. **Enrollment**: press *Record NAME now*, and that person speaks their eight-second statement. Levels and rejections show inline; a rejected set is recorded again.
+4. Press **Start conversation**. Speak/Hold/Cancel/eagerness per agent, the transcript, floor and server MCP proof are on the same page. *End conversation* closes the microphone and ends the room; *Withdraw* on any release stops everything and starts destruction.
+
+When a conversation ends the launcher offers another one in the same services; Ctrl+C in the window stops everything. Hosted agents stay blocked until `VOICEPRINT_OPENAI_REVIEWED=true` and `VOICEPRINT_CLOUDFLARE_REVIEWED=true` are set in `data\launcher.env` after you have actually reviewed those vendor settings; the launcher says so at start, the page disables *Create room* until then, and every person must check both optional disclosures or the room cannot use the agents. Optional settings there: `VOICEPRINT_DEVICE` (microphone preference), `VOICEPRINT_MCP_URL` (skip the tunnel), `VOICEPRINT_CONTROL_PORT`. If 8090 is busy (a Wondershare notifier on this machine) the launcher picks the next free port and opens `/ui?control=PORT`. If something already listens on the worker/API/MCP ports (a leftover from an earlier run keeps its old settings and credentials), the launcher stops and names the PIDs; rerun with `--replace-services` to stop them or `--reuse-services` to keep them after it checks their notice and credential against yours. Services started by the launcher die with it, even if the window is closed. If port 8080 is not the API, `--no-browser`/`--once` are launcher flags for scripted runs. The manual multi-terminal path below still works and `agent_runtime.py --gui` is what the launcher runs.
 
 ## Run locally
 
@@ -140,7 +153,7 @@ Other providers: xAI Responses and Speech-to-Speech accept the same remote MCP s
 - `VOICEPRINT_WORKER_URL`: default `http://127.0.0.1:8091`.
 - `VOICEPRINT_DB`: default `data/voiceprint.sqlite`.
 - `VOICEPRINT_API_TOKEN`: optional bearer token; set the same value in the API, microphone client and MCP adapter environments.
-- `VOICEPRINT_ML_THREADS`: Python CPU inference threads, default `2`.
+- `VOICEPRINT_ML_THREADS`: Python CPU inference threads, default `1`. More threads can slow these small streaming windows; benchmark before overriding.
 - Worker `--calibration PATH`: load an eligible calibration artifact; fails startup if invalid.
 
 Both servers bind to loopback. They are intended for a single trusted local user. Network deployment requires a separate authenticated TLS boundary and tenant isolation; it is not part of this spike. Browser-origin API requests are rejected.

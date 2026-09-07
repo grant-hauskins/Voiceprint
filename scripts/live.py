@@ -15,6 +15,8 @@ import voiceprint_client as vp  # noqa: E402
 
 
 def run(args):
+    if args.events is not None:
+        raise vp.ConsentError("--events disk logs are disabled pending encrypted artifact registration and verified destruction")
     if not 2 <= len(args.names) <= 4:
         raise ValueError("Choose 2–4 participants")
     replay = args.stream_wav is not None
@@ -23,40 +25,50 @@ def run(args):
     if not args.no_transcribe:
         print(f"Loading faster-whisper {args.model} (first run downloads the model)...", flush=True)
     session = args.session or "live_" + uuid.uuid4().hex[:12]
-    names = vp.enroll(args.api, session, args.names, vp.record_from_mic(args.device), args.enroll_wavs if replay else None)
+    if replay:
+        raise vp.ConsentError("Human-audio replay is blocked in this entry point until a provenance/permission workflow exists; use synthetic offline tests")
+    consent = vp.prepare_room(args.api, session, args.names, args.contacts)
+    names = vp.enroll(args.api, session, args.names, vp.record_from_mic(args.device, consent),
+                      args.enroll_wavs if replay else None, consent=consent)
     print("Session", session, "ready:", ", ".join(f"{pid}={name}" for pid, name in names.items()), flush=True)
-    log = None
-    if args.events:
-        args.events.parent.mkdir(parents=True, exist_ok=True)
-        log = args.events.open("w", encoding="utf-8")
-    transcriber = None if args.no_transcribe else vp.Transcriber(args.api, session, names, args.model, log)
+    from agent_runtime import EventLog
+    log = EventLog(None, session, secrets=(vp.api_token(),))
+    transcriber = None if args.no_transcribe else vp.Transcriber(args.api, session, names, args.model, log, consent=consent)
     sink = transcriber.submit if transcriber else (lambda utterance, pcm: print(vp.format_line(dict(utterance, text="(not transcribed)"), names), flush=True))
-    stream = vp.Stream(args.api, session, vp.Turns(sink, args.verbose), log, verbose=args.verbose)
+    stream = vp.Stream(args.api, session, vp.Turns(sink, args.verbose), log, verbose=args.verbose, consent=consent)
     print("Lines starting with #id are stored and readable by agents via get_transcript under that id.", flush=True)
     if not replay:
         input("Press Enter to start the conversation. Ctrl+C ends the session. ")
     try:
         if replay:
-            for pcm, captured_at in vp.file_chunks(args.stream_wav, args.realtime):
+            for pcm, captured_at in vp.file_chunks(args.stream_wav, args.realtime, consent):
                 if stream.sequence >= args.seconds * 4:
                     break
                 stream.feed(pcm, captured_at)
         else:
-            with vp.Microphone(args.device) as mic:
+            with vp.Microphone(args.device, consent=consent) as mic:
                 while stream.sequence < args.seconds * 4:
                     pcm, captured_at = mic.get()
                     stream.feed(pcm, captured_at)
     except KeyboardInterrupt:
         print("Conversation stopped.", flush=True)
     finally:
-        stream.end()
+        if consent.failed.is_set():
+            stream.turns.chunks.clear()
+            stream.turns.current = stream.turns.overlap = None
+            if transcriber:
+                transcriber.discard()
+        else:
+            stream.turns.flush()
         if transcriber:
             print("Finishing transcription...", flush=True)
             transcriber.finish()
+        vp.api(args.api, f"/speaker/session/{session}/end", {})
         if log:
+            log.summarize()
             log.close()
         print("Session ended:", session, flush=True)
-        print(f'Transcript: scripts\\live.py transcript {session}  or MCP get_transcript(session_id="{session}")', flush=True)
+        print("Session purpose complete; protected transcript destruction requested.", flush=True)
 
 
 def show(args):
@@ -70,6 +82,7 @@ if __name__ == "__main__":
     commands = parser.add_subparsers(dest="command", required=True)
     live = commands.add_parser("run", help="enroll, stream and transcribe")
     live.add_argument("--names", nargs="+", required=True)
+    live.add_argument("--contacts", nargs="+", help="one typed email/phone per full name; otherwise prompt")
     live.add_argument("--session")
     live.add_argument("--seconds", type=int, default=60)
     live.add_argument("--device", type=int, help="sounddevice input index")

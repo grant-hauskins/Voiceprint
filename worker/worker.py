@@ -9,6 +9,7 @@ import base64
 import hashlib
 import json
 import os
+import hmac
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -71,7 +72,10 @@ class Models:
         from speechbrain.inference.speaker import EncoderClassifier
         from speechbrain.utils.fetching import LocalStrategy
 
-        torch.set_num_threads(int(os.environ.get("VOICEPRINT_ML_THREADS", "2")))
+        # Small streaming windows can be slower with thread-pool coordination.
+        # Keep the override for machines benchmarked with a different CPU budget.
+        threads = int(os.environ.get("VOICEPRINT_ML_THREADS", "1"))
+        torch.set_num_threads(threads)
         self.torch = torch
         # Local-only model loading: setup_models.py performs the explicit downloads.
         self.encoder = EncoderClassifier.from_hparams(
@@ -80,7 +84,7 @@ class Models:
             run_opts={"device": "cpu"}, local_strategy=LocalStrategy.COPY,
         )
         options = ort.SessionOptions()
-        options.intra_op_num_threads = int(os.environ.get("VOICEPRINT_ML_THREADS", "2"))
+        options.intra_op_num_threads = threads
         options.inter_op_num_threads = 1
         self.segmentation = ort.InferenceSession(str(root / "segmentation.onnx"), options, providers=["CPUExecutionProvider"])
         # SincNet kernels [251,5,5], strides [1,1,1], max pools [3,3,3],
@@ -139,7 +143,9 @@ class Models:
                 "calibration_id": self.calibrator.id if prediction is not None else None}
 
 
-def serve(models, port):
+def create_server(models, port, token=None):
+    """Only the API holds this service credential; it is not participant consent."""
+    expected_token = token if token is not None else os.environ.get("VOICEPRINT_WORKER_TOKEN")
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
             pass  # Never log audio, profiles, or participant identities.
@@ -157,8 +163,15 @@ def serve(models, port):
                        {"status": "ready", "model_id": models.model_id} if self.path == "/health" else {"error": "not_found"})
 
         def do_POST(self):
-            if self.headers.get("Origin") or self.headers.get("Host", "").split(":")[0] not in ("localhost", "127.0.0.1"):
+            if self.headers.get("Origin") is not None or self.headers.get("Host", "") not in (
+                    f"localhost:{self.server.server_port}", f"127.0.0.1:{self.server.server_port}"):
                 self.reply(403, {"error": "origin_rejected"})
+                return
+            if not expected_token:
+                self.reply(503, {"error": "worker_auth_not_configured"})
+                return
+            if not hmac.compare_digest(self.headers.get("Authorization", ""), "Bearer " + expected_token):
+                self.reply(401, {"error": "worker_unauthorized"})
                 return
             try:
                 self.connection.settimeout(10)
@@ -180,7 +193,11 @@ def serve(models, port):
                 print("Inference failed:", type(error).__name__, flush=True)
                 self.reply(503, {"error": "inference_failed"})
 
-    HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    return HTTPServer(("127.0.0.1", port), Handler)
+
+
+def serve(models, port):
+    create_server(models, port).serve_forever()
 
 
 if __name__ == "__main__":
