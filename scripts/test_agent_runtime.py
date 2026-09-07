@@ -541,12 +541,37 @@ class LifecycleHttpTest(unittest.TestCase):
                 self.runtime.recorder(None, FakeConsent(), console=False)("Synthetic One")
             microphone.assert_not_called()
 
+    REVIEWED = {"configured": True, "vendors": {"openai_reviewed": True, "cloudflare_reviewed": True}}
+
     def test_prepare_room_wait_abandons_on_stop(self):
         stop = threading.Event(); stop.set()
-        responses = iter([{"configured": True}, {"session_id": "room"}, {"state": "pending", "allowed": False}])
+        responses = iter([self.REVIEWED, {"session_id": "room"}, {"state": "pending", "allowed": False}])
         with patch.object(vp, "api_token", return_value="operator-token"), patch.object(vp, "api", side_effect=lambda *a, **k: next(responses)):
             with self.assertRaisesRegex(vp.ConsentError, "Stopped while waiting"):
                 vp.prepare_room("http://127.0.0.1:1", "room", ["Synthetic One"], ["one@example.invalid"], True, stop)
+
+    def test_prepare_room_refuses_hosted_room_before_vendor_review_and_names_missing_scopes(self):
+        calls = []
+        unreviewed = {"configured": True, "vendors": {"openai_reviewed": True, "cloudflare_reviewed": False}}
+        with patch.object(vp, "api_token", return_value="operator-token"), patch.object(vp, "api", side_effect=lambda base, path, body=None: (calls.append(path), unreviewed)[1]):
+            with self.assertRaisesRegex(vp.ConsentError, "VOICEPRINT_CLOUDFLARE_REVIEWED=true"):
+                vp.prepare_room("http://127.0.0.1:1", "room", ["Synthetic One"], ["one@example.invalid"], True)
+        self.assertEqual(calls, ["/privacy/notice"])                      # no room was created
+        signed_without_scopes = {"state": "active", "allowed": True, "scopes": {"local_processing": True, "openai_audio": False, "hosted_mcp": False}}
+        responses = iter([self.REVIEWED, {"session_id": "room"}, signed_without_scopes])
+        with patch.object(vp, "api_token", return_value="operator-token"), patch.object(vp, "api", side_effect=lambda *a, **k: next(responses)):
+            with self.assertRaisesRegex(vp.ConsentError, "disclosure box unchecked"):
+                vp.prepare_room("http://127.0.0.1:1", "room", ["Synthetic One"], ["one@example.invalid"], True)
+
+    def test_guard_keeps_the_specific_reason(self):
+        guard = vp.ConsentGuard("http://127.0.0.1:1", "room", hosted=True)
+        state = {"session_id": "room", "allowed": True, "state": "active", "policy_version": "p", "consent_method_version": "m", "roster_version": 1,
+                 "participants": [{"bipa_consent_granted": True}], "scopes": {"local_processing": True, "openai_audio": False, "hosted_mcp": False},
+                 "retention_deadline_ms": (time.time() + 60) * 1000}
+        with patch.object(vp, "api", return_value=state):
+            with self.assertRaisesRegex(vp.ConsentError, "reviewed vendor configuration"):
+                guard.require("local_processing")
+        self.assertTrue(guard.failed.is_set())
 
 
 if __name__ == "__main__":

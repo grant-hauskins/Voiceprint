@@ -65,9 +65,10 @@ class ConsentGuard:
             self.epoch = epoch
             self.valid_until = time.monotonic() + 1.0
             return state
-        except Exception:
+        except Exception as error:
             self.deny()
-            raise ConsentError("Consent unavailable, revoked, expired, or changed; stopped all protected processing") from None
+            reason = str(error) if isinstance(error, ConsentError) else "consent status request failed"
+            raise ConsentError(f"Consent unavailable, revoked, expired, or changed; stopped all protected processing ({reason})") from None
 
 
 def require_consent(consent, scope="local_processing"):
@@ -84,6 +85,11 @@ def prepare_room(base, session, names, contacts=None, hosted=False, stop=None):
     notice = api(base, "/privacy/notice")
     if not notice.get("configured"):
         raise ConsentError("Configure the controller name, address, and email in the API before consent")
+    vendors = notice.get("vendors") or {}
+    if hosted and not (vendors.get("openai_reviewed") is True and vendors.get("cloudflare_reviewed") is True):
+        # Fail before anyone signs: the API would compute the hosted scopes as false no matter what people check.
+        raise ConsentError("Hosted agents are blocked until the operator has reviewed the OpenAI and Cloudflare account settings and set "
+                           "VOICEPRINT_OPENAI_REVIEWED=true and VOICEPRINT_CLOUDFLARE_REVIEWED=true in data\\launcher.env (then restart)")
     if contacts is not None and len(contacts) != len(names):
         raise ValueError("Provide one --contacts entry per full participant name")
     contacts = contacts or [input(f"{name}: type your email or phone (unverified): ").strip() for name in names]
@@ -98,6 +104,10 @@ def prepare_room(base, session, names, contacts=None, hosted=False, stop=None):
         if state.get("state") in ("revoked", "destroying", "destroyed", "legacy_blocked"):
             raise ConsentError("This room cannot be authorized; start a new consent room")
         if state.get("allowed"):
+            scopes = state.get("scopes") or {}
+            if hosted and not (scopes.get("openai_audio") is True and scopes.get("hosted_mcp") is True):
+                raise ConsentError("Everyone signed, but at least one release left an optional disclosure box unchecked, so the room "
+                                   "cannot use OpenAI audio or hosted MCP. End this room and start again with both disclosure boxes checked")
             guard = ConsentGuard(base, session, hosted)
             guard.require("openai_audio" if hosted else "local_processing")
             return guard

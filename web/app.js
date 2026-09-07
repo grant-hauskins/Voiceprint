@@ -164,8 +164,13 @@
       const remove = node(this.doc, "button", "Remove"); remove.type = "button"; remove.addEventListener("click", () => row.remove()); row.append(remove);
       this.$("setup-roster").append(row);
     }
+    vendorsReviewed() {
+      const v = this.notice && this.notice.vendors;
+      return Boolean(v && v.openai_reviewed === true && v.cloudflare_reviewed === true);
+    }
     async submitSetup() {
       if (!this.runtime || this.runtime.phase !== "setup") throw new Error("The runtime is not waiting for setup.");
+      if (!this.vendorsReviewed()) throw new Error("Hosted agents are blocked until both vendor review flags are set in data\\launcher.env.");
       const participants = [...this.$("setup-roster").children].map(row => Object.fromEntries(["name", "contact"].map(key => [key, row.querySelector(`[name="${key}"]`).value.trim()])));
       if (participants.length < 2 || participants.length > 4 || participants.some(p => !p.name || !p.contact)) throw new Error("Enter a full name and an email or phone for each of the two to four people within microphone range.");
       const body = {participants};
@@ -181,13 +186,17 @@
       await this.request(path, {runtime:true, body:{}}); await this.pollRuntime();
     }
     renderRuntime() {
-      const r = this.runtime, key = JSON.stringify([this.token ? 1 : 0, r]);
+      const r = this.runtime, key = JSON.stringify([this.token ? 1 : 0, this.vendorsReviewed(), r]);
       if (key === this.runtimeKey) return; this.runtimeKey = key;
       const phase = r ? (r.phase || "live") : null;
       this.$("phase").textContent = !this.token ? "Connect first" : !r ? `Runtime unavailable on ${this.control.slice(7)}` : phase;
       this.$("phase-detail").textContent = r && r.detail ? r.detail : !r && this.token ? "Start it with Voiceprint.cmd (or scripts\\dev.ps1 up) and this page will connect on its own." : "";
       this.$("setup-form").hidden = phase !== "setup";
       this.$("key-label").hidden = !(r && r.needs_openai_key);
+      // Without both review flags the API computes the hosted scopes as false, so a room created now would fail after everyone signed.
+      const reviewed = this.vendorsReviewed();
+      this.$("setup-submit").disabled = !reviewed;
+      this.$("setup-blocked").textContent = reviewed ? "" : "Hosted agents are blocked: review the OpenAI and Cloudflare account settings, then set VOICEPRINT_OPENAI_REVIEWED=true and VOICEPRINT_CLOUDFLARE_REVIEWED=true in data\\launcher.env and restart the launcher.";
       const people = r && r.participants || [];
       const enrollment = this.$("enrollment"); enrollment.hidden = !["enrollment", "connecting", "ready", "live"].includes(phase) || !people.length; enrollment.replaceChildren();
       for (const p of people) {
@@ -344,6 +353,7 @@
         const accept = checkbox("I personally reviewed the controller, purpose and retention notice above. I consent to the collection, storage and local processing of my voiceprint for this room and intend my typed name and this submission as my written electronic release."); accept.required = true;
         const audio = checkbox("I also authorize disclosure of my voice audio to OpenAI for the room's voice agent features, as described in the notice.");
         const mcp = checkbox("I also authorize hosted MCP disclosure of my named transcript and speaker attribution to OpenAI through Cloudflare, as described in the notice.");
+        form.append(node(doc, "p", "The voice agents need both optional disclosures from every person in the room. A release without them still counts locally, but the room then cannot use the agents and must be ended and re-signed.", "muted"));
         const submit = node(doc, "button", "Participant: sign written release"); submit.type = "submit"; submit.disabled = !this.noticeReady;
         const feedback = node(doc, "p", "", "release-feedback"); feedback.setAttribute("role", "status");
         form.append(submit, feedback);

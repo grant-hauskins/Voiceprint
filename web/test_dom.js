@@ -89,7 +89,7 @@ async function main() {
 
   // Launcher-started runtime: bootstrap hands over the token, the page drives setup, enrollment, start and stop.
   const runtimeCalls = [];
-  let phase = "setup", awaiting = null, sessionId = null;
+  let phase = "setup", awaiting = null, sessionId = null, reviewedVendors = {openai_reviewed:false, cloudflare_reviewed:true};
   const runtimeFetcher = async (url, options) => {
     runtimeCalls.push({url, options});
     let data = {};
@@ -100,7 +100,7 @@ async function main() {
     else if (url === "http://127.0.0.1:8123/enrollment/record") { awaiting = null; phase = "ready"; }
     else if (url === "http://127.0.0.1:8123/start") phase = "live";
     else if (url === "http://127.0.0.1:8123/stop") phase = "ended";
-    else if (url === "/privacy/notice") data = {configured:true,controller_name:"Test Controller",controller_address:"Test address",controller_email:"test@example.invalid",notice_text:"Synthetic",notice_sha256:"h",retention_text:"r",vendors:{},policy_version:"t",consent_method_version:"t"};
+    else if (url === "/privacy/notice") data = {configured:true,controller_name:"Test Controller",controller_address:"Test address",controller_email:"test@example.invalid",notice_text:"Synthetic",notice_sha256:"h",retention_text:"r",vendors:reviewedVendors,policy_version:"t",consent_method_version:"t"};
     else if (url === "/speaker/sessions?limit=100") data = {sessions:[]};
     else if (url === "/privacy/rooms") data = {rooms:[]};
     else if (url.endsWith("/consent")) data = {session_id:"room_auto",state:"pending",allowed:false,participants:[]};
@@ -112,6 +112,11 @@ async function main() {
   await launched.bootstrap(); assert.equal(launched.token, "launcher_token");
   await launched.pollRuntime();
   assert.equal(launched.$("phase").textContent, "setup"); assert(!launched.$("setup-form").hidden); assert(!launched.$("key-label").hidden);
+  // Unreviewed vendor settings block room creation up front instead of failing after everyone has signed.
+  assert(launched.$("setup-submit").disabled); assert.match(launched.$("setup-blocked").textContent, /VOICEPRINT_OPENAI_REVIEWED=true/);
+  await assert.rejects(() => launched.submitSetup(), /vendor review flags/);
+  reviewedVendors = {openai_reviewed:true, cloudflare_reviewed:true}; await launched.loadNotice(); await launched.pollRuntime();
+  assert(!launched.$("setup-submit").disabled); assert.equal(launched.$("setup-blocked").textContent, "");
   launched.$("openai-key").value = "sk-synthetic-key-value-0000000000";
   launched.addSetupPerson(); launched.addSetupPerson(); const [rowOne, rowTwo] = launched.$("setup-roster").children;
   rowOne.querySelector('[name="name"]').value = "Synthetic One"; rowOne.querySelector('[name="contact"]').value = "one@example.invalid";
