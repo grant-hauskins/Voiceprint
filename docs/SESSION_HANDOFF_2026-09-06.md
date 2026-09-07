@@ -122,3 +122,10 @@ Later v2 roadmap items remain: calibrated labels with an independent truth set, 
 - Audio preference: Seiren X input, output `HD 4.40,BenQ`; BenQ can disappear when the monitor sleeps. Check enrollment peak levels before blaming attribution when Kyle receives low labels.
 
 Commits retain the agreed stream prefix, verification body and `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>` trailer. The trailer follows Grant's requested convention; test claims must still identify the evidence actually obtained.
+
+## Update 2026-09-07: launcher and the first two-agent live run
+
+Commits `da8513e`..`6170333` on `v2-integration` add `Voiceprint.cmd` / `scripts\dev.ps1 up` (one window: worker, API, cloudflared, `agent_runtime.py --gui`, browser) and move every former console step into `/ui`: roster and provider key, per-person enrollment recording, Start, End. Occupied ports are refused unless `--replace-services` or `--reuse-services`; launcher children die with the launcher (Windows job object); the public MCP URL is verified with `tools/list` before the runtime starts; hosted rooms are refused before signing unless both vendor review flags are set.
+
+Live evidence, reported by Grant from the console page on 2026-09-07 (session about four minutes): two humans (Grant and a second voice source) and two agents (Ava, Ben); both written releases with both disclosures; enrollment peaks 5622 and 5525; 11 utterances; **5 server-recorded `get_transcript` calls** attributed to both agent participant IDs with completed status; Ava and Ben each answered a "who said" question with the correct human name. Human labels were mostly `medium` (similarity 0.46-0.56). An earlier run the same night recorded zero server calls while the agent narrated fetching; it had reused a stale API from a previous launcher run, and the cause was not isolated before the fix that refuses stale services. This is one observed run, not calibration or compliance evidence; the limitations above still apply.
+
