@@ -1,6 +1,10 @@
 r"""One shared microphone, a stored conversation bus, and N floor-controlled voice agents.
 
-PowerShell (worker/API/MCP tunnel already running; OPENAI_API_KEY in this shell):
+Normal start: double-click Voiceprint.cmd (or `scripts\dev.ps1 up`), which runs worker, API, tunnel and this
+runtime with --gui, then opens the console at /ui where the operator enters the roster and provider key,
+each person signs, each enrollment is recorded, and the conversation is started and controlled.
+
+Manual PowerShell (worker/API/MCP tunnel already running; OPENAI_API_KEY in this shell):
   .venv\Scripts\python.exe scripts\agent_runtime.py --names Grant Kyle --mcp-url https://HOST/mcp
 
 Keys: 1/2 select an agent, Space speaks once, H toggles hold, C cancels, Q quits.
@@ -516,7 +520,167 @@ class Room:
             agent.emit("control", {"action": action, "value": value, "held": agent.gate.manual == "hold"})
 
 
-def control_server(room, port=8090, api_origin="http://127.0.0.1:8080", token=None):
+PHASES = ("setup", "consent", "enrollment", "connecting", "ready", "live", "ending", "ended", "failed")
+NAME_RE = re.compile(r"^[^\x00-\x1f]{1,200}$")
+
+
+class Runtime:
+    """Lifecycle shared between main() and the local control server, so the GUI can drive every step
+    that used to be a console prompt: roster/contacts (and the provider key), each enrollment recording,
+    the start of the conversation, and shutdown. Consent itself is still signed by each person in the GUI
+    against the API; this object never bypasses that check."""
+
+    def __init__(self, room=None, gui=False, mcp_url=None, api_token=None):
+        self.lock = threading.Lock()
+        self.room = room
+        self.gui = gui
+        self.mcp_url, self.api_token = mcp_url, api_token
+        self.phase = "live" if room is not None else "setup"
+        self.detail = ""
+        self.session_id = room.session_id if room is not None else None
+        self.setup = queue.Queue()
+        self.records = queue.Queue()
+        self.start = threading.Event()
+        self.stop = threading.Event()
+        self.participants = []       # [{"id","name"}] humans, in enrollment order
+        self.enrollment = {}         # participant_id -> {"state": pending|waiting|recording|recorded|rejected, "peak": int|None}
+        self.awaiting = None         # participant_id whose recording the runtime is waiting to be triggered
+
+    def set_phase(self, phase, detail=""):
+        if phase not in PHASES:
+            raise ValueError(phase)
+        with self.lock:
+            self.phase, self.detail = phase, detail
+        print(f"[{phase}] {detail}" if detail else f"[{phase}]", flush=True)
+
+    def needs_openai_key(self):
+        return not os.environ.get("OPENAI_API_KEY")
+
+    def state(self):
+        with self.lock:
+            agents = self.room.state()["agents"] if self.room is not None else []
+            return {"session_id": self.session_id, "agents": agents, "phase": self.phase, "detail": self.detail,
+                    "participants": [dict(p, enrollment=self.enrollment.get(p["id"], {"state": "pending", "peak": None}))
+                                     for p in self.participants],
+                    "awaiting": self.awaiting, "needs_openai_key": self.needs_openai_key(),
+                    "mcp_configured": bool(self.mcp_url), "gui": self.gui}
+
+    def bootstrap(self):
+        """Loopback-GUI convenience: only a runtime started with --gui hands the operator token to the page
+        served by the same API, so the operator does not paste it. Non-GUI runtimes reveal nothing."""
+        with self.lock:
+            return {"phase": self.phase, "session_id": self.session_id, "gui": self.gui,
+                    "api_token": self.api_token if self.gui else None}
+
+    def submit_setup(self, body):
+        with self.lock:
+            if self.phase != "setup":
+                raise ValueError("Roster can only be set while the runtime is waiting for setup")
+        people = body.get("participants")
+        if not isinstance(people, list) or not 2 <= len(people) <= 4:
+            raise ValueError("A room needs two to four people within microphone range")
+        names, contacts = [], []
+        for person in people:
+            if not isinstance(person, dict):
+                raise ValueError("Invalid participant")
+            name, contact = person.get("name"), person.get("contact")
+            if not isinstance(name, str) or not isinstance(contact, str) or not NAME_RE.match(name.strip()) or not NAME_RE.match(contact.strip()):
+                raise ValueError("Each participant needs a full name and an email or phone")
+            names.append(name.strip()); contacts.append(contact.strip())
+        if len({n.casefold() for n in names}) != len(names):
+            raise ValueError("Participant names must be distinct")
+        session = body.get("session_id")
+        if session is not None and (not isinstance(session, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", session)):
+            raise ValueError("Invalid room ID")
+        key = body.get("openai_api_key")
+        if key is not None and (not isinstance(key, str) or not re.fullmatch(r"[\x21-\x7e]{20,400}", key.strip())):
+            raise ValueError("Invalid provider key")
+        if self.needs_openai_key() and not key:
+            raise ValueError("The OpenAI API key is required to start the agents")
+        if key:
+            # Held only in this process's environment for the provider transport; never logged or written.
+            os.environ["OPENAI_API_KEY"] = key.strip()
+        self.setup.put({"names": names, "contacts": contacts, "session_id": session})
+
+    def request_record(self, participant_id):
+        with self.lock:
+            if self.phase != "enrollment" or participant_id != self.awaiting:
+                raise ValueError("That participant is not the one the runtime is waiting to record")
+        self.records.put(participant_id)
+
+    def request_start(self):
+        with self.lock:
+            if self.phase != "ready":
+                raise ValueError("The runtime is not ready to start")
+        self.start.set()
+
+    def request_stop(self):
+        self.stop.set()
+        self.start.set()
+        self.records.put(None)
+        self.setup.put(None)
+
+    def wait_setup(self):
+        while not self.stop.is_set():
+            try:
+                item = self.setup.get(timeout=.5)
+            except queue.Empty:
+                continue
+            if item is None:
+                break
+            return item
+        raise RuntimeError("Stopped before setup")
+
+    def recorder(self, microphone, consent, console=True):
+        """Per-name recorder for vp.enroll: waits for the GUI (or Enter in the console) before opening the mic."""
+        ids = {p["name"]: p["id"] for p in self.participants}
+        sentence = ("I, {name}, consent to Voiceprint collecting my voiceprint for identifying consenting speakers and "
+                    "providing a speaker-attributed transcript during the current room conversation today.")
+
+        def record(name):
+            import numpy as np
+            pid = ids[name]
+            vp.require_consent(consent)
+            with self.lock:
+                self.enrollment[pid] = {"state": "waiting", "peak": None}
+                self.awaiting = pid
+            self.set_phase("enrollment", f"Waiting to record {name}")
+            print(f"{name}: press Record in the GUI" + (" or Enter here" if console else "") + f", then speak for 8 seconds, starting: {sentence.format(name=name)}", flush=True)
+            if console:
+                threading.Thread(target=lambda: (input(), self.records.put(pid)), daemon=True).start()
+            while True:
+                if self.stop.is_set():
+                    raise RuntimeError("Stopped during enrollment")
+                try:
+                    item = self.records.get(timeout=.5)
+                except queue.Empty:
+                    continue
+                if item == pid:
+                    break
+            with self.lock:
+                self.enrollment[pid] = {"state": "recording", "peak": None}
+                self.awaiting = None
+            self.set_phase("enrollment", f"Recording {name} for 8 seconds")
+            with vp.Microphone(microphone, consent=consent) as capture:
+                pcm = b"".join(capture.get()[0] for _ in range(32))
+            vp.require_consent(consent)
+            audio = np.frombuffer(pcm, dtype="<i2")
+            level = max(abs(int(audio.min())), int(audio.max()))
+            with self.lock:
+                self.enrollment[pid] = {"state": "recorded", "peak": level}
+            self.set_phase("enrollment", f"Recorded {name}: peak level {level} of 32767" + ("  (too quiet: move closer or raise input gain)" if level < 1500 else ""))
+            return pcm
+        return record
+
+    def reset_enrollment(self, message):
+        with self.lock:
+            for p in self.participants:
+                self.enrollment[p["id"]] = {"state": "rejected", "peak": None}
+        self.set_phase("enrollment", message)
+
+
+def control_server(target, port=8090, api_origin="http://127.0.0.1:8080", token=None):
+    runtime = target if isinstance(target, Runtime) else Runtime(room=target)
     origin = urlsplit(api_origin)
     if origin.scheme != "http" or origin.hostname not in ("127.0.0.1", "localhost") or origin.path or origin.query or origin.fragment:
         raise ValueError("The control API origin must be a loopback HTTP origin without a path")
@@ -541,7 +705,7 @@ def control_server(room, port=8090, api_origin="http://127.0.0.1:8080", token=No
             self.end_headers()
             self.wfile.write(data)
 
-        def allowed(self, preflight=False):
+        def allowed(self, preflight=False, public=False):
             hosts = {f"127.0.0.1:{self.server.server_port}", f"localhost:{self.server.server_port}"}
             if self.headers.get("Host") not in hosts:
                 self.answer(403, {"error": "invalid_host"})
@@ -549,37 +713,71 @@ def control_server(room, port=8090, api_origin="http://127.0.0.1:8080", token=No
             if self.headers.get("Origin") is not None and self.headers["Origin"] not in allowed_origins:
                 self.answer(403, {"error": "invalid_origin"})
                 return False
-            if token and not preflight and not hmac.compare_digest(self.headers.get("Authorization", ""), "Bearer " + token):
+            if token and not preflight and not public and not hmac.compare_digest(self.headers.get("Authorization", ""), "Bearer " + token):
                 self.answer(401, {"error": "unauthorized"})
                 return False
             return True
+
+        def body(self, limit=4096):
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 <= length <= limit:
+                raise ValueError()
+            data = json.loads(self.rfile.read(length)) if length else {}
+            if not isinstance(data, dict):
+                raise ValueError()
+            return data
 
         def do_OPTIONS(self):
             if self.allowed(preflight=True):
                 self.answer(200)
 
         def do_GET(self):
+            if self.path == "/bootstrap":
+                # Only the page served by the local API (exact loopback Origin) can read this; it is the
+                # no-paste handoff from the launcher-started runtime to the console on the same computer.
+                if self.allowed(public=True):
+                    self.answer(200, runtime.bootstrap())
+                return
             if self.allowed():
                 if self.path == "/agents":
-                    self.answer(200, room.state())
+                    self.answer(200, runtime.state())
                 else:
                     self.answer(404, {"error": "not_found"})
 
         def do_POST(self):
             if not self.allowed():
                 return
+            try:
+                if self.path == "/setup":
+                    runtime.submit_setup(self.body(8192))
+                    self.answer(200, {"ok": True})
+                    return
+                if self.path == "/enrollment/record":
+                    participant = self.body().get("participant_id")
+                    if not isinstance(participant, str):
+                        raise ValueError()
+                    runtime.request_record(participant)
+                    self.answer(200, {"ok": True})
+                    return
+                if self.path == "/start":
+                    self.body(); runtime.request_start(); self.answer(200, {"ok": True})
+                    return
+                if self.path == "/stop":
+                    self.body(); runtime.request_stop(); self.answer(200, {"ok": True})
+                    return
+            except ValueError as error:
+                self.answer(409 if str(error) else 400, {"error": "invalid_request", "message": str(error) or "Invalid request"})
+                return
             match = re.fullmatch(r"/agents/([^/]+)/control", self.path)
             name = unquote(match[1]) if match else None
-            agent = next((a for a in room.agents if a.config.name == name), None)
+            room = runtime.room
+            agent = next((a for a in room.agents if a.config.name == name), None) if room is not None else None
             if agent is None:
                 self.answer(404, {"error": "unknown_agent"})
                 return
             try:
-                length = int(self.headers.get("Content-Length", "0"))
-                if not 0 < length <= 4096:
-                    raise ValueError()
-                body = json.loads(self.rfile.read(length))
-                if not isinstance(body, dict):
+                body = self.body()
+                if not 0 < int(self.headers.get("Content-Length", "0")):
                     raise ValueError()
                 action, value = body.get("action"), body.get("value")
                 if action not in ("speak", "hold", "cancel", "eagerness") or (action == "eagerness" and value not in tg.SILENCE_AFTER_TURN_S):
@@ -602,19 +800,69 @@ async def main(args):
     configs = getattr(args, "configs", None) or load_config(args.config)
     if any(c.provider != "openai_realtime" for c in configs):
         raise RuntimeError("Only openai_realtime is live; xai_speech and gemini_live are stubs")
-    if not os.environ.get("OPENAI_API_KEY"):
-        raise RuntimeError("Set OPENAI_API_KEY in this shell before starting the runtime")
+    if not os.environ.get("OPENAI_API_KEY") and not getattr(args, "gui", False):
+        raise RuntimeError("Set OPENAI_API_KEY in this shell before starting the runtime, or start with --gui and enter it there")
     mcp_token = getattr(args, "mcp_token", None) or os.environ.get("VOICEPRINT_MCP_TOKEN")
     token_path = Path(__file__).resolve().parents[1] / "data" / "mcp-token.txt"
     if not mcp_token and token_path.exists():
         mcp_token = token_path.read_text(encoding="utf-8").strip()
+    gui = bool(getattr(args, "gui", False))
+    runtime = Runtime(gui=gui, mcp_url=args.mcp_url, api_token=vp.api_token())
+    server = control_server(runtime, args.control_port, args.api.rstrip("/"), vp.api_token())
+    api_ui = args.api.rstrip("/") + "/ui" + (f"?control={server.server_port}" if server.server_port != 8090 else "")
+    print(f"GUI {api_ui}; controls 127.0.0.1:{server.server_port}.", flush=True)
     microphone = resolve_device(args.device, "input")
     print("Microphone:", describe_device(microphone, "input"), flush=True)
-    session_id = args.session or "room_" + uuid.uuid4().hex[:10]
-    consent = await asyncio.to_thread(vp.prepare_room, args.api, session_id, args.names, args.contacts, True)
+    stop = threading.Event()
     try:
-        names = await asyncio.to_thread(vp.enroll, args.api, session_id, args.names,
-                                        vp.record_from_mic(microphone, consent), None, consent)
+        await run_session(args, configs, runtime, server, microphone, mcp_token, stop)
+    except Exception as error:
+        message = str(error)
+        for secret in (os.environ.get("OPENAI_API_KEY"), mcp_token, vp.api_token()):
+            if secret:
+                message = message.replace(secret, "[redacted]")
+        if runtime.stop.is_set() and runtime.phase in ("setup", "consent", "enrollment", "connecting", "ready"):
+            runtime.set_phase("ended", f"Stopped by the operator before the conversation started ({message})")
+            return
+        runtime.set_phase("failed", message)
+        if gui and not runtime.stop.is_set():
+            print("Runtime failed. The GUI shows the reason; press Stop there or Ctrl+C here.", file=sys.stderr, flush=True)
+            while not runtime.stop.is_set():
+                await asyncio.sleep(.5)
+        raise
+    finally:
+        await asyncio.to_thread(server.shutdown)
+        server.server_close()
+
+
+async def run_session(args, configs, runtime, server, microphone, mcp_token, stop):
+    gui = runtime.gui
+    if args.contacts:
+        names, contacts, session_id = list(args.names), list(args.contacts), args.session
+    elif gui:
+        runtime.set_phase("setup", "Waiting for the roster in the GUI")
+        setup = await asyncio.to_thread(runtime.wait_setup)
+        names, contacts, session_id = setup["names"], setup["contacts"], setup["session_id"] or args.session
+    else:
+        names, contacts, session_id = list(args.names), None, args.session
+    session_id = session_id or "room_" + uuid.uuid4().hex[:10]
+    with runtime.lock:
+        runtime.session_id = session_id
+        runtime.participants = [{"id": f"participant_{i}", "name": name} for i, name in enumerate(names, 1)]
+    runtime.set_phase("consent", "Each person signs their written release in the GUI; microphone closed")
+    try:
+        consent = await asyncio.to_thread(vp.prepare_room, args.api, session_id, names, contacts, True, runtime.stop)
+    except vp.ConsentError:
+        if runtime.stop.is_set():
+            # The pending room was created; end it now rather than leaving it to the inactivity sweeper.
+            try:
+                await asyncio.to_thread(vp.api, args.api, f"/speaker/session/{session_id}/end", {})
+            except Exception:
+                pass
+        raise
+    try:
+        record = runtime.recorder(microphone, consent, console=not gui)
+        names = await asyncio.to_thread(vp.enroll, args.api, session_id, names, record, None, consent, runtime.reset_enrollment)
     except BaseException:
         consent.deny()
         try:
@@ -622,14 +870,16 @@ async def main(args):
         except Exception:
             print("Enrollment stopped; room-end request failed. API destruction reconciliation must resolve it.", file=sys.stderr, flush=True)
         raise
+    runtime.set_phase("connecting", "Registering agents and connecting to the provider")
     log = EventLog(args.events, session_id, secrets=(os.environ.get("OPENAI_API_KEY"), mcp_token, vp.api_token()))
     room = Room(configs, session_id, names, RestClient(args.api, vp.api_token()), log, consent)
-    stop = threading.Event()
+    with runtime.lock:
+        runtime.room = room
     loop = asyncio.get_running_loop()
     audio_out = asyncio.Queue(maxsize=8)
     failures = queue.Queue()
     tasks, providers, players = [], [], []
-    server, transcriber, stream, capture_thread = None, None, None, None
+    transcriber, stream, capture_thread = None, None, None
     try:
         ids = await room.register()
         for config, participant_id in zip(configs, ids):
@@ -746,17 +996,21 @@ async def main(args):
                     await agent.cancel("consent_stopped")
                 raise
 
-        server = control_server(room, args.control_port, args.api.rstrip("/"), vp.api_token())
-        print(f"Session {session_id}. GUI http://127.0.0.1:8080/ui; controls 127.0.0.1:{server.server_port}.", flush=True)
-        print("Press Enter to start; 1/2 select agent, Space = speak, H = hold, C = cancel, Q = quit.", flush=True)
-        await asyncio.to_thread(input)
+        runtime.set_phase("ready", f"Session {session_id}. Press Start in the GUI" + ("" if gui else " or Enter here") + " to open the microphone")
+        if not gui:
+            print("1/2 select agent, Space = speak, H = hold, C = cancel, Q = quit.", flush=True)
+            threading.Thread(target=lambda: (input(), runtime.start.set()), daemon=True).start()
+        await asyncio.to_thread(runtime.start.wait)
+        if runtime.stop.is_set():
+            raise RuntimeError("Stopped before the conversation started")
+        runtime.set_phase("live", "Conversation running")
         log.emit("runtime", {"action": "started", "agents": room.state()["agents"]})
         capture_thread = threading.Thread(target=microphone_loop, daemon=True)
         capture_thread.start()
         threading.Thread(target=keyboard_loop, daemon=True).start()
         tasks = [asyncio.create_task(sender()), asyncio.create_task(gate_loop()), asyncio.create_task(consent_monitor())]
         tasks += [asyncio.create_task(receiver(a)) for a in room.agents]
-        while not stop.is_set():
+        while not stop.is_set() and not runtime.stop.is_set():
             for task in tasks:
                 if task.done():
                     task.result()
@@ -766,6 +1020,7 @@ async def main(args):
             raise failures.get()
     finally:
         stop.set()
+        runtime.set_phase("ending", "Finishing transcription and ending the room")
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -785,9 +1040,6 @@ async def main(args):
                 player.close()
             except Exception:
                 log.emit("runtime", {"action": "player_close_failed"})
-        if server:
-            await asyncio.to_thread(server.shutdown)
-            server.server_close()
         if capture_thread:
             await asyncio.to_thread(capture_thread.join, 45)
         if stream:
@@ -816,7 +1068,7 @@ async def main(args):
             room.names.clear()
             for agent in room.agents:
                 agent.gate.history.clear()
-        print("Session ended:", session_id, flush=True)
+        runtime.set_phase("ended", f"Session ended: {session_id}")
 
 
 def parser():
@@ -834,6 +1086,7 @@ def parser():
     result.add_argument("--model", default="base.en")
     result.add_argument("--events", type=Path, help="disabled by privacy policy; aggregate scoring uses bounded memory")
     result.add_argument("--control-port", type=int, default=8090)
+    result.add_argument("--gui", action="store_true", help="roster, provider key, enrollment and start come from the /ui console instead of console prompts")
     result.add_argument("--verbose", action="store_true")
     result.add_argument("--list-devices", action="store_true")
     result.add_argument("--check-config", action="store_true", help="validate TOML without provider credentials or devices")

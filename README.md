@@ -22,6 +22,17 @@ The real-model integration path runs. **This is not a launch-qualified MVP:** ca
 
 The API returns `confidence: null`, `confidence_kind: "uncalibrated"`, and `trusted: false` until a validated calibration artifact is loaded. `similarity` is a cosine score, **not a probability**. Text is optional, supplied by an external ASR client; this spike does not transcribe audio.
 
+## Start (one window)
+
+Double-click `Voiceprint.cmd` (or run `scripts\dev.ps1 up`). It provisions the local credentials, asks once for the controller name, address and email (saved to ignored `data\launcher.env`; they appear verbatim in every written release), builds the jar if missing, then starts the worker, the API, the cloudflared MCP tunnel and the runtime in that one window and opens `http://127.0.0.1:8080/ui`. The page connects to the runtime by itself; nothing is pasted. The rest of a session happens in the browser:
+
+1. **Conversation runtime** panel: paste the OpenAI API key (held only in the runtime process; it is never written to disk) and enter each person's full name and email/phone. *Create room* posts the roster; the microphone stays closed.
+2. **Participant releases**: each person reads the notice on the shared screen, types their name, checks the release and the optional OpenAI/MCP disclosures, and signs.
+3. **Enrollment**: press *Record NAME now*, and that person speaks their eight-second statement. Levels and rejections show inline; a rejected set is recorded again.
+4. Press **Start conversation**. Speak/Hold/Cancel/eagerness per agent, the transcript, floor and server MCP proof are on the same page. *End conversation* closes the microphone and ends the room; *Withdraw* on any release stops everything and starts destruction.
+
+When a conversation ends the launcher offers another one in the same services; Ctrl+C in the window stops everything. Hosted agents stay blocked until `VOICEPRINT_OPENAI_REVIEWED=true` and `VOICEPRINT_CLOUDFLARE_REVIEWED=true` are set in `data\launcher.env` after you have actually reviewed those vendor settings; the launcher says so at start. Optional settings there: `VOICEPRINT_DEVICE` (microphone preference), `VOICEPRINT_MCP_URL` (skip the tunnel), `VOICEPRINT_CONTROL_PORT`. If 8090 is busy (a Wondershare notifier on this machine) the launcher picks the next free port and opens `/ui?control=PORT`. Already-running worker/API processes on their ports are reused rather than duplicated. If port 8080 is not the API, `--no-browser`/`--once` are launcher flags for scripted runs. The manual multi-terminal path below still works and `agent_runtime.py --gui` is what the launcher runs.
+
 ## Run locally
 
 Requires **JDK 21**, **Maven 3.9+**, and **Python 3.12**. Java 8 is insufficient. In PowerShell, from the repository:

@@ -86,6 +86,57 @@ async function main() {
 
   const noConfig = new Console(new Document(), async()=>({ok:true,status:200,json:async()=>({configured:false})}), {hostname:"127.0.0.1",protocol:"http:"});
   await noConfig.loadNotice(); assert(!noConfig.noticeReady); assert(noConfig.$("create-room").disabled);
+
+  // Launcher-started runtime: bootstrap hands over the token, the page drives setup, enrollment, start and stop.
+  const runtimeCalls = [];
+  let phase = "setup", awaiting = null, sessionId = null;
+  const runtimeFetcher = async (url, options) => {
+    runtimeCalls.push({url, options});
+    let data = {};
+    if (url === "http://127.0.0.1:8123/bootstrap") { assert(!options.headers.Authorization); data = {phase, session_id:sessionId, gui:true, api_token:"launcher_token"}; }
+    else if (url === "http://127.0.0.1:8123/agents") data = {session_id:sessionId, agents:[], phase, detail:`in ${phase}`, awaiting, needs_openai_key:phase === "setup",
+      participants: sessionId ? [{id:"participant_1", name:"Synthetic One", enrollment:{state:awaiting === "participant_1" ? "waiting" : "recorded", peak:awaiting ? null : 9000}}] : []};
+    else if (url === "http://127.0.0.1:8123/setup") { phase = "consent"; sessionId = "room_auto"; }
+    else if (url === "http://127.0.0.1:8123/enrollment/record") { awaiting = null; phase = "ready"; }
+    else if (url === "http://127.0.0.1:8123/start") phase = "live";
+    else if (url === "http://127.0.0.1:8123/stop") phase = "ended";
+    else if (url === "/privacy/notice") data = {configured:true,controller_name:"Test Controller",controller_address:"Test address",controller_email:"test@example.invalid",notice_text:"Synthetic",notice_sha256:"h",retention_text:"r",vendors:{},policy_version:"t",consent_method_version:"t"};
+    else if (url === "/speaker/sessions?limit=100") data = {sessions:[]};
+    else if (url === "/privacy/rooms") data = {rooms:[]};
+    else if (url.endsWith("/consent")) data = {session_id:"room_auto",state:"pending",allowed:false,participants:[]};
+    return {ok:true,status:200,json:async()=>data};
+  };
+  const launched = new Console(new Document(), runtimeFetcher, {hostname:"127.0.0.1",protocol:"http:",search:"?control=8123"});
+  assert.equal(launched.control, "http://127.0.0.1:8123");
+  assert.equal(new Console(new Document(), runtimeFetcher, {hostname:"127.0.0.1",protocol:"http:",search:"?control=evil"}).control, "http://127.0.0.1:8090");
+  await launched.bootstrap(); assert.equal(launched.token, "launcher_token");
+  await launched.pollRuntime();
+  assert.equal(launched.$("phase").textContent, "setup"); assert(!launched.$("setup-form").hidden); assert(!launched.$("key-label").hidden);
+  launched.$("openai-key").value = "sk-synthetic-key-value-0000000000";
+  launched.addSetupPerson(); launched.addSetupPerson(); const [rowOne, rowTwo] = launched.$("setup-roster").children;
+  rowOne.querySelector('[name="name"]').value = "Synthetic One"; rowOne.querySelector('[name="contact"]').value = "one@example.invalid";
+  await assert.rejects(() => launched.submitSetup(), /two to four people/);          // one person is not a room
+  rowTwo.querySelector('[name="name"]').value = "Synthetic Two"; rowTwo.querySelector('[name="contact"]').value = "555-0100";
+  launched.$("openai-key").value = "sk-synthetic-key-value-0000000000";
+  await launched.submitSetup();
+  const setup = runtimeCalls.find(c => c.url.endsWith("/setup"));
+  assert.deepEqual(JSON.parse(setup.options.body), {participants:[{name:"Synthetic One",contact:"one@example.invalid"},{name:"Synthetic Two",contact:"555-0100"}], openai_api_key:"sk-synthetic-key-value-0000000000"});
+  assert.equal(setup.options.headers.Authorization, "Bearer launcher_token");
+  assert.equal(launched.$("openai-key").value, "");                       // key never lingers in the page
+  assert.equal(launched.session, "room_auto");                            // runtime's room opened automatically
+  assert(launched.$("setup-form").hidden);
+  phase = "enrollment"; awaiting = "participant_1"; await launched.pollRuntime();
+  const recordButton = walk(launched.$("enrollment")).find(e => e.tagName === "button");
+  assert.match(recordButton.textContent, /Record Synthetic One now/); assert(!recordButton.disabled); assert(launched.$("start").hidden);
+  await launched.recordParticipant("participant_1");
+  assert.deepEqual(JSON.parse(runtimeCalls.find(c => c.url.endsWith("/enrollment/record")).options.body), {participant_id:"participant_1"});
+  assert.equal(launched.$("phase").textContent, "ready"); assert(!launched.$("start").hidden);
+  assert.match(launched.$("enrollment").textContent, /peak 9000/);
+  await launched.runtimeAction("/start"); assert.equal(launched.$("phase").textContent, "live"); assert(launched.$("start").hidden);
+  assert.match(launched.$("stop-runtime").textContent, /End conversation/);
+  await launched.runtimeAction("/stop"); assert.equal(launched.$("phase").textContent, "ended"); assert(launched.$("stop-runtime").hidden);
+  const manual = new Console(new Document(), async (url) => { if (url.endsWith("/bootstrap")) throw new Error("no runtime"); return {ok:true,status:200,json:async()=>({})}; }, {hostname:"127.0.0.1",protocol:"http:"});
+  await manual.bootstrap(); assert.equal(manual.token, "");               // no launcher: paste the token as before
   console.log("DOM/mock API checks passed: 4 replay rows, 2 calls, dedupe, XSS text, effective gates, unchecked releases, nonce binding, withdrawal clearing.");
 }
 main().catch(error=>{console.error(error);process.exitCode=1;});

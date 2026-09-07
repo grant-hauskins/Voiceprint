@@ -20,6 +20,19 @@
     <p class="muted">The token identifies the operator. Each participant must give their own written release. Token is held only in this page's memory.</p>
     <p id="message" role="status" aria-live="polite"></p>
   </section>
+  <section class="panel" aria-labelledby="runtime-title">
+    <div class="section-heading"><div><span class="eyebrow">ONE SHARED MICROPHONE</span><h2 id="runtime-title">Conversation runtime</h2></div><span id="phase" class="pill">Connect first</span></div>
+    <p id="phase-detail" class="muted"></p>
+    <form id="setup-form" hidden>
+      <label id="key-label">OpenAI API key (kept in the runtime's memory only) <input id="openai-key" type="password" autocomplete="off"></label>
+      <p class="muted">Everyone within microphone range, one row each. Contact details are stored unverified.</p>
+      <div id="setup-roster"></div>
+      <div class="inline"><button type="button" id="setup-add">Add person</button><button type="submit" id="setup-submit">Create room &amp; collect releases</button></div>
+      <p class="muted">Next: each person signs their written release below, then records an eight-second statement, then you press Start. The microphone stays closed until then.</p>
+    </form>
+    <div id="enrollment" hidden></div>
+    <div class="inline"><button id="start" type="button" hidden>Start conversation (opens microphone)</button><button id="stop-runtime" type="button" class="danger" hidden>Stop runtime</button></div>
+  </section>
   <section aria-labelledby="notice-title" class="panel notice">
     <span class="eyebrow">BEFORE ANY MICROPHONE CAPTURE</span><h2 id="notice-title">Voiceprint collection notice</h2>
     <p id="configuration" role="status">Loading controller configuration…</p>

@@ -76,8 +76,9 @@ def require_consent(consent, scope="local_processing"):
     return consent.require(scope)
 
 
-def prepare_room(base, session, names, contacts=None, hosted=False):
-    """Collect roster text only. The actual people sign in the GUI while the mic stays closed."""
+def prepare_room(base, session, names, contacts=None, hosted=False, stop=None):
+    """Collect roster text only. The actual people sign in the GUI while the mic stays closed.
+    `stop` is an optional threading.Event that abandons the wait (the room is left pending for the API sweeper)."""
     if not api_token():
         raise ConsentError("VOICEPRINT_API_TOKEN must authenticate the operator before the consent flow")
     notice = api(base, "/privacy/notice")
@@ -100,6 +101,8 @@ def prepare_room(base, session, names, contacts=None, hosted=False):
             guard = ConsentGuard(base, session, hosted)
             guard.require("openai_audio" if hosted else "local_processing")
             return guard
+        if stop is not None and stop.is_set():
+            raise ConsentError("Stopped while waiting for written releases")
         time.sleep(.5)
 
 
@@ -399,8 +402,9 @@ class Stream:
         return api(self.base, f"/speaker/session/{self.session}/end", {})
 
 
-def enroll(base, session, names, record, replay_wavs=None, consent=None):
-    """Enroll `names` (list) and return {participant_id: name}. `record(name)` returns 8 s of PCM16 from the mic."""
+def enroll(base, session, names, record, replay_wavs=None, consent=None, on_reject=None):
+    """Enroll `names` (list) and return {participant_id: name}. `record(name)` returns 8 s of PCM16 from the mic.
+    `on_reject(message)` is told when the API rejects the statements and everyone is recorded again."""
     ids = {f"participant_{i}": name for i, name in enumerate(names, 1)}
     require_consent(consent)
     while True:
@@ -416,8 +420,11 @@ def enroll(base, session, names, record, replay_wavs=None, consent=None):
         except RuntimeError as error:
             if "422" not in str(error) or replay_wavs:
                 raise
+            message = "One statement had silence, two voices, or a pause long enough to look like a speaker change. Recording everyone again."
             print(f"Enrollment rejected: {error}", flush=True)
-            print("One statement had silence, two voices, or a pause long enough to look like a speaker change. Recording everyone again.", flush=True)
+            print(message, flush=True)
+            if on_reject is not None:
+                on_reject(f"Enrollment rejected ({error}). {message}")
 
 
 def record_from_mic(device, consent=None):

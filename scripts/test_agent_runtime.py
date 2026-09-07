@@ -429,5 +429,125 @@ class ControlsHttpTest(unittest.TestCase):
         self.assertEqual(self.request("/agents/Nobody/control", "POST", {"action": "speak"})[0], 404)
 
 
+class LifecycleHttpTest(unittest.TestCase):
+    """The GUI drives setup, enrollment, start and stop through the same loopback control server."""
+
+    def setUp(self):
+        self.runtime = ar.Runtime(gui=True, mcp_url="https://example.invalid/mcp", api_token="operator-token")
+        self.server = ar.control_server(self.runtime, port=0, token="operator-token")
+        self.base = f"http://127.0.0.1:{self.server.server_port}"
+        self.saved_key = os.environ.pop("OPENAI_API_KEY", None)
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        os.environ.pop("OPENAI_API_KEY", None)
+        if self.saved_key is not None:
+            os.environ["OPENAI_API_KEY"] = self.saved_key
+
+    def request(self, path, method="GET", body=None, headers=None, auth=True):
+        headers = {**({"Authorization": "Bearer operator-token"} if auth else {}), **(headers or {})}
+        raw = None if body is None else json.dumps(body).encode()
+        request = urllib.request.Request(self.base + path, raw, headers, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=2) as response:
+                return response.status, json.load(response)
+        except urllib.error.HTTPError as error:
+            return error.code, json.load(error)
+
+    def test_bootstrap_hands_token_only_to_gui_runtime_from_local_origin(self):
+        status, body = self.request("/bootstrap", headers={"Origin": "http://127.0.0.1:8080"}, auth=False)
+        self.assertEqual((status, body["api_token"], body["phase"]), (200, "operator-token", "setup"))
+        self.assertEqual(self.request("/bootstrap", headers={"Origin": "https://example.test"}, auth=False)[0], 403)
+        self.assertEqual(self.request("/bootstrap", headers={"Host": "evil.example"}, auth=False)[0], 403)
+        plain = ar.control_server(ar.Runtime(gui=False, api_token="operator-token"), port=0, token="operator-token")
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{plain.server_port}/bootstrap", timeout=2) as response:
+                self.assertIsNone(json.load(response)["api_token"])
+        finally:
+            plain.shutdown(); plain.server_close()
+        self.assertEqual(self.request("/agents", auth=False)[0], 401)
+
+    def test_setup_validation_and_key_kept_in_process_only(self):
+        status, body = self.request("/agents")
+        self.assertTrue(body["needs_openai_key"]); self.assertEqual(body["phase"], "setup"); self.assertEqual(body["agents"], [])
+        people = [{"name": "Synthetic One", "contact": "one@example.invalid"}, {"name": "Synthetic Two", "contact": "555-0100"}]
+        self.assertEqual(self.request("/setup", "POST", {"participants": people})[0], 409)          # key required
+        self.assertEqual(self.request("/setup", "POST", {"participants": [], "openai_api_key": "x" * 40})[0], 409)
+        self.assertEqual(self.request("/setup", "POST", {"participants": people[:1], "openai_api_key": "x" * 40})[0], 409)   # API needs 2-4 humans
+        self.assertEqual(self.request("/setup", "POST", {"participants": [people[0], people[0]], "openai_api_key": "x" * 40})[0], 409)
+        self.assertEqual(self.request("/setup", "POST", {"participants": people, "openai_api_key": "short"})[0], 409)
+        self.assertEqual(self.request("/setup", "POST", {"participants": people, "openai_api_key": "k" * 40, "session_id": "bad id"})[0], 409)
+        self.assertEqual(self.request("/setup", "POST", {"participants": people, "openai_api_key": "k" * 40, "session_id": "room_1"})[0], 200)
+        self.assertEqual(os.environ["OPENAI_API_KEY"], "k" * 40)
+        self.assertEqual(self.runtime.wait_setup(), {"names": ["Synthetic One", "Synthetic Two"], "contacts": ["one@example.invalid", "555-0100"], "session_id": "room_1"})
+        self.assertFalse(self.request("/agents")[1]["needs_openai_key"])
+        self.runtime.set_phase("consent")
+        self.assertEqual(self.request("/setup", "POST", {"participants": people})[0], 409)        # only during setup
+
+    def test_enrollment_start_and_stop_follow_phases(self):
+        self.runtime.participants = [{"id": "participant_1", "name": "Synthetic One"}]
+        self.assertEqual(self.request("/enrollment/record", "POST", {"participant_id": "participant_1"})[0], 409)
+        self.assertEqual(self.request("/start", "POST", {})[0], 409)
+        self.runtime.set_phase("enrollment")
+        with self.runtime.lock:
+            self.runtime.awaiting = "participant_1"; self.runtime.enrollment["participant_1"] = {"state": "waiting", "peak": None}
+        body = self.request("/agents")[1]
+        self.assertEqual(body["awaiting"], "participant_1"); self.assertEqual(body["participants"][0]["enrollment"]["state"], "waiting")
+        self.assertEqual(self.request("/enrollment/record", "POST", {"participant_id": "participant_2"})[0], 409)
+        self.assertEqual(self.request("/enrollment/record", "POST", {"participant_id": "participant_1"})[0], 200)
+        self.assertEqual(self.runtime.records.get(timeout=1), "participant_1")
+        self.runtime.set_phase("ready")
+        self.assertFalse(self.runtime.start.is_set())
+        self.assertEqual(self.request("/start", "POST", {})[0], 200)
+        self.assertTrue(self.runtime.start.is_set())
+        self.assertEqual(self.request("/stop", "POST", {})[0], 200)
+        self.assertTrue(self.runtime.stop.is_set())
+        self.assertEqual(self.request("/agents/Ava/control", "POST", {"action": "speak"})[0], 404)   # no room yet
+
+    def test_recorder_waits_for_trigger_and_reports_level(self):
+        self.runtime.participants = [{"id": "participant_1", "name": "Synthetic One"}]
+        consent = FakeConsent()
+        chunk = b"\x10\x27" * 2000   # 0x2710 = 10000 peak
+        capture = Mock(); capture.get.return_value = (chunk, 0.0)
+        capture.__enter__ = Mock(return_value=capture); capture.__exit__ = Mock(return_value=False)
+        with patch.object(vp, "Microphone", return_value=capture):
+            record = self.runtime.recorder(None, consent, console=False)
+            result = {}
+            worker = threading.Thread(target=lambda: result.setdefault("pcm", record("Synthetic One")))
+            worker.start()
+            for _ in range(50):
+                if self.runtime.awaiting == "participant_1":
+                    break
+                time.sleep(.02)
+            self.assertEqual(self.runtime.state()["participants"][0]["enrollment"]["state"], "waiting")
+            self.assertFalse(capture.__enter__.called)                     # microphone closed until triggered
+            self.runtime.request_record("participant_1")
+            worker.join(5)
+        self.assertEqual(len(result["pcm"]), 32 * len(chunk))
+        state = self.runtime.state()["participants"][0]["enrollment"]
+        self.assertEqual((state["state"], state["peak"]), ("recorded", 10000))
+        self.assertIsNone(self.runtime.state()["awaiting"])
+        self.runtime.reset_enrollment("Enrollment rejected: try again")
+        self.assertEqual(self.runtime.state()["participants"][0]["enrollment"]["state"], "rejected")
+
+    def test_stop_unblocks_setup_and_enrollment_waits(self):
+        self.runtime.request_stop()
+        with self.assertRaisesRegex(RuntimeError, "Stopped before setup"):
+            self.runtime.wait_setup()
+        self.runtime.participants = [{"id": "participant_1", "name": "Synthetic One"}]
+        with patch.object(vp, "Microphone") as microphone:
+            with self.assertRaisesRegex(RuntimeError, "Stopped during enrollment"):
+                self.runtime.recorder(None, FakeConsent(), console=False)("Synthetic One")
+            microphone.assert_not_called()
+
+    def test_prepare_room_wait_abandons_on_stop(self):
+        stop = threading.Event(); stop.set()
+        responses = iter([{"configured": True}, {"session_id": "room"}, {"state": "pending", "allowed": False}])
+        with patch.object(vp, "api_token", return_value="operator-token"), patch.object(vp, "api", side_effect=lambda *a, **k: next(responses)):
+            with self.assertRaisesRegex(vp.ConsentError, "Stopped while waiting"):
+                vp.prepare_room("http://127.0.0.1:1", "room", ["Synthetic One"], ["one@example.invalid"], True, stop)
+
+
 if __name__ == "__main__":
     unittest.main()

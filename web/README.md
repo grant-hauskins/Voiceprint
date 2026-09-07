@@ -8,9 +8,23 @@ Before collecting releases, configure the API's controller name, address, email,
 and operator token. The notice is read from `/privacy/notice`; this page never
 invents an entity or policy. Enter the operator token in the page. It is kept in
 memory and cleared on disconnect/navigation, and must not be shared as a
-participant credential.
+participant credential. When the runtime was started by the launcher
+(`agent_runtime.py --gui`), the page fetches that token from the runtime's
+loopback `/bootstrap` endpoint instead; only this page's exact origin is allowed
+to read it, and a runtime started without `--gui` reveals nothing.
 
-Use the exact room and participant IDs from the runtime. Open the pending room,
+The **Conversation runtime** panel mirrors the runtime's phase (setup, consent,
+enrollment, connecting, ready, live, ending, ended, failed). In setup it posts
+the roster, contacts and, if the runtime has no key, the OpenAI API key to the
+runtime's loopback control port; the key field is cleared immediately and the
+runtime keeps it in memory only. The runtime then creates the pending room and
+this page opens it. After every release, the panel offers one *Record* button at
+a time for the participant the runtime is waiting on, shows peak levels and
+rejections, then *Start conversation*, then *End conversation*. The control
+port defaults to 8090; the launcher passes `?control=PORT` when it had to pick
+another one.
+
+Otherwise use the exact room and participant IDs from the runtime. Open the pending room,
 or create it here with each person's full name and unverified email/phone.
 Each participant personally reviews the notice, types their full name, checks
 the written release and optional disclosure scopes, and submits. Nothing is

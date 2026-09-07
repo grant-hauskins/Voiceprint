@@ -65,6 +65,10 @@
       this.doc = doc; this.fetch = fetcher; this.location = location;
       this.token = ""; this.session = ""; this.epoch = 0; this.notice = null; this.consent = null; this.runtime = null;
       this.consentKey = ""; this.agentKey = ""; this.polling = false; this.floor = null; this.busy = false;
+      this.runtimeKey = ""; this.autoOpened = ""; this.pollingRuntime = false;
+      // The launcher opens /ui?control=PORT when 8090 is busy on this computer; the origin stays the loopback API.
+      const control = String(new URLSearchParams(location && location.search || "").get("control") || "");
+      this.control = `http://127.0.0.1:${/^\d{2,5}$/.test(control) ? control : "8090"}`;
       this.feed = new Feed(doc, this.$("transcript"), this.$("mcp-calls"));
     }
     $(id) { return this.doc.getElementById(id); }
@@ -76,7 +80,7 @@
         headers.Authorization = `Bearer ${this.token}`;
       }
       if (body !== undefined) headers["Content-Type"] = "application/json";
-      const response = await this.fetch((runtime ? "http://127.0.0.1:8090" : "") + path,
+      const response = await this.fetch((runtime ? this.control : "") + path,
         {method: body === undefined ? "GET" : "POST", headers, body: body === undefined ? undefined : JSON.stringify(body), cache: "no-store", credentials: "omit", redirect: "error", signal: AbortSignal.timeout(12000)});
       let data;
       try { data = await response.json(); } catch (_) { throw new Error(`Service returned an invalid response (${response.status}).`); }
@@ -117,9 +121,87 @@
       this.$("add-person").addEventListener("click", () => this.addPerson());
       this.$("create-form").addEventListener("submit", run(() => this.createRoom()));
       this.$("end-room").addEventListener("click", run(() => this.endRoom()));
-      this.addPerson(); this.addPerson(); this.loadNotice();
-      this.timer = setInterval(() => { this.tickFloor(); this.poll(); }, 1500);
+      this.$("setup-add").addEventListener("click", () => this.addSetupPerson());
+      this.$("setup-form").addEventListener("submit", run(() => this.submitSetup()));
+      this.$("start").addEventListener("click", run(() => this.runtimeAction("/start")));
+      this.$("stop-runtime").addEventListener("click", run(() => this.runtimeAction("/stop")));
+      this.addPerson(); this.addPerson(); this.addSetupPerson(); this.addSetupPerson(); this.loadNotice();
+      this.bootstrap().then(() => this.pollRuntime());
+      this.timer = setInterval(() => { this.tickFloor(); this.poll(); this.pollRuntime(); }, 1500);
       global.addEventListener("pagehide", () => this.disconnect());
+    }
+    async bootstrap() {
+      // A runtime started by the launcher (--gui) hands the operator token to this loopback page; otherwise paste it.
+      try {
+        const data = await this.request("/bootstrap", {runtime:true, publicRequest:true});
+        if (data && typeof data.api_token === "string" && data.api_token) {
+          this.disconnect(); this.token = data.api_token;
+          await this.loadNotice(); await this.loadRooms(); this.$("connection").textContent = "Operator connected (launcher)"; this.say("");
+        }
+      } catch (_) { /* no launcher-started runtime: manual token entry remains available */ }
+    }
+    async pollRuntime() {
+      if (!this.token || this.pollingRuntime) return;
+      this.pollingRuntime = true;
+      try {
+        this.runtime = await this.request("/agents", {runtime:true});
+      } catch (_) { this.runtime = null; }
+      finally { this.pollingRuntime = false; }
+      this.renderRuntime();
+      const r = this.runtime;
+      if (r && r.session_id && r.phase !== "setup" && r.session_id !== this.session && this.autoOpened !== r.session_id && ID.test(r.session_id)) {
+        this.autoOpened = r.session_id;
+        // The runtime reports the room a moment before the API has it; retry on the next tick instead of giving up.
+        try { await this.loadRooms(); await this.open(r.session_id); } catch (e) { this.autoOpened = ""; this.say(e.message); }
+      }
+    }
+    addSetupPerson() {
+      const row = node(this.doc, "div", undefined, "person inline");
+      for (const [field, title] of [["name", "Full name"], ["contact", "Email or phone (unverified)"]]) {
+        const label = node(this.doc, "label", title); const input = node(this.doc, "input");
+        input.name = field; input.required = true; input.maxLength = 200; input.autocomplete = "off"; label.append(input); row.append(label);
+      }
+      const remove = node(this.doc, "button", "Remove"); remove.type = "button"; remove.addEventListener("click", () => row.remove()); row.append(remove);
+      this.$("setup-roster").append(row);
+    }
+    async submitSetup() {
+      if (!this.runtime || this.runtime.phase !== "setup") throw new Error("The runtime is not waiting for setup.");
+      const participants = [...this.$("setup-roster").children].map(row => Object.fromEntries(["name", "contact"].map(key => [key, row.querySelector(`[name="${key}"]`).value.trim()])));
+      if (participants.length < 2 || participants.length > 4 || participants.some(p => !p.name || !p.contact)) throw new Error("Enter a full name and an email or phone for each of the two to four people within microphone range.");
+      const body = {participants};
+      const key = this.$("openai-key").value.trim(); this.$("openai-key").value = "";
+      if (this.runtime.needs_openai_key) { if (!key) throw new Error("Paste the OpenAI API key."); body.openai_api_key = key; }
+      await this.request("/setup", {runtime:true, body});
+      this.say(""); await this.pollRuntime();
+    }
+    async recordParticipant(id) {
+      await this.request("/enrollment/record", {runtime:true, body:{participant_id:id}}); await this.pollRuntime();
+    }
+    async runtimeAction(path) {
+      await this.request(path, {runtime:true, body:{}}); await this.pollRuntime();
+    }
+    renderRuntime() {
+      const r = this.runtime, key = JSON.stringify([this.token ? 1 : 0, r]);
+      if (key === this.runtimeKey) return; this.runtimeKey = key;
+      const phase = r ? (r.phase || "live") : null;
+      this.$("phase").textContent = !this.token ? "Connect first" : !r ? `Runtime unavailable on ${this.control.slice(7)}` : phase;
+      this.$("phase-detail").textContent = r && r.detail ? r.detail : !r && this.token ? "Start it with Voiceprint.cmd (or scripts\\dev.ps1 up) and this page will connect on its own." : "";
+      this.$("setup-form").hidden = phase !== "setup";
+      this.$("key-label").hidden = !(r && r.needs_openai_key);
+      const people = r && r.participants || [];
+      const enrollment = this.$("enrollment"); enrollment.hidden = !["enrollment", "connecting", "ready", "live"].includes(phase) || !people.length; enrollment.replaceChildren();
+      for (const p of people) {
+        const e = p.enrollment || {}, row = node(this.doc, "div", undefined, "person inline");
+        row.append(node(this.doc, "strong", p.name), node(this.doc, "span", `${e.state || "pending"}${Number.isFinite(e.peak) ? ` · peak ${e.peak}${e.peak < 1500 ? " (too quiet)" : ""}` : ""}`, "chip"));
+        if (phase === "enrollment") {
+          const button = node(this.doc, "button", r.awaiting === p.id ? `Record ${p.name} now (8 s)` : "Waiting"); button.type = "button"; button.disabled = r.awaiting !== p.id;
+          button.addEventListener("click", async () => { button.disabled = true; try { await this.recordParticipant(p.id); } catch (err) { this.say(err.message); } }); row.append(button);
+        }
+        enrollment.append(row);
+      }
+      this.$("start").hidden = phase !== "ready";
+      this.$("stop-runtime").hidden = !r || ["ended"].includes(phase);
+      this.$("stop-runtime").textContent = phase === "failed" ? "Dismiss failed runtime" : phase === "live" ? "End conversation & close microphone" : "Stop runtime";
     }
     disconnect() {
       this.token = ""; this.session = ""; this.epoch++; this.consent = null; this.runtime = null; this.consentKey = ""; this.agentKey = "";
@@ -129,6 +211,7 @@
       this.$("enrollment-help").textContent = ""; this.$("capture-status").textContent = "Microphone capture requires a current release from everyone.";
       this.$("destruction").textContent = ""; this.$("room-id").value = "";
       this.$("token").value = ""; this.$("new-room-id").value = ""; this.$("new-roster").replaceChildren(); this.addPerson();
+      this.$("openai-key").value = ""; this.runtimeKey = ""; this.renderRuntime();
     }
     clearProtected() {
       this.feed.reset(); this.floor = null; this.$("participants").replaceChildren(); this.$("agents").replaceChildren();
@@ -313,7 +396,7 @@
     }
     renderAgents() {
       const enabled = allowedControls(this.consent, this.runtime, this.session);
-      this.$("runtime-state").textContent = !this.runtime ? "Runtime unavailable on 127.0.0.1:8090" : this.runtime.session_id !== this.session ? `Runtime is serving a different room (${this.runtime.session_id}). Controls disabled.` : !enabled ? "Controls blocked: current local release, disclosure scopes and vendor review are required." : "Runtime connected to this room";
+      this.$("runtime-state").textContent = !this.runtime ? `Runtime unavailable on ${this.control.slice(7)}` : this.runtime.session_id !== this.session ? `Runtime is serving a different room (${this.runtime.session_id}). Controls disabled.` : !enabled ? "Controls blocked: current local release, disclosure scopes and vendor review are required." : "Runtime connected to this room";
       const key = JSON.stringify([this.runtime, enabled, [...this.feed.lastCalls]]);
       if (key === this.agentKey) return; this.agentKey = key; this.$("agents").replaceChildren();
       for (const a of this.runtime?.agents || []) {
