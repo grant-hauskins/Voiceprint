@@ -32,7 +32,7 @@ The natural read of "agents negotiate for their principals" is two advocate agen
 
 This is the load-bearing decision for the whole feature set: it turns the leak-prevention problem from "trust two adversarial agents not to slip" into "one enforcement point on one neutral node." Everything in §3-4 assumes this topology.
 
-**Decided:** the Arbitrator is always a text-only model — a plain Responses-style API call, never a live voice/realtime session. It has no independent voice presence in the room. It reads the human transcript through the same MCP tools (`get_transcript`, etc.) the Advocates already use, not a special access path — the Arbitrator is a distinguished consumer of the same tool surface, not a differently-privileged one. Advocates keep their existing voice presence (they're the ones actually speaking in the room, per §5); the Arbitrator's output is always text (notes board, prompts to an advocate, the closing summary in §6).
+**Decided:** the Arbitrator is always a text-only model — a plain Responses-style API call, never a live voice/realtime session. It has no independent voice presence in the room. It reads the human transcript through the same MCP tools (`get_transcript`, etc.) the Advocates already use, not a special access path — the Arbitrator is a distinguished consumer of the same tool surface, not a differently-privileged one. Advocates keep their existing voice presence (they're the ones actually speaking in the room, per §5); the Arbitrator's output is always text (notes board, prompts to an advocate, the closing summary in §6). At a pivotal moment — a compromise found, the conversation needing to refocus (§5.1) — that text output should reach the humans directly rather than staying buried in a notes board they might not be watching; whether that's TTS on the Arbitrator's own text or a prompted Advocate reading it out is an implementation detail (§5.1 leaves the trigger open, this leaves the delivery mechanism open), not a reason to give the Arbitrator its own voice session.
 
 ## 2. Objectives: structured, private, versioned
 
@@ -91,9 +91,18 @@ This extends the existing floor gate ([TURN_TAKING.md](TURN_TAKING.md), `scripts
 
 Direct address always overrides the default (existing rule, unchanged). The Arbitrator has no voice (§1), so "interject" for it never means taking the floor itself — it means writing to the notes board, or, for something that needs to be heard, prompting the relevant Advocate to say it.
 
-**Decided:** separately, any agent's speak-request carries a self-declared category tag, most are ordinary and just enter the table above. One category is confirmed and should exist from the start: **`OBJECTIVE_ACHIEVED`** — a deal or conversation objective has been reached — which should let an agent (most naturally the Arbitrator) skip the queue and announce a summary of what was agreed. Do not build a whole taxonomy around a single illustrative example; add categories as real cases come up rather than speculatively.
+**Decided:** separately, any agent's speak-request carries a self-declared category tag; most are ordinary and just enter the table above. Two categories are confirmed and should exist from the start: **`OBJECTIVE_ACHIEVED`** (a deal or conversation objective has been reached) and **`REFOCUS_NEEDED`** (the conversation has drifted from the stated objective). Both let an agent — most naturally the Arbitrator — skip the queue. Do not build a larger taxonomy around these two; add categories as real cases come up rather than speculatively.
 
 **Decided:** the agent making the speak-request should not be the sole judge of whether its own override claim is valid — same self-policing risk as §4. A separate, lightweight check verifies an override claim before it's allowed to skip the queue. Because this check isn't on the live-audio critical path (see above), it can afford to be a real second pass rather than a keyword heuristic, if that's what gets it right.
+
+### 5.1 When the Arbitrator generates at all
+
+The Arbitrator's default state is passive, not idle: it continuously ingests new context — polling `get_transcript` and the agent channel (§3.1) as lines arrive — but that's data intake, not inference. It does not run a full generation on every new line the way a chat agent would; that would be noisy, slow relative to nothing, and expensive for no benefit. **Decided:** it only invokes an actual generation in two cases:
+
+1. **Contribution** — it has judged there's something material to add for the Advocates: an identified zone of agreement, a clarifying question, an update worth posting to the notes board. This is the routine path and stays inside the participation table above (Arbitration → may post proactively).
+2. **Pivotal moment** — `OBJECTIVE_ACHIEVED` or `REFOCUS_NEEDED` from the tags above. Both justify generating (and being heard, per §1's "pivotal moments" carve-out) even outside the routine contribution path.
+
+**Open:** what actually decides "is this worth a generation" for case 1 — a check on every new line, every N lines, or a cheap heuristic pass before considering the full (costlier) generation call? The live floor gate ([TURN_TAKING.md](TURN_TAKING.md) §2) already solves the adjacent problem — deciding when a cheap signal justifies an expensive action — with tiered hard/soft/inhibitor signals. That's the right pattern to adapt here, not a new one to invent, even though the Arbitrator's version runs on text on its own schedule rather than live audio.
 
 ## 6. Conversation summarizer
 
