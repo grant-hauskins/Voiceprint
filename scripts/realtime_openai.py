@@ -43,6 +43,20 @@ def instructions(agent_name, session_id, names):
     )
 
 
+def persona(agent_name, speaks_for="", standing_instructions=""):
+    """Operator-authored flavor appended after the room rules: whose agent this is, and its standing instructions.
+    The room rules above still govern tool use and turn-taking; the persona changes what the agent says, not when."""
+    parts = []
+    if speaks_for:
+        parts.append(f"You are {speaks_for}'s personal agent in this room. Speak on {speaks_for}'s behalf: when {speaks_for} is asked "
+                     f"something, when the conversation concerns {speaks_for}, or when {speaks_for} asks you to. Do not speak for anyone else. "
+                     f"Refer to {speaks_for} by name and say plainly that you are speaking for them when it matters.")
+    if standing_instructions:
+        parts.append("Standing instructions from your operator, which apply to every reply unless they conflict with the room rules above:\n"
+                     + standing_instructions)
+    return "\n\n".join(parts)
+
+
 HOSTAPI_PREFERENCE = ("MME", "Windows DirectSound", "Windows WASAPI", "Windows WDM-KS")   # MME resamples for us; WDM-KS is picky
 
 

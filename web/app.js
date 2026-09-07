@@ -12,6 +12,9 @@
     if (cls) el.className = cls;
     return el;
   }
+  const GLYPHS = {speak: "\u{1F5E3}", hold: "\u23F8", release: "\u25B6", cancel: "\u2715", start: "\u25B6", stop: "\u25A0"};
+  function icon(doc, name) { const el = node(doc, "span", GLYPHS[name] || "", "ico"); el.setAttribute("aria-hidden", "true"); return el; }
+  function hue(name) { let h = 0; for (const ch of String(name)) h = (h * 31 + ch.codePointAt(0)) % 360; return h; }
   function allowedControls(consent, runtime, session) {
     return Boolean(consent && consent.allowed === true && !terminal(consent.state) &&
       consent.scopes && consent.scopes.openai_audio === true && consent.scopes.hosted_mcp === true &&
@@ -65,7 +68,7 @@
       this.doc = doc; this.fetch = fetcher; this.location = location;
       this.token = ""; this.session = ""; this.epoch = 0; this.notice = null; this.consent = null; this.runtime = null;
       this.consentKey = ""; this.agentKey = ""; this.polling = false; this.floor = null; this.busy = false;
-      this.runtimeKey = ""; this.autoOpened = ""; this.pollingRuntime = false;
+      this.runtimeKey = ""; this.autoOpened = ""; this.pollingRuntime = false; this.agentSetupKey = ""; this.gateForced = false;
       // The launcher opens /ui?control=PORT when 8090 is busy on this computer; the origin stays the loopback API.
       const control = String(new URLSearchParams(location && location.search || "").get("control") || "");
       this.control = `http://127.0.0.1:${/^\d{2,5}$/.test(control) ? control : "8090"}`;
@@ -112,7 +115,7 @@
       const run = fn => async event => { event.preventDefault(); try { await fn(); } catch (e) { this.say(e.message); } };
       this.$("connect-form").addEventListener("submit", run(async () => {
         const token = this.$("token").value.trim(); this.disconnect(); this.token = token;
-        await this.loadNotice(); await this.loadRooms(); this.$("connection").textContent = "Operator connected"; this.say("");
+        await this.loadNotice(); await this.loadRooms(); this.$("connection").textContent = "Operator connected"; this.say(""); this.renderStage();
       }));
       this.$("disconnect").addEventListener("click", () => { this.disconnect(); this.$("token").value = ""; });
       this.$("refresh").addEventListener("click", run(() => this.loadRooms()));
@@ -122,8 +125,12 @@
       this.$("create-form").addEventListener("submit", run(() => this.createRoom()));
       this.$("end-room").addEventListener("click", run(() => this.endRoom()));
       this.$("setup-add").addEventListener("click", () => this.addSetupPerson());
+      this.$("agent-add").addEventListener("click", () => this.addAgentCard());
       this.$("setup-form").addEventListener("submit", run(() => this.submitSetup()));
       this.$("start").addEventListener("click", run(() => this.runtimeAction("/start")));
+      this.$("gate-stop").addEventListener("click", run(() => this.runtimeAction("/stop")));
+      this.$("gate-close").addEventListener("click", () => { this.gateForced = false; this.renderStage(); });
+      this.$("review-releases").addEventListener("click", () => { this.gateForced = true; this.renderStage(); });
       this.$("stop-runtime").addEventListener("click", run(() => this.runtimeAction("/stop")));
       this.addPerson(); this.addPerson(); this.addSetupPerson(); this.addSetupPerson(); this.loadNotice();
       this.bootstrap().then(() => this.pollRuntime());
@@ -152,7 +159,7 @@
       if (r && r.session_id && r.phase !== "setup" && r.session_id !== this.session && this.autoOpened !== r.session_id && ID.test(r.session_id)) {
         this.autoOpened = r.session_id;
         // The runtime reports the room a moment before the API has it; retry on the next tick instead of giving up.
-        try { await this.loadRooms(); await this.open(r.session_id); } catch (e) { this.autoOpened = ""; this.say(e.message); }
+        try { await this.loadRooms(); await this.open(r.session_id); this.say(""); } catch (e) { this.autoOpened = ""; this.say(e.message); }
       }
     }
     addSetupPerson() {
@@ -168,12 +175,56 @@
       const v = this.notice && this.notice.vendors;
       return Boolean(v && v.openai_reviewed === true && v.cloudflare_reviewed === true);
     }
+    renderAgentSetup(configs, options) {
+      // Rebuilt only when the runtime's agent list changes, so typing in the boxes survives polling.
+      const key = JSON.stringify([configs, options]);
+      if (key === this.agentSetupKey) return; this.agentSetupKey = key;
+      this.agentOptions = options; const box = this.$("setup-agents"); box.replaceChildren();
+      for (const a of configs) this.addAgentCard(a);
+    }
+    addAgentCard(a = {}) {
+      const options = this.agentOptions || {voices:["marin"], eagerness_levels:["quiet","balanced","eager"], max_agents:4};
+      const box = this.$("setup-agents");
+      if (box.children.length >= options.max_agents) { this.say(`At most ${options.max_agents} agents per room.`); return; }
+      const doc = this.doc, card = node(doc, "div", undefined, "agent-card");
+      const field = (title, name, value, max) => { const label = node(doc, "label", title), input = node(doc, "input"); input.name = name; input.value = value || ""; input.maxLength = max; input.autocomplete = "off"; label.append(input); return label; };
+      const choice = (title, name, values, value) => { const label = node(doc, "label", title), select = node(doc, "select"); select.name = name; for (const v of values) { const option = node(doc, "option", v); option.value = v; select.append(option); } select.value = values.includes(value) ? value : values[0]; label.append(select); return label; };
+      card.append(field("Agent name (its own separate instance and prompt)", "name", a.name, 60),
+        choice("Voice", "voice", options.voices, a.voice), choice("Eagerness", "eagerness", options.eagerness_levels, a.eagerness),
+        field("Speaks for (a full name from the roster, optional)", "speaks_for", a.speaks_for, 200));
+      const how = node(doc, "label", "Standing instructions (how this agent should respond)"); const text = node(doc, "textarea");
+      text.name = "instructions"; text.value = a.instructions || ""; text.rows = 5; text.maxLength = 6000; how.append(text);
+      const file = node(doc, "label", "Load instructions from a text file"); const picker = node(doc, "input");
+      picker.type = "file"; picker.name = "file"; picker.accept = ".txt,.md,text/plain,text/markdown";
+      picker.addEventListener("change", () => {
+        const chosen = picker.files && picker.files[0]; if (!chosen) return;
+        if (chosen.size > 65536) { this.say("Instruction files are limited to 64 KB."); picker.value = ""; return; }
+        const reader = new FileReader(); reader.onload = () => { text.value = String(reader.result || "").slice(0, 6000); }; reader.readAsText(chosen);
+      });
+      file.append(picker);
+      const remove = node(doc, "button", "Remove agent"); remove.type = "button"; remove.addEventListener("click", () => card.remove());
+      card.append(how, file, remove, node(doc, "p", "Each agent is its own provider session with only its own instructions. What is listed here is what gets saved on this computer under data\\agents. The room rules (who spoke, when to speak) still apply.", "muted"));
+      box.append(card);
+    }
+    agentSetup() {
+      return [...this.$("setup-agents").children].map(card => Object.fromEntries(["name", "voice", "eagerness", "speaks_for", "instructions"].map(k => [k, card.querySelector(`[name="${k}"]`).value.trim()])));
+    }
     async submitSetup() {
       if (!this.runtime || this.runtime.phase !== "setup") throw new Error("The runtime is not waiting for setup.");
       if (!this.vendorsReviewed()) throw new Error("Hosted agents are blocked until both vendor review flags are set in data\\launcher.env.");
       const participants = [...this.$("setup-roster").children].map(row => Object.fromEntries(["name", "contact"].map(key => [key, row.querySelector(`[name="${key}"]`).value.trim()])));
       if (participants.length < 2 || participants.length > 4 || participants.some(p => !p.name || !p.contact)) throw new Error("Enter a full name and an email or phone for each of the two to four people within microphone range.");
-      const body = {participants};
+      const agents = this.agentSetup();
+      const names = new Set(participants.map(p => p.name.toLowerCase()));
+      if (!agents.length) throw new Error("Add at least one agent.");
+      const agentNames = new Set();
+      for (const a of agents) {
+        if (!a.name) throw new Error("Every agent needs a name.");
+        if (agentNames.has(a.name.toLowerCase()) || names.has(a.name.toLowerCase())) throw new Error(`Agent name ${a.name} must be distinct from the other agents and from the people in the room.`);
+        agentNames.add(a.name.toLowerCase());
+        if (a.speaks_for && !names.has(a.speaks_for.toLowerCase())) throw new Error(`${a.name} can only speak for a person on the roster (exact full name).`);
+      }
+      const body = {participants, agents};
       const key = this.$("openai-key").value.trim(); this.$("openai-key").value = "";
       if (this.runtime.needs_openai_key) { if (!key) throw new Error("Paste the OpenAI API key."); body.openai_api_key = key; }
       await this.request("/setup", {runtime:true, body});
@@ -185,6 +236,35 @@
     async runtimeAction(path) {
       await this.request(path, {runtime:true, body:{}}); await this.pollRuntime();
     }
+    stage() {
+      // Which view the operator should be in. The gate (setup, releases, enrollment) is inescapable until the room is
+      // enrolled; afterwards it can be reopened to review or withdraw releases.
+      const r = this.runtime, phase = r ? (r.phase || "live") : null;
+      if (!this.token) return {gate: true, step: "room", required: true};
+      if (phase && ["setup", "consent", "enrollment", "connecting"].includes(phase)) return {gate: true, step: phase === "setup" ? "room" : phase === "consent" ? "releases" : "enrollment", required: true};
+      if (phase && ["ready", "live", "ending", "ended", "failed"].includes(phase)) return {gate: this.gateForced, step: "enrollment", required: false};
+      if (this.session && this.consent && this.consent.allowed) return {gate: this.gateForced, step: "enrollment", required: false};
+      return {gate: true, step: this.session ? "releases" : "room", required: true};
+    }
+    renderStage() {
+      const {gate, step, required} = this.stage(), r = this.runtime, phase = r ? (r.phase || "live") : null;
+      this.$("gate").hidden = !gate;
+      this.$("gate-close").hidden = required;
+      this.$("gate-stop").hidden = !(r && required && !["ended", "failed"].includes(phase));
+      this.$("gate-stop").disabled = !this.token;
+      const order = ["room", "releases", "enrollment"];
+      for (const li of this.$("steps").children || []) { const name = li.getAttribute ? li.getAttribute("data-step") : li["data-step"]; li.className = name === step ? "active" : order.indexOf(name) < order.indexOf(step) ? "done" : ""; }
+      this.$("connect-section").hidden = Boolean(this.token) && this.$("connection").textContent.includes("launcher");
+      this.$("room-section").hidden = step !== "room";
+      this.$("notice-section").hidden = step === "room" && !this.session;
+      this.$("releases-section").hidden = step === "room" && !this.session;
+      this.$("enrollment-section").hidden = step !== "enrollment";
+      this.$("gate-title").textContent = step === "room" ? "Set up this conversation" : step === "releases" ? "Each person signs their written release" : phase === "connecting" ? "Connecting the agents" : "Record each person's enrollment statement";
+      const mic = this.$("mic"); const state = phase === "live" ? "on" : phase === "ready" ? "ready" : "off";
+      mic.setAttribute("data-state", state);
+      this.$("mic-label").textContent = state === "on" ? "Microphone open · shared by everyone in the room" : state === "ready" ? "Ready · press Start to open the microphone" : "Microphone closed";
+      this.$("app-message").textContent = !this.token ? "Local room console" : !r ? "Monitoring" : phase === "live" ? `Live · ${r.session_id || ""}` : phase === "ready" ? "Enrolled · ready to start" : phase === "ended" ? "Conversation ended" : phase === "failed" ? "Runtime stopped" : "Setting up";
+    }
     renderRuntime() {
       const r = this.runtime, key = JSON.stringify([this.token ? 1 : 0, this.vendorsReviewed(), r]);
       if (key === this.runtimeKey) return; this.runtimeKey = key;
@@ -193,6 +273,7 @@
       this.$("phase-detail").textContent = r && r.detail ? r.detail : !r && this.token ? "Start it with Voiceprint.cmd (or scripts\\dev.ps1 up) and this page will connect on its own." : "";
       this.$("mcp-url").textContent = r && r.mcp_url ? `Hosted MCP URL given to the provider: ${r.mcp_url}` : "";
       this.$("setup-form").hidden = phase !== "setup";
+      if (phase === "setup") this.renderAgentSetup(r.agent_configs || [], {voices:r.voices || ["marin"], eagerness_levels:r.eagerness_levels || ["quiet","balanced","eager"], max_agents:r.max_agents || 4});
       this.$("key-label").hidden = !(r && r.needs_openai_key);
       // Without both review flags the API computes the hosted scopes as false, so a room created now would fail after everyone signed.
       const reviewed = this.vendorsReviewed();
@@ -212,6 +293,8 @@
       this.$("start").hidden = phase !== "ready";
       this.$("stop-runtime").hidden = !r || ["ended"].includes(phase);
       this.$("stop-runtime").textContent = phase === "failed" ? "Dismiss failed runtime" : phase === "live" ? "End conversation & close microphone" : "Stop runtime";
+      this.$("stop-runtime").prepend(icon(this.doc, "stop"));
+      this.renderStage();
     }
     disconnect() {
       this.token = ""; this.session = ""; this.epoch++; this.consent = null; this.runtime = null; this.consentKey = ""; this.agentKey = "";
@@ -221,7 +304,7 @@
       this.$("enrollment-help").textContent = ""; this.$("capture-status").textContent = "Microphone capture requires a current release from everyone.";
       this.$("destruction").textContent = ""; this.$("room-id").value = "";
       this.$("token").value = ""; this.$("new-room-id").value = ""; this.$("new-roster").replaceChildren(); this.addPerson();
-      this.$("openai-key").value = ""; this.runtimeKey = ""; this.renderRuntime();
+      this.$("openai-key").value = ""; this.runtimeKey = ""; this.gateForced = false; this.renderRuntime();
     }
     clearProtected() {
       this.feed.reset(); this.floor = null; this.$("participants").replaceChildren(); this.$("agents").replaceChildren();
@@ -275,7 +358,7 @@
       try {
         const consent = await this.request(this.path("consent", session));
         if (epoch !== this.epoch) return;
-        this.consent = consent; this.renderConsent();
+        this.consent = consent; this.renderConsent(); this.renderStage();
         if (!consent.allowed || terminal(consent.state)) {
           this.clearProtected();
           if (["revoked", "destroying", "destroyed"].includes(consent.state)) await this.loadDestruction(epoch, session);
@@ -411,21 +494,26 @@
       const key = JSON.stringify([this.runtime, enabled, [...this.feed.lastCalls]]);
       if (key === this.agentKey) return; this.agentKey = key; this.$("agents").replaceChildren();
       for (const a of this.runtime?.agents || []) {
-        const card = node(this.doc, "div", undefined, "agent-card");
-        card.append(node(this.doc, "h3", a.name), node(this.doc, "p", `${a.provider} · ${a.model} · ${a.voice}`, "muted"), node(this.doc, "p", a.held ? "Held" : a.responding ? "Responding" : "Listening"));
-        const actions = node(this.doc, "div", undefined, "inline");
+        const card = node(this.doc, "div", undefined, `agent-card${a.held ? " held" : a.responding ? " speaking" : ""}`);
+        const wrap = node(this.doc, "div", undefined, "orb-wrap"), orb = node(this.doc, "div", undefined, "orb");
+        orb.setAttribute("style", `--h:${hue(a.name)}`); orb.setAttribute("aria-hidden", "true"); wrap.append(orb);
+        card.append(wrap, node(this.doc, "h3", a.name), node(this.doc, "p", a.held ? "Held" : a.responding ? "Speaking" : "Listening", "state"),
+          node(this.doc, "p", `${a.provider} · ${a.model} · ${a.voice}`, "meta"));
+        const actions = node(this.doc, "div", undefined, "actions");
         for (const action of ["speak", "hold", "cancel"]) {
-          const button = node(this.doc, "button", action === "hold" && a.held ? "Release hold" : action[0].toUpperCase() + action.slice(1)); button.type = "button"; button.disabled = !enabled;
+          const text = action === "hold" && a.held ? "Release hold" : action[0].toUpperCase() + action.slice(1);
+          const button = node(this.doc, "button", undefined); button.type = "button"; button.disabled = !enabled; button.title = text;
+          button.append(icon(this.doc, action === "hold" && a.held ? "release" : action), node(this.doc, "span", text));
           button.addEventListener("click", async () => { try { await this.control(a.name, {action}); } catch (e) { this.say(e.message); } }); actions.append(button);
         }
         const label = node(this.doc, "label", "Eagerness"), select = node(this.doc, "select");
         for (const value of ["quiet", "balanced", "eager"]) { const option = node(this.doc, "option", value); option.value = value; select.append(option); }
         select.value = a.eagerness; select.disabled = !enabled; select.addEventListener("change", async () => { try { await this.control(a.name, {action:"eagerness",value:select.value}); } catch (e) { this.say(e.message); } }); label.append(select);
         const m = a.mcp || {};
-        const listing = m.list_tools === "failed" ? `Provider FAILED to list our MCP tools${m.last_error ? `: ${m.last_error}` : ""}. The agent cannot call get_transcript; check the tunnel URL and token.` : m.list_tools === "ok" ? `Provider listed tools ${JSON.stringify(m.tools || [])}` : m.calls ? "Provider is calling our MCP tools (no separate listing event from this provider)." : "Provider has not reported any MCP activity yet.";
-        card.append(node(this.doc, "p", `${listing} Provider-declared calls: ${m.calls || 0}${m.failed ? ` (${m.failed} failed: ${m.last_error || "no detail"})` : ""}.`, m.list_tools === "failed" || m.failed ? "warn" : "muted"));
+        const listing = m.list_tools === "failed" ? `Provider FAILED to list our MCP tools${m.last_error ? `: ${m.last_error}` : ""}. The agent cannot call get_transcript; check the tunnel URL and token.` : m.list_tools === "ok" ? `Provider listed tools ${JSON.stringify(m.tools || [])}` : m.calls ? "Provider is calling our MCP tools." : "No MCP activity reported by the provider yet.";
         const call = this.feed.lastCalls.get(a.participant_id);
-        card.append(actions, label, node(this.doc, "p", call ? `Last declared MCP call: ${call.tool} · ${call.bytes} bytes · ${stamp(call.timestamp_ms)}` : "No server call attributed to this agent.", "muted")); this.$("agents").append(card);
+        card.append(actions, label, node(this.doc, "p", `${listing} Provider-declared calls: ${m.calls || 0}${m.failed ? ` (${m.failed} failed: ${m.last_error || "no detail"})` : ""}. ${call ? `Last server-recorded call: ${call.tool} · ${call.bytes} bytes · ${stamp(call.timestamp_ms)}.` : "No server call attributed to this agent."}`, m.list_tools === "failed" || m.failed ? "warn meta" : "meta"));
+        this.$("agents").append(card);
       }
     }
     async control(name, body) {

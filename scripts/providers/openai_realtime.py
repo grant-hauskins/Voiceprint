@@ -5,7 +5,7 @@ import json
 import os
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from realtime_openai import REALTIME_URL, instructions
+from realtime_openai import REALTIME_URL, instructions, persona
 import voiceprint_client as vp
 
 
@@ -46,8 +46,9 @@ class OpenAIRealtime:
         if self.mcp_token:
             tool["authorization"] = self.mcp_token
         prompt = instructions(self.config.name, self.session_id, self.names)
-        if self.config.instructions_extra:
-            prompt += " " + self.config.instructions_extra
+        flavor = persona(self.config.name, getattr(self.config, "speaks_for", ""), self.config.instructions_extra)
+        if flavor:
+            prompt += "\n\n" + flavor
         await self._send({"type": "session.update", "session": {
             "type": "realtime", "model": self.config.model, "output_modalities": ["audio"],
             "instructions": prompt,

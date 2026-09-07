@@ -1,6 +1,15 @@
 # Local room console
 
 Serve this directory through the Java API at `http://127.0.0.1:8080/ui`.
+The page has two views. Setup, the collection notice, each person's release and
+enrollment recording live in a dialog that cannot be dismissed until the room is
+enrolled (steps Room, Releases, Enrollment); afterwards *Releases* in the header
+reopens it for review or withdrawal. Behind it, the console proper: a toolbar with
+the microphone state and Start/End controls, and a grid of agent cards (a gradient
+orb per agent that pulses while that agent speaks), room status, the transcript and
+the server-recorded MCP evidence. The palette follows the operating system's light
+or dark preference. Element IDs and client logic are shared by both views and by
+the tests below.
 There is no build step. Do not expose port 8080 or this directory through a tunnel.
 The existing Cloudflare tunnel remains exclusively for hosted MCP on port 8082.
 

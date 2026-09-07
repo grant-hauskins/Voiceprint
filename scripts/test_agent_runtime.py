@@ -1,6 +1,7 @@
 """No provider key, hardware, or human fixtures: floor, transport, controls and prior-consent regression tests."""
 import asyncio
 import base64
+import dataclasses
 import json
 import os
 import tempfile
@@ -233,6 +234,20 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
 
 
 class GateAndConfigTest(unittest.TestCase):
+    def test_persona_prompt_and_toml_fields(self):
+        from realtime_openai import persona
+        self.assertEqual(persona("Ava"), "")
+        text = persona("Ben", "Grant Hauskins", "Answer in haiku.")
+        self.assertIn("Grant Hauskins's personal agent", text); self.assertIn("Do not speak for anyone else", text); self.assertTrue(text.endswith("Answer in haiku."))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "agents.toml"
+            path.write_text('[[agents]]\nname = "Ava"\nspeaks_for = "Grant Hauskins"\ninstructions_extra = "Be terse."\n', encoding="utf-8")
+            config = ar.load_config(path)[0]
+            self.assertEqual((config.speaks_for, config.instructions_extra), ("Grant Hauskins", "Be terse."))
+            path.write_text('[[agents]]\nname = "Ava"\nspeaks_for = 3\n', encoding="utf-8")
+            with self.assertRaises(ValueError):
+                ar.load_config(path)
+
     def test_default_configuration(self):
         configs = ar.load_config(Path(ar.__file__).with_name("agents.toml"))
         self.assertEqual([(c.name, c.voice, c.eagerness) for c in configs], [("Ava", "marin", "balanced"), ("Ben", "cedar", "quiet")])
@@ -501,6 +516,45 @@ class LifecycleHttpTest(unittest.TestCase):
         self.assertFalse(self.request("/agents")[1]["needs_openai_key"])
         self.runtime.set_phase("consent")
         self.assertEqual(self.request("/setup", "POST", {"participants": people})[0], 409)        # only during setup
+
+    def test_setup_builds_separate_agents_and_persists_the_panel(self):
+        configs = [ar.AgentConfig("Ava", instructions_extra="from toml"), ar.AgentConfig("Ben", voice="cedar", output_device="Speakers X")]
+        with tempfile.TemporaryDirectory() as tmp, patch.object(ar, "PERSONA_DIR", Path(tmp)):
+            ar.save_personas([dataclasses.replace(configs[0], instructions_extra="")])                  # an explicitly cleared default
+            runtime = ar.Runtime(gui=True, mcp_url="https://example.invalid/mcp", api_token="operator-token", configs=configs)
+            shown = runtime.state()
+            self.assertEqual(shown["agent_configs"][0]["instructions"], "")                              # cleared stays cleared, TOML does not come back
+            self.assertEqual(shown["voices"][0], "alloy"); self.assertEqual(shown["max_agents"], ar.MAX_AGENTS)
+            server = ar.control_server(runtime, port=0, token="operator-token")
+            try:
+                base = self.base; self.base = f"http://127.0.0.1:{server.server_port}"
+                people = [{"name": "Synthetic One", "contact": "one@example.invalid"}, {"name": "Synthetic Two", "contact": "555-0100"}]
+                key = {"openai_api_key": "k" * 40}
+                bad = [[], [{"name": "Ben", "speaks_for": "Nobody"}], [{"name": "Ben", "instructions": "x" * 6001}], [{"name": "Ben", "voice": "robot"}],
+                       [{"name": "Synthetic One"}], [{"name": "Ben"}, {"name": "ben"}], [{"name": f"A{i}"} for i in range(ar.MAX_AGENTS + 1)]]
+                for agents in bad:
+                    self.assertEqual(self.request("/setup", "POST", {"participants": people, "agents": agents, **key})[0], 409, agents)
+                self.assertIsNone(runtime.session_configs)
+                big = "\u00e9" * 6000                                                                  # non-ASCII at the limit, two agents: well over 8 KiB
+                status, _ = self.request("/setup", "POST", {"participants": people, "agents": [
+                    {"name": "Ben", "speaks_for": "synthetic two", "voice": "sage", "eagerness": "eager", "instructions": "Only words that start with A.\r\n\x00Be brief."},
+                    {"name": "Cy", "instructions": big}], **key})
+                self.assertEqual(status, 200)
+                self.base = base
+            finally:
+                server.shutdown(); server.server_close()
+            runtime.wait_setup()
+            active = {c.name: c for c in runtime.active_configs()}
+            self.assertEqual(sorted(active), ["Ben", "Cy"])                                              # Ava was removed from this room
+            self.assertEqual((active["Ben"].speaks_for, active["Ben"].voice, active["Ben"].eagerness, active["Ben"].instructions_extra, active["Ben"].output_device),
+                             ("synthetic two", "sage", "eager", "Only words that start with A.\nBe brief.", "Speakers X"))
+            self.assertEqual((active["Cy"].instructions_extra, active["Cy"].speaks_for, active["Cy"].provider), (big, "", "openai_realtime"))
+            files = sorted(p.name for p in Path(tmp).glob("*.json"))
+            self.assertEqual(len(files), 2); self.assertTrue(any(f.startswith("Ben-") for f in files)); self.assertTrue(any(f.startswith("Cy-") for f in files))
+            self.assertNotEqual(ar.persona_path("Agent One"), ar.persona_path("Agent_One"))              # distinct names never share a file
+            fresh = ar.Runtime(gui=True, configs=configs)
+            self.assertEqual([(c.name, c.voice, c.instructions_extra[:4]) for c in fresh.configs], [("Ava", "marin", "from"), ("Ben", "sage", "Only"), ("Cy", "marin", "\u00e9\u00e9\u00e9\u00e9")])
+            self.assertNotIn("Only words", json.dumps(runtime.bootstrap()))
 
     def test_enrollment_start_and_stop_follow_phases(self):
         self.runtime.participants = [{"id": "participant_1", "name": "Synthetic One"}]

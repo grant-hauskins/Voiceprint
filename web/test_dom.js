@@ -12,6 +12,8 @@ class Element {
   append(...nodes) { this.children.push(...nodes); }
   replaceChildren(...nodes) { this.children = nodes; this._text = ""; }
   setAttribute(key, value) { this[key] = value; }
+  getAttribute(key) { return this[key]; }
+  prepend(...nodes) { this.children.unshift(...nodes); }
   addEventListener(type, fn) { this.listeners[type] = fn; }
   querySelector(selector) { const key = selector.match(/\[name="(.+)"\]/)?.[1]; return walk(this).find(e => e.name === key); }
 }
@@ -95,6 +97,8 @@ async function main() {
     let data = {};
     if (url === "http://127.0.0.1:8123/bootstrap") { assert(!options.headers.Authorization); data = {phase, session_id:sessionId, gui:true, api_token:"launcher_token"}; }
     else if (url === "http://127.0.0.1:8123/agents") data = {session_id:sessionId, agents:[], phase, detail:`in ${phase}`, awaiting, needs_openai_key:phase === "setup",
+      agent_configs:[{name:"Ava", voice:"marin", model:"m", eagerness:"balanced", instructions:"Answer in haiku.", speaks_for:""}, {name:"Ben", voice:"cedar", model:"m", eagerness:"quiet", instructions:"", speaks_for:""}],
+      voices:["marin","cedar","sage"], eagerness_levels:["quiet","balanced","eager"], max_agents:3,
       participants: sessionId ? [{id:"participant_1", name:"Synthetic One", enrollment:{state:awaiting === "participant_1" ? "waiting" : "recorded", peak:awaiting ? null : 9000}}] : []};
     else if (url === "http://127.0.0.1:8123/setup") { phase = "consent"; sessionId = "room_auto"; }
     else if (url === "http://127.0.0.1:8123/enrollment/record") { awaiting = null; phase = "ready"; }
@@ -112,6 +116,8 @@ async function main() {
   await launched.bootstrap(); assert.equal(launched.token, "launcher_token");
   await launched.pollRuntime();
   assert.equal(launched.$("phase").textContent, "setup"); assert(!launched.$("setup-form").hidden); assert(!launched.$("key-label").hidden);
+  assert(!launched.$("gate").hidden); assert(launched.$("gate-close").hidden); assert(!launched.$("room-section").hidden);   // inescapable setup gate
+  assert.equal(launched.$("mic").getAttribute("data-state"), "off");
   // Unreviewed vendor settings block room creation up front instead of failing after everyone has signed.
   assert(launched.$("setup-submit").disabled); assert.match(launched.$("setup-blocked").textContent, /VOICEPRINT_OPENAI_REVIEWED=true/);
   await assert.rejects(() => launched.submitSetup(), /vendor review flags/);
@@ -123,9 +129,26 @@ async function main() {
   await assert.rejects(() => launched.submitSetup(), /two to four people/);          // one person is not a room
   rowTwo.querySelector('[name="name"]').value = "Synthetic Two"; rowTwo.querySelector('[name="contact"]').value = "555-0100";
   launched.$("openai-key").value = "sk-synthetic-key-value-0000000000";
+  const agentCards = launched.$("setup-agents").children;
+  assert.equal(agentCards.length, 2); assert.equal(agentCards[0].querySelector('[name="instructions"]').value, "Answer in haiku.");   // prefilled from the runtime
+  agentCards[1].querySelector('[name="speaks_for"]').value = "Nobody Here";
+  await assert.rejects(() => launched.submitSetup(), /speak for a person on the roster/);
+  agentCards[1].querySelector('[name="speaks_for"]').value = "Synthetic Two"; agentCards[1].querySelector('[name="instructions"]').value = "Only words starting with A.";
+  launched.$("openai-key").value = "sk-synthetic-key-value-0000000000";
+  await launched.pollRuntime(); assert.equal(launched.$("setup-agents").children[1].querySelector('[name="instructions"]').value, "Only words starting with A.");   // polling keeps typed text
+  launched.addAgentCard(); launched.addAgentCard();
+  assert.equal(launched.$("setup-agents").children.length, 3); assert.match(launched.$("message").textContent, /At most 3 agents/);   // runtime's cap
+  const third = launched.$("setup-agents").children[2];
+  third.querySelector('[name="name"]').value = "Synthetic Two";                                          // collides with a human
+  await assert.rejects(() => launched.submitSetup(), /distinct from the other agents and from the people/);
+  third.querySelector('[name="name"]').value = "Cy"; third.querySelector('[name="voice"]').value = "sage"; third.querySelector('[name="eagerness"]').value = "eager";
+  third.querySelector('[name="speaks_for"]').value = "Synthetic One"; third.querySelector('[name="instructions"]').value = "Speak only in questions.";
+  launched.$("openai-key").value = "sk-synthetic-key-value-0000000000";
   await launched.submitSetup();
   const setup = runtimeCalls.find(c => c.url.endsWith("/setup"));
-  assert.deepEqual(JSON.parse(setup.options.body), {participants:[{name:"Synthetic One",contact:"one@example.invalid"},{name:"Synthetic Two",contact:"555-0100"}], openai_api_key:"sk-synthetic-key-value-0000000000"});
+  assert.deepEqual(JSON.parse(setup.options.body), {participants:[{name:"Synthetic One",contact:"one@example.invalid"},{name:"Synthetic Two",contact:"555-0100"}],
+    agents:[{name:"Ava", voice:"marin", eagerness:"balanced", speaks_for:"", instructions:"Answer in haiku."}, {name:"Ben", voice:"cedar", eagerness:"quiet", speaks_for:"Synthetic Two", instructions:"Only words starting with A."},
+      {name:"Cy", voice:"sage", eagerness:"eager", speaks_for:"Synthetic One", instructions:"Speak only in questions."}], openai_api_key:"sk-synthetic-key-value-0000000000"});
   assert.equal(setup.options.headers.Authorization, "Bearer launcher_token");
   assert.equal(launched.$("openai-key").value, "");                       // key never lingers in the page
   assert.equal(launched.session, "room_auto");                            // runtime's room opened automatically
@@ -133,11 +156,25 @@ async function main() {
   phase = "enrollment"; awaiting = "participant_1"; await launched.pollRuntime();
   const recordButton = walk(launched.$("enrollment")).find(e => e.tagName === "button");
   assert.match(recordButton.textContent, /Record Synthetic One now/); assert(!recordButton.disabled); assert(launched.$("start").hidden);
+  assert(!launched.$("gate").hidden); assert(!launched.$("enrollment-section").hidden); assert(launched.$("room-section").hidden);   // still gated during enrollment
   await launched.recordParticipant("participant_1");
   assert.deepEqual(JSON.parse(runtimeCalls.find(c => c.url.endsWith("/enrollment/record")).options.body), {participant_id:"participant_1"});
   assert.equal(launched.$("phase").textContent, "ready"); assert(!launched.$("start").hidden);
+  assert(launched.$("gate").hidden); assert.equal(launched.$("mic").getAttribute("data-state"), "ready");                         // gate lifts once enrolled
+  launched.gateForced = true; launched.renderStage(); assert(!launched.$("gate").hidden); assert(!launched.$("gate-close").hidden); // review is escapable
+  launched.gateForced = false; launched.renderStage(); assert(launched.$("gate").hidden);
   assert.match(launched.$("enrollment").textContent, /peak 9000/);
   await launched.runtimeAction("/start"); assert.equal(launched.$("phase").textContent, "live"); assert(launched.$("start").hidden);
+  assert.equal(launched.$("mic").getAttribute("data-state"), "on");
+  launched.session = "room_auto"; launched.consent = {allowed:true, state:"active", scopes:{openai_audio:true, hosted_mcp:true}};
+  launched.runtime = {session_id:"room_auto", phase:"live", agents:[{name:"Ava", participant_id:"agent_1", provider:"p", model:"m", voice:"marin", eagerness:"balanced", held:false, responding:true},
+    {name:"Ben", participant_id:"agent_2", provider:"p", model:"m", voice:"cedar", eagerness:"quiet", held:true, responding:false}]};
+  launched.renderAgents();
+  const cards = launched.$("agents").children;
+  assert.match(cards[0].className, /speaking/); assert.match(cards[1].className, /held/);
+  assert.match(walk(cards[0]).find(e => e.className === "orb").style, /--h:\d+/);
+  assert.notEqual(walk(cards[0]).find(e => e.className === "orb").style, walk(cards[1]).find(e => e.className === "orb").style);   // unique gradient per agent
+  assert.equal(walk(cards[0]).filter(e => e.tagName === "button").length, 3);
   assert.match(launched.$("stop-runtime").textContent, /End conversation/);
   await launched.runtimeAction("/stop"); assert.equal(launched.$("phase").textContent, "ended"); assert(launched.$("stop-runtime").hidden);
   const manual = new Console(new Document(), async (url) => { if (url.endsWith("/bootstrap")) throw new Error("no runtime"); return {ok:true,status:200,json:async()=>({})}; }, {hostname:"127.0.0.1",protocol:"http:"});
