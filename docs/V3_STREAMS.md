@@ -1,6 +1,8 @@
 # V3 build streams: agent-mediated arbitration with leak prevention
 
-Build plan for `docs/BUILD_SPEC_V3.md`, grounded by `docs/HANDOFF_PROMPT.md`. Contract: the "V3 arbitration contract" section of `docs/API.md`. Conventions carry over from `docs/V2_STREAMS.md`: contract first, one concern per commit, commit prefixes `[api] [agent] [gui] [eval] [contract] [docs]`, every stream green before merge, no invented probabilities, labels stay `similarity_based_uncalibrated`.
+Build plan for `docs/BUILD_SPEC_V3.md`, grounded by the 2026-09-07 grounding version of `docs/HANDOFF_PROMPT.md` (its §C conflicts, §E questions, §G pseudocode and §K traceability matrix). That version lived uncommitted in the main checkout while this was built and is being rewritten by another session, so the committed `HANDOFF_PROMPT.md` may not carry the section letters cited here; the substance those sections carried is restated in this file and in the V3 section of `docs/API.md`.
+
+**Status after the 2026-09-08 build (branch `worktree-v3-arbitration`):** everything below is built and unit-tested (Java 49, scripts 127, worker 13, web 4). Not done: the manual live smoke (two people, provider key, tunnel) and Grant's answers to the five questions, each of which has a reversible default in place. Contract: the "V3 arbitration contract" section of `docs/API.md`. Conventions carry over from `docs/V2_STREAMS.md`: contract first, one concern per commit, commit prefixes `[api] [agent] [gui] [eval] [contract] [docs]`, every stream green before merge, no invented probabilities, labels stay `similarity_based_uncalibrated`.
 
 ## Decisions made in Grant's absence (reversible; flagged for review)
 
