@@ -49,7 +49,8 @@ final class RestServer implements AutoCloseable {
                 throw new ApiException(401, "unauthorized", "A valid bearer token is required.");
             if (path.equals("/health") && method.equals("GET")) { respond(exchange, 200, Json.obj().put("status", "ok").put("service", "voiceprint").put("model_readiness", "checked_on_inference")); return; }
             if (token == null || token.isBlank()) throw new ApiException(503, "operator_auth_required", "Configure an operator API token before using privacy or conversation endpoints.");
-            boolean consentWrite = method.equals("POST") && (path.equals("/privacy/rooms") || path.contains("/consents/") || path.endsWith("/agent_channel/reveal"));
+            boolean consentWrite = method.equals("POST") && (path.equals("/privacy/rooms") || path.contains("/consents/") || path.endsWith("/agent_channel/reveal"))
+                || method.equals("DELETE") && path.startsWith("/privacy/profiles/");  // the person clicks the delete themselves
             if (consentWrite && origins == null) throw new ApiException(403, "origin_rejected", "Consent submission requires the exact local browser origin.");
             String admissionSession = null;
             String scope = "true".equals(exchange.getRequestHeaders().getFirst("X-Voiceprint-Hosted-MCP")) ? "hosted_mcp" : "local_processing";
@@ -63,6 +64,7 @@ final class RestServer implements AutoCloseable {
                 if (room && admission.length == 5 && Set.of("audio", "utterances", "correct", "current", "profiles", "participants", "transcript", "corrections", "floor", "events", "objectives", "agent_channel", "summary").contains(admission[4])
                     && !(admission[4].equals("summary") && !method.equals("POST"))) admissionSession = admission[3];
                 if (room && admission.length == 6 && admission[4].equals("agent_channel") && admission[5].equals("reveal")) admissionSession = admission[3];
+                if (room && admission.length == 7 && admission[4].equals("utterances") && admission[6].equals("review")) admissionSession = admission[3];
             }
             // Admission happens before the app reads, decodes or hashes any unauthorized audio body.
             if (admissionSession != null) service.requireConsent(admissionSession, scope);
@@ -78,6 +80,12 @@ final class RestServer implements AutoCloseable {
             }
             if (path.equals("/privacy/rooms") && method.equals("POST")) { respond(exchange, 201, service.createPrivacyRoom(body)); return; }
             if (path.equals("/privacy/rooms") && method.equals("GET")) { respond(exchange, 200, service.privacyRooms()); return; }
+            if (path.equals("/privacy/profiles") && method.equals("GET")) { respond(exchange, 200, service.retainedProfiles()); return; }
+            if (path.startsWith("/privacy/profiles/") && method.equals("DELETE")) {
+                String key = path.substring("/privacy/profiles/".length());
+                if (!key.matches("[0-9a-f]{64}")) throw new ApiException(400, "invalid_input", "subject_key must be a 64-character hex SHA-256.");
+                respond(exchange, 200, service.deleteRetainedProfile(key)); return;
+            }
             if (path.equals("/speaker/session/init") && method.equals("POST")) {
                 if (!body.path("session_id").asText().equals(admissionSession)) throw new ApiException(403, "roster_mismatch", "Enrollment room does not match its authorization header.");
                 synchronized (service) { respond(exchange, 201, service.init(body)); } return;
@@ -106,6 +114,10 @@ final class RestServer implements AutoCloseable {
             ObjectNode result;
             int status = method.equals("POST") && Set.of("objectives", "agent_channel", "summary").contains(action) ? 201 : 200;
             if (parts.length == 4 && method.equals("DELETE")) result = service.delete(session);
+            else if (parts.length == 7 && parts[4].equals("utterances") && parts[6].equals("review") && method.equals("POST")) {
+                if (!parts[5].matches("[1-9][0-9]{0,17}")) throw new ApiException(400, "invalid_input", "utterance_id must be a positive integer.");
+                result = service.reviewUtterance(session, Long.parseLong(parts[5]), body);
+            }
             else if (parts.length != 5) throw new ApiException(404, "not_found", "Endpoint does not exist.");
             else result = switch (method + " " + action) {
                 case "POST objectives" -> service.createObjective(session, body);

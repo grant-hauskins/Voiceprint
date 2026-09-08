@@ -5,13 +5,15 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 
 /** Synthetic people and synthetic PCM only; all tests use the real challenge/release flow. */
 final class PrivacyTestSupport {
-    static final PrivacyPolicy POLICY = new PrivacyPolicy("Synthetic Test Operator", "1 Test Street", "operator@example.invalid", "test-secret", true, true);
-    static ObjectNode init(SpeakerService service, JsonNode request) {
+    static final PrivacyPolicy POLICY = new PrivacyPolicy("Synthetic Test Operator", "1 Test Street", "operator@example.invalid", "test-secret", true, true, java.util.List.of("OpenAI"));
+    static ObjectNode init(SpeakerService service, JsonNode request) { return init(service, request, ALL_SCOPES); }
+    /** Signs every roster member with the given scopes when the room does not exist yet, then enrolls. */
+    static ObjectNode init(SpeakerService service, JsonNode request, java.util.List<String> scopes) {
         String id = request.path("session_id").asText();
         try { service.consentStatus(id); }
         catch (ApiException e) {
             if (e.status != 404) throw e;
-            authorize(service, id, request.path("participants"), true);
+            authorize(service, id, request.path("participants"), scopes);
         }
         return service.init(request);
     }
@@ -27,6 +29,8 @@ final class PrivacyTestSupport {
     }
     static final java.util.List<String> ALL_SCOPES = java.util.List.of("openai_audio", "hosted_mcp", "negotiation_text");
     static final java.util.List<String> V2_SCOPES = java.util.List.of("openai_audio", "hosted_mcp");
+    /** Every disclosure plus the per-person voiceprint retention choice. */
+    static final java.util.List<String> RETAIN_SCOPES = java.util.List.of("openai_audio", "hosted_mcp", "negotiation_text", PrivacyGate.RETENTION);
     static void sign(SpeakerService service, String session, String id, String name, boolean disclosures) {
         sign(service, session, id, name, disclosures ? ALL_SCOPES : java.util.List.of());
     }

@@ -227,7 +227,8 @@ class V2ContractTest {
         var beforeTranscript = service.transcript("room", null, -1, 100);
         var beforeCorrections = service.corrections("room", 0, 100);
         var beforeUtterances = service.utterances("room", 0, 100, null);
-        for (String table : List.of("summaries", "channel_reveals", "agent_channel", "objectives", "destruction_items", "destruction_jobs", "consent_challenges", "consent_audit", "biometric_consents", "privacy_rooms", "floor", "events", "mcp_calls", "participants")) store.execute("DROP TABLE " + table);
+        for (String table : List.of("retained_profiles", "summaries", "channel_reveals", "agent_channel", "objectives", "destruction_items", "destruction_jobs", "consent_challenges", "consent_audit", "biometric_consents", "privacy_rooms", "floor", "events", "mcp_calls", "participants")) store.execute("DROP TABLE " + table);
+        for (String column : List.of("reviewed_text", "reviewed_speaker_id", "reviewed_ms")) store.execute("ALTER TABLE utterances DROP COLUMN " + column);
         store.execute("PRAGMA user_version=3");
         store.close(); store = new Store(temp.resolve("room.sqlite")); service = new SpeakerService(store, new SpeakerServiceTest.FakeEngine(), clock, PrivacyTestSupport.POLICY);
         assertEquals(2, store.participants("room").size());
@@ -246,7 +247,7 @@ class V2ContractTest {
         assertEquals(2, events.get(1).path("data").path("utterance_id").asLong());
         store.close(); store = new Store(temp.resolve("room.sqlite"));
         assertEquals(2, count("events"));
-        try (var p = store.prepare("PRAGMA user_version"); var r = p.executeQuery()) { assertEquals(6, r.getInt(1)); }
+        try (var p = store.prepare("PRAGMA user_version"); var r = p.executeQuery()) { assertEquals(7, r.getInt(1)); }
     }
 
     @Test void deletingSessionCascadesAllRoomDataAndEventIdsNeverRepeat() throws Exception {

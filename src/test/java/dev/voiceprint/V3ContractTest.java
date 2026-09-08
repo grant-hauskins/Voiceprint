@@ -353,23 +353,27 @@ class V3ContractTest {
         for (var p : roster) room.withArray("participants").add(Json.obj().put("id", p.path("id").asText()).put("name", p.path("name").asText()).put("contact", "x@example.invalid"));
         service.createPrivacyRoom(room);
         assertEquals(403, assertThrows(ApiException.class, () -> PrivacyTestSupport.sign(service, "strict", "a", "Alice", List.of("negotiation_text", "everything"))).status);
-        var unreviewed = new PrivacyPolicy("Synthetic Test Operator", "1 Test Street", "operator@example.invalid", TOKEN, false, true);
+        var unreviewed = new PrivacyPolicy("Synthetic Test Operator", "1 Test Street", "operator@example.invalid", TOKEN, false, true, List.of("OpenAI"));
         var strict = new SpeakerService(store, new SpeakerServiceTest.FakeEngine(), clock, unreviewed);
         assertTrue(strict.consentStatus("room").path("scopes").path("local_processing").asBoolean());
         assertFalse(strict.consentStatus("room").path("scopes").path("negotiation_text").asBoolean());
         assertEquals(403, assertThrows(ApiException.class, () -> strict.createObjective("room", objective("a", "1"))).status);
     }
 
-    @Test void schemaV6MigratesFromV5ExactlyOnceAndRefusesNewerFiles() throws Exception {
+    @Test void schemaV7MigratesFromV5ExactlyOnceAndRefusesNewerFiles() throws Exception {
         service.createObjective("room", objective("a", "300000"));
-        for (String table : List.of("summaries", "channel_reveals", "agent_channel", "objectives")) store.execute("DROP TABLE " + table);
+        service.utter("room", V2ContractTest.utterance("a", 0, "kept across the migration"));
+        for (String table : List.of("retained_profiles", "summaries", "channel_reveals", "agent_channel", "objectives")) store.execute("DROP TABLE " + table);
+        for (String column : List.of("reviewed_text", "reviewed_speaker_id", "reviewed_ms")) store.execute("ALTER TABLE utterances DROP COLUMN " + column);
         store.execute("PRAGMA user_version=5");
         store.close(); store = new Store(temp.resolve("room.sqlite"));
-        try (var p = store.prepare("PRAGMA user_version"); var r = p.executeQuery()) { assertEquals(6, r.getInt(1)); }
-        for (String table : List.of("summaries", "channel_reveals", "agent_channel", "objectives")) assertEquals(0, count(table));
+        try (var p = store.prepare("PRAGMA user_version"); var r = p.executeQuery()) { assertEquals(7, r.getInt(1)); }
+        for (String table : List.of("retained_profiles", "summaries", "channel_reveals", "agent_channel", "objectives")) assertEquals(0, count(table));
+        var row = store.utterances("room", 0, 100, 0).get(0);
+        assertEquals("kept across the migration", row.path("text").asText()); assertTrue(row.path("original_text").isNull()); assertTrue(row.path("reviewed_ms").isNull());
         service = new SpeakerService(store, new SpeakerServiceTest.FakeEngine(), clock, PrivacyTestSupport.POLICY);
         assertEquals(1, service.createObjective("room", objective("a", "300000")).path("version").asLong());
-        store.execute("PRAGMA user_version=7");
+        store.execute("PRAGMA user_version=8");
         store.close();
         assertThrows(IllegalStateException.class, () -> new Store(temp.resolve("room.sqlite")));
         store = new Store(temp.resolve("fresh.sqlite"));

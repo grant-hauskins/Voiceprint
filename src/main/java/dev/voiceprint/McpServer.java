@@ -169,7 +169,7 @@ final class McpServer {
         var sessions = tool("list_sessions", "List recent Voiceprint sessions (newest first) with status and enrolled participants. Call first to find a session_id.", true);
         ((ObjectNode) sessions.path("inputSchema").path("properties")).set("limit", Json.obj().put("type", "integer").put("minimum", 1).put("maximum", 200));
         result.add(sessions);
-        var transcript = tool("get_transcript", "Get the attributed transcript as compact lines '#id m:ss.s-m:ss.s Name [label]: words'. Labels high/medium/low are similarity-based, NOT calibrated probabilities; 'OVERLAP A+B' lines are people talking over each other and their words cannot be attributed. Agent labels are declared by their registered producer. Pass after_id from the previous call to fetch only new lines; min_label=high returns high human labels and all agent lines.", true, "session_id");
+        var transcript = tool("get_transcript", "Get the attributed transcript as compact lines '#id m:ss.s-m:ss.s Name [label]: words'. Labels high/medium/low are similarity-based, NOT calibrated probabilities; 'OVERLAP A+B' lines are people talking over each other and their words cannot be attributed. Agent labels are declared by their registered producer; a 'reviewed' label means the operator corrected the speaker or wording of that line. Pass after_id from the previous call to fetch only new lines; min_label=high returns high human labels and all agent and reviewed lines.", true, "session_id");
         ObjectNode tp = (ObjectNode) transcript.path("inputSchema").path("properties");
         ObjectNode minLabel = Json.obj().put("type", "string");
         minLabel.putArray("enum").add("high").add("medium").add("low");

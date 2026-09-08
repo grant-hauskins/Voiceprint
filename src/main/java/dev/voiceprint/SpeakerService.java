@@ -30,6 +30,8 @@ final class SpeakerService {
         buffers.remove(session); failures.remove(session); notifyAll(); destructionWakeup.run(); return result;
     }
     synchronized ObjectNode destructionStatus(String session) { return privacy.destruction(session); }
+    synchronized ObjectNode retainedProfiles() { return privacy.retainedProfiles(); }
+    synchronized ObjectNode deleteRetainedProfile(String subjectKey) { return privacy.deleteRetainedProfile(subjectKey); }
     synchronized void requireConsent(String session, String scope) { privacy.require(session, scope); }
     synchronized void setDestructionWakeup(Runnable wakeup) { destructionWakeup = wakeup; }
     synchronized void sweepPrivacy() {
@@ -77,14 +79,20 @@ final class SpeakerService {
         privacy.require(session, "local_processing");
         return store.transaction(() -> {
             store.execute("INSERT INTO sessions(id,status,created_ms) VALUES(?,'active',?)", session, clock.millis());
+            var seeded = Json.arr();
             for (int i = 0; i < participants.size(); i++) {
-                var p = participants.get(i); var result = results.get(i); String vector = Store.vectorJson(Audio.normalize(result.embedding()));
-                store.execute("INSERT INTO profiles VALUES(?,?,?,?,?,?)", session, p.get("id").asText(), p.get("name").asText(), result.modelId(), vector, vector);
-                store.execute("INSERT INTO participants VALUES(?,?,?,'human',NULL,?)", session, p.get("id").asText(), p.get("name").asText(), result.modelId());
-                privacy.linkOpening(session, p.get("id").asText(), audio.get(i));
+                var p = participants.get(i); var result = results.get(i); String id = p.get("id").asText();
+                double[] enrollment = Audio.normalize(result.embedding());
+                // A retaining person's earlier voiceprint starts this room's profile; anchor and vector both begin from the blend.
+                double[] start = privacy.seed(privacy.retainer(session, id), result.modelId(), enrollment);
+                String vector = Store.vectorJson(start == null ? enrollment : start);
+                store.execute("INSERT INTO profiles VALUES(?,?,?,?,?,?)", session, id, p.get("name").asText(), result.modelId(), vector, vector);
+                store.execute("INSERT INTO participants VALUES(?,?,?,'human',NULL,?)", session, id, p.get("name").asText(), result.modelId());
+                privacy.linkOpening(session, id, audio.get(i));
+                seeded.add(Json.obj().put("id", id).put("profile_seeded", start != null));
             }
             return Json.obj().put("session_id", session).put("profiles_created", participants.size()).put("status", "ready")
-                .put("confidence_kind", "uncalibrated").put("chunk_ms", 250).put("context_ms", 1500);
+                .put("confidence_kind", "uncalibrated").put("chunk_ms", 250).put("context_ms", 1500).set("participants", seeded);
         });
     }
 
@@ -566,32 +574,81 @@ final class SpeakerService {
         store.session(session);
         String segmentId = Json.id(request, "segment_id"), actual = Json.id(request, "actual_speaker");
         if (store.profiles(session).stream().noneMatch(p -> p.id().equals(actual))) throw new ApiException(404, "speaker_not_found", "Speaker is not enrolled in this session.");
-        return store.transaction(() -> {
-            try (var q = store.prepare("SELECT body,embedding,eligible FROM segments WHERE session_id=? AND id=?", session, segmentId); var r = q.executeQuery()) {
-                if (!r.next()) throw new ApiException(404, "segment_not_found", "Segment is not in this session.");
-                ObjectNode body = (ObjectNode) Json.parse(r.getString(1)); String embedding = r.getString(2); boolean eligible = r.getBoolean(3);
-                String previous = body.path("speaker_id").isNull() ? null : body.path("speaker_id").asText();
-                if (actual.equals(previous) && body.path("source").asText().equals("human_correction"))
-                    return Json.obj().put("correction_logged", false).put("already_applied", true).put("profile_updated", false).set("attribution", body);
-                store.execute("INSERT INTO corrections(session_id,segment_id,previous_speaker,actual_speaker,created_ms,profile_updated) VALUES(?,?,?,?,?,?)",
-                    session, segmentId, previous, actual, clock.millis(), eligible);
-                if (eligible) {
-                    store.execute("INSERT INTO correction_examples VALUES(?,?,?,?) ON CONFLICT(segment_id) DO UPDATE SET speaker_id=excluded.speaker_id,embedding=excluded.embedding", segmentId, session, actual, embedding);
-                    store.rebuildProfiles(session);
-                }
-                // Preserve model score and original identity; a human label does not calibrate the model.
-                if (!body.has("original_confidence")) body.set("original_confidence", body.get("confidence"));
-                body.put("speaker_id", actual).put("source", "human_correction").put("corrected_at_ms", clock.millis())
-                    .putNull("confidence").put("confidence_kind", "human_label").put("trusted", false).put("uncertain", true);
-                store.execute("UPDATE segments SET speaker_id=?,body=? WHERE id=?", actual, body.toString(), segmentId);
-                var response = Json.obj().put("correction_logged", true).put("profile_updated", eligible)
-                    .put("profile_update_reason", eligible ? "clean_speech_example" : "segment_not_verified_as_single_speaker");
-                return response.set("attribution", body);
+        return store.transaction(() -> correctSegment(session, segmentId, actual));
+    }
+    /** Inside a transaction: one segment's human correction, its example when the audio was verified single-speaker, and the profile rebuild. */
+    private ObjectNode correctSegment(String session, String segmentId, String actual) throws java.sql.SQLException {
+        try (var q = store.prepare("SELECT body,embedding,eligible FROM segments WHERE session_id=? AND id=?", session, segmentId); var r = q.executeQuery()) {
+            if (!r.next()) throw new ApiException(404, "segment_not_found", "Segment is not in this session.");
+            ObjectNode body = (ObjectNode) Json.parse(r.getString(1)); String embedding = r.getString(2); boolean eligible = r.getBoolean(3);
+            String previous = body.path("speaker_id").isNull() ? null : body.path("speaker_id").asText();
+            if (actual.equals(previous) && body.path("source").asText().equals("human_correction"))
+                return Json.obj().put("correction_logged", false).put("already_applied", true).put("profile_updated", false).set("attribution", body);
+            store.execute("INSERT INTO corrections(session_id,segment_id,previous_speaker,actual_speaker,created_ms,profile_updated) VALUES(?,?,?,?,?,?)",
+                session, segmentId, previous, actual, clock.millis(), eligible);
+            if (eligible) {
+                store.execute("INSERT INTO correction_examples VALUES(?,?,?,?) ON CONFLICT(segment_id) DO UPDATE SET speaker_id=excluded.speaker_id,embedding=excluded.embedding", segmentId, session, actual, embedding);
+                store.rebuildProfiles(session);
             }
+            // Preserve model score and original identity; a human label does not calibrate the model.
+            if (!body.has("original_confidence")) body.set("original_confidence", body.get("confidence"));
+            body.put("speaker_id", actual).put("source", "human_correction").put("corrected_at_ms", clock.millis())
+                .putNull("confidence").put("confidence_kind", "human_label").put("trusted", false).put("uncertain", true);
+            store.execute("UPDATE segments SET speaker_id=?,body=? WHERE id=?", actual, body.toString(), segmentId);
+            var response = Json.obj().put("correction_logged", true).put("profile_updated", eligible)
+                .put("profile_update_reason", eligible ? "clean_speech_example" : "segment_not_verified_as_single_speaker");
+            return response.set("attribution", body);
+        }
+    }
+    /**
+     * Operator review of one transcript row (docs/API.md, V3.1): the reviewed text and speaker sit beside the originals, and a
+     * speaker change corrects every segment inside the row's span through the same path as POST /correct, which is the in-session model improvement.
+     */
+    synchronized ObjectNode reviewUtterance(String session, long utteranceId, JsonNode request) {
+        privacy.require(session, "local_processing");
+        store.session(session);
+        String text = request.has("text") && !request.get("text").isNull() ? Json.text(request, "text", 4000) : null;
+        String speaker = request.has("speaker_id") && !request.get("speaker_id").isNull() ? Json.id(request, "speaker_id") : null;
+        if (text == null && speaker == null) throw new ApiException(400, "invalid_input", "Supply text, speaker_id or both.");
+        String source, original, current; long start, end;
+        try (var q = store.prepare("SELECT source,speaker_id,reviewed_speaker_id,start_ms,end_ms FROM utterances WHERE session_id=? AND id=?", session, utteranceId); var r = q.executeQuery()) {
+            if (!r.next()) throw new ApiException(404, "utterance_not_found", "Utterance is not in this session.");
+            source = r.getString(1); original = r.getString(2); current = r.getString(3) == null ? original : r.getString(3); start = r.getLong(4); end = r.getLong(5);
+        } catch (java.sql.SQLException e) { throw new IllegalStateException(e); }
+        if (speaker != null) {
+            if (source.equals("agent")) throw new ApiException(400, "invalid_input", "An agent row's attribution is declared by its producer; review its text only.");
+            if (store.profiles(session).stream().noneMatch(p -> p.id().equals(speaker))) {
+                boolean agent = store.participants(session).findValuesAsText("id").contains(speaker);
+                throw new ApiException(agent ? 400 : 404, agent ? "invalid_participant" : "speaker_not_found", "speaker_id must be a human enrolled in this session.");
+            }
+        }
+        boolean changed = speaker != null && !speaker.equals(current);
+        ObjectNode result = store.transaction(() -> {
+            long now = clock.millis(); int corrected = 0; boolean profileUpdated = false;
+            store.reviewUtterance(session, utteranceId, text, speaker, now);
+            if (changed) {
+                var segments = new ArrayList<String>();
+                // Segment spans are 250 ms from sequence*250; the stored body is the authority on the span.
+                try (var q = store.prepare("SELECT id,body FROM segments WHERE session_id=? AND sequence*250>=? AND sequence*250<? ORDER BY sequence", session, start, end); var r = q.executeQuery()) {
+                    while (r.next()) { var body = Json.parse(r.getString(2)); if (body.path("start_ms").asLong() >= start && body.path("end_ms").asLong() <= end) segments.add(r.getString(1)); }
+                }
+                for (String segment : segments) {
+                    var outcome = correctSegment(session, segment, speaker);
+                    if (outcome.path("correction_logged").asBoolean()) corrected++;
+                    profileUpdated |= outcome.path("profile_updated").asBoolean();
+                }
+            }
+            var row = store.utterance(session, utteranceId);
+            store.event(session, now, "utterance_reviewed", row);
+            return row.put("session_id", session).put("segments_corrected", corrected).put("profile_updated", profileUpdated);
         });
+        notifyAll();
+        return result;
     }
 
     synchronized ObjectNode end(String session) {
+        // Retaining people take their final in-session voiceprint with them before the room's graph is scheduled for destruction.
+        privacy.retainProfiles(session);
         privacy.schedule(session, "purpose_completed", null);
         buffers.remove(session); failures.remove(session);
         notifyAll(); destructionWakeup.run();
