@@ -91,7 +91,7 @@ async function main() {
 
   // Launcher-started runtime: bootstrap hands over the token, the page drives setup, enrollment, start and stop.
   const runtimeCalls = [];
-  let phase = "setup", awaiting = null, sessionId = null, reviewedVendors = {openai_reviewed:false, cloudflare_reviewed:true};
+  let phase = "setup", awaiting = null, sessionId = null, reviewedVendors = {openai_reviewed:false, cloudflare_reviewed:true}, consentGranted = false;
   const runtimeFetcher = async (url, options) => {
     runtimeCalls.push({url, options});
     let data = {};
@@ -104,15 +104,16 @@ async function main() {
     else if (url === "http://127.0.0.1:8123/enrollment/record") { awaiting = null; phase = "ready"; }
     else if (url === "http://127.0.0.1:8123/start") phase = "live";
     else if (url === "http://127.0.0.1:8123/stop") phase = "ended";
+    else if (url === "http://127.0.0.1:8123/agents/Ava/control") data = {ok:true, agent:{}};
     else if (url === "/privacy/notice") data = {configured:true,controller_name:"Test Controller",controller_address:"Test address",controller_email:"test@example.invalid",notice_text:"Synthetic",notice_sha256:"h",retention_text:"r",vendors:reviewedVendors,policy_version:"t",consent_method_version:"t"};
     else if (url === "/speaker/sessions?limit=100") data = {sessions:[]};
     else if (url === "/privacy/rooms") data = {rooms:[]};
-    else if (url.endsWith("/consent")) data = {session_id:"room_auto",state:"pending",allowed:false,participants:[]};
+    else if (url.endsWith("/consent")) data = {session_id:"room_auto",state:consentGranted ? "active" : "pending",allowed:consentGranted,scopes:{openai_audio:true, hosted_mcp:true},participants:[]};
     return {ok:true,status:200,json:async()=>data};
   };
   const launched = new Console(new Document(), runtimeFetcher, {hostname:"127.0.0.1",protocol:"http:",search:"?control=8123"});
-  assert.equal(launched.control, "http://127.0.0.1:8123");
-  assert.equal(new Console(new Document(), runtimeFetcher, {hostname:"127.0.0.1",protocol:"http:",search:"?control=evil"}).control, "http://127.0.0.1:8090");
+  assert.equal(launched.controlUrl, "http://127.0.0.1:8123");
+  assert.equal(new Console(new Document(), runtimeFetcher, {hostname:"127.0.0.1",protocol:"http:",search:"?control=evil"}).controlUrl, "http://127.0.0.1:8090");
   await launched.bootstrap(); assert.equal(launched.token, "launcher_token");
   await launched.pollRuntime();
   assert.equal(launched.$("phase").textContent, "setup"); assert(!launched.$("setup-form").hidden); assert(!launched.$("key-label").hidden);
@@ -175,6 +176,12 @@ async function main() {
   assert.match(walk(cards[0]).find(e => e.className === "orb").style, /--h:\d+/);
   assert.notEqual(walk(cards[0]).find(e => e.className === "orb").style, walk(cards[1]).find(e => e.className === "orb").style);   // unique gradient per agent
   assert.equal(walk(cards[0]).filter(e => e.tagName === "button").length, 3);
+  // Regression: the runtime URL property used to shadow control(), so no card button ever sent a request.
+  const holdButton = walk(cards[0]).filter(e => e.tagName === "button")[1]; assert.match(holdButton.textContent, /Hold/);
+  consentGranted = true; await holdButton.listeners.click();
+  const holdRequest = runtimeCalls.find(c => c.url === "http://127.0.0.1:8123/agents/Ava/control");
+  assert(holdRequest, "Hold must POST to the runtime control endpoint"); assert.equal(holdRequest.options.method, "POST");
+  assert.deepEqual(JSON.parse(holdRequest.options.body), {action:"hold"}); assert.equal(holdRequest.options.headers.Authorization, "Bearer launcher_token");
   assert.match(launched.$("stop-runtime").textContent, /End conversation/);
   await launched.runtimeAction("/stop"); assert.equal(launched.$("phase").textContent, "ended"); assert(launched.$("stop-runtime").hidden);
   const manual = new Console(new Document(), async (url) => { if (url.endsWith("/bootstrap")) throw new Error("no runtime"); return {ok:true,status:200,json:async()=>({})}; }, {hostname:"127.0.0.1",protocol:"http:"});
