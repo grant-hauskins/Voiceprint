@@ -115,6 +115,19 @@ def score(run_id, rows, truth=None, names=None):
     playback_duplicates = 0
     server_bytes = []
     server_calls = set()
+    # V3 arbitration kinds (docs/EVENTS.md): operational counts only, never channel text or constraint values.
+    arbitrator_rows = 0
+    generations = ingested_rows = 0
+    posts = Counter()
+    post_redactions = 0
+    overrides = Counter()
+    open_claims = 0
+    unclaimed_confirmations = 0
+    guard_rows = 0
+    spoken_cuts = 0
+    stage_redactions = Counter()
+    summary_state = {"saved": False, "attempts": None, "board_rows": None, "transcript_rows": None,
+                     "skipped_reason": None, "failed": False}
 
     def agent_state(name):
         return agents.setdefault(name, {"replies": 0, "replies_with_fresh_result": 0, "get_transcript_calls": 0,
@@ -243,6 +256,47 @@ def score(run_id, rows, truth=None, names=None):
         if isinstance(call, dict) and call.get("call_id") not in server_calls:
             server_calls.add(call.get("call_id"))
             server_bytes.append(call.get("bytes"))
+        arbitrator = row.get("arbitrator")
+        if isinstance(arbitrator, dict):
+            arbitrator_rows += 1
+            action = arbitrator.get("action")
+            # Counters are cumulative on the row, so the largest value seen is the run total.
+            if number(arbitrator.get("generations")):
+                generations = max(generations, arbitrator["generations"])
+            if number(arbitrator.get("ingested_rows")):
+                ingested_rows = max(ingested_rows, arbitrator["ingested_rows"])
+            if action == "posted":
+                if arbitrator.get("tier") in ("board", "raw"):
+                    posts[arbitrator["tier"]] += 1
+                if number(arbitrator.get("redactions")):
+                    post_redactions += arbitrator["redactions"]
+            elif action == "override_claimed":
+                overrides["claimed"] += 1
+                open_claims += 1
+            elif action in ("override_confirmed", "override_rejected"):
+                overrides[action.removeprefix("override_")] += 1
+                # Each verdict consumes one earlier claim; a verdict with none open is self-judged.
+                if open_claims:
+                    open_claims -= 1
+                elif action == "override_confirmed":
+                    unclaimed_confirmations += 1
+        guard = row.get("guard")
+        if isinstance(guard, dict):
+            guard_rows += 1
+            if guard.get("action") == "cut" and guard.get("stage") == "spoken_delta":
+                spoken_cuts += 1
+            if number(guard.get("redactions")):
+                stage_redactions[guard.get("stage")] += guard["redactions"]
+        summary = row.get("summary")
+        if isinstance(summary, dict):
+            action = summary.get("action")
+            summary_state["saved"] |= action == "saved"
+            summary_state["failed"] |= action == "failed"
+            if action == "skipped" and summary.get("reason"):
+                summary_state["skipped_reason"] = summary["reason"]
+            for field in ("attempts", "board_rows", "transcript_rows"):
+                if number(summary.get(field)):
+                    summary_state[field] = max(summary_state[field] or 0, summary[field])
 
     # A strict order is available for a response only if its first audio event was logged.
     for agent, state in agents.items():
@@ -311,6 +365,21 @@ def score(run_id, rows, truth=None, names=None):
         warnings.append("No API MCP call records in this log: provider tool events are not independent server-side proof.")
     if any(not number(offset) for offset in playback_starts.values()) or not playback_starts:
         warnings.append("Some or all replies lack audio-timeline playback timestamps: overlap timing has incomplete coverage.")
+    generation_ratio = fraction(generations, ingested_rows)
+    if arbitrator_rows and generation_ratio["ratio"] is not None and generation_ratio["ratio"] >= 1.0:
+        warnings.append("Arbitrator generated on every ingested row: BUILD_SPEC_V3 §5.1 expects far fewer generations than lines.")
+    if unclaimed_confirmations:
+        warnings.append("Override confirmed without a recorded claim")
+    if summary_state["failed"]:
+        warnings.append("A summary attempt failed: check that End conversation blocked on the write (BUILD_SPEC_V3 §6).")
+    if spoken_cuts:
+        warnings.append(f"Advocate speech was cut by the leak guard {spoken_cuts} times: audio before the cut may have been heard.")
+    arbitrator_summary = {"generations": generations, "ingested_rows": ingested_rows, "generation_ratio": generation_ratio,
+                          "posts": {"board": posts["board"], "raw": posts["raw"]}, "post_redactions": post_redactions,
+                          "overrides": {"claimed": overrides["claimed"], "confirmed": overrides["confirmed"], "rejected": overrides["rejected"]}}
+    guard_summary = {"spoken_cuts": spoken_cuts, "stored_utterance_redactions": stage_redactions["stored_utterance"],
+                     "board_redactions": stage_redactions["board"], "raw_redactions": stage_redactions["raw"],
+                     "summary_redactions": stage_redactions["summary"], "events": guard_rows}
     return {"schema_version": 1, "run_id": run_id, "session_ids": sorted(sessions), "rows": len(rows),
             "provider_sessions": provider_events["session.created"], "configured_sessions": configured,
             "responses_started": len(started), "responses_done": len(completed), "pending_responses": len(started - completed),
@@ -321,7 +390,22 @@ def score(run_id, rows, truth=None, names=None):
             "server_mcp_response_bytes": distribution(server_bytes), "provider_tool_latency_ms": distribution(tool_latencies),
             "capture_end_to_response_ms": distribution(capture_latencies), "inference_ms": distribution(inference_latencies),
             "reply_evidence": [{key: value for key, value in reply.items() if key != "transcripts"} for reply in responses.values()],
-            "tool_evidence": list(tools.values()), "warnings": warnings}
+            "tool_evidence": list(tools.values()), "arbitrator": arbitrator_summary, "guard": guard_summary,
+            "summary": summary_state, "warnings": warnings}
+
+
+def describe_summary(summary):
+    """One clause for the summarizer's outcome; identical wording in the aggregate and Markdown views."""
+    if summary["saved"]:
+        attempts = summary["attempts"]
+        counts = f" ({summary['board_rows']} board rows, {summary['transcript_rows']} transcript rows)" if number(summary["board_rows"]) and number(summary["transcript_rows"]) else ""
+        return f"saved after {attempts} attempt{'' if attempts == 1 else 's'}{counts}" if number(attempts) else f"saved{counts}"
+    if summary["skipped_reason"]:
+        return f"skipped ({summary['skipped_reason']})"
+    if summary["failed"]:
+        attempts = summary["attempts"]
+        return f"failed after {attempts} attempt{'' if attempts == 1 else 's'}" if number(attempts) else "failed"
+    return "not recorded"
 
 
 def render_markdown(result):
@@ -346,19 +430,32 @@ def render_markdown(result):
         lines += ["", "| Ground truth metric | Result |", "|---|---|"]
         lines.extend(f"| {name} attribution | {ratio(value)} |" for name, value in truth["per_speaker"].items())
         lines.extend(f"| {key} | {ratio(truth[key])} |" for key in ("overlap_precision", "overlap_recall", "named_agent_handoffs"))
+    arbitrator, guard = result["arbitrator"], result["guard"]
+    lines += ["", "| Arbitration | Result |", "|---|---|",
+              f"| Arbitrator generations / ingested rows | {ratio(arbitrator['generation_ratio'])} |",
+              f"| Arbitrator posts (board / raw) | {arbitrator['posts']['board']} / {arbitrator['posts']['raw']} ({arbitrator['post_redactions']} redactions) |",
+              f"| Overrides (claimed / confirmed / rejected) | {arbitrator['overrides']['claimed']} / {arbitrator['overrides']['confirmed']} / {arbitrator['overrides']['rejected']} |",
+              f"| Guard spoken cuts | {guard['spoken_cuts']} |",
+              f"| Guard redactions (stored / board / raw / summary) | {guard['stored_utterance_redactions']} / {guard['board_redactions']} / {guard['raw_redactions']} / {guard['summary_redactions']} |",
+              f"| Summary | {describe_summary(result['summary'])} |"]
     lines += ["", *["- " + warning for warning in result["warnings"]]]
     return "\n".join(lines)
 
 
 def aggregate(result):
-    """Allowlisted operational counts; excludes room/subject/event IDs and biometric metrics."""
+    """Allowlisted operational counts; excludes room/subject/event IDs, biometric metrics and all channel/summary text.
+
+    The v3 blocks (arbitrator, guard, summary) are counts plus the summary skip-reason enum; copied through as-is.
+    """
     agents = {}
     for index, agent in enumerate(result["agents"].values(), 1):
         agents[f"Agent {index}"] = {key: agent[key] for key in
             ("replies", "get_transcript_calls", "failed_tool_calls", "tool_before_reply", "reply_timing_missing", "tokens")}
-    return {"schema_version": 2, "scope": "operational_aggregate", "agents": agents,
+    return {"schema_version": 3, "scope": "operational_aggregate", "agents": agents,
             "floor_violations": result["floor"]["violations"],
-            "server_mcp_call_samples": result["server_mcp_response_bytes"]["n"]}
+            "server_mcp_call_samples": result["server_mcp_response_bytes"]["n"],
+            "arbitrator": {key: dict(value) if isinstance(value, dict) else value for key, value in result["arbitrator"].items()},
+            "guard": dict(result["guard"]), "summary": dict(result["summary"])}
 
 
 def render_aggregate(result):
@@ -370,6 +467,16 @@ def render_aggregate(result):
     violations = result["floor_violations"]
     lines.append("Played-audio floor violations: " + (str(violations) if violations is not None else "NA (incomplete playback evidence)") + ".")
     lines.append(f"Independent server MCP samples: {result['server_mcp_call_samples']}.")
+    arbitrator, guard = result["arbitrator"], result["guard"]
+    ratio = arbitrator["generation_ratio"]["ratio"]
+    lines.append(f"Arbitrator: {arbitrator['generations']} generations over {arbitrator['ingested_rows']} ingested rows "
+                 f"(ratio {f'{ratio:.3f}' if ratio is not None else 'NA'}); "
+                 f"posts board {arbitrator['posts']['board']} raw {arbitrator['posts']['raw']}; "
+                 f"overrides {arbitrator['overrides']['claimed']} claimed, {arbitrator['overrides']['confirmed']} confirmed, "
+                 f"{arbitrator['overrides']['rejected']} rejected.")
+    lines.append(f"Guard: {guard['spoken_cuts']} spoken cuts; redactions stored {guard['stored_utterance_redactions']}, "
+                 f"board {guard['board_redactions']}, raw {guard['raw_redactions']}, summary {guard['summary_redactions']}.")
+    lines.append(f"Summary: {describe_summary(result['summary'])}.")
     return "\n".join(lines)
 
 
