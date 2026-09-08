@@ -4,7 +4,17 @@ Build plan for `docs/BUILD_SPEC_V3.md`, grounded by the 2026-09-07 grounding ver
 
 **Status after the 2026-09-08 build (branch `worktree-v3-arbitration`):** everything below is built and unit-tested (Java 49, scripts 127, worker 13, web 4). Not done: the manual live smoke (two people, provider key, tunnel) and Grant's answers to the five questions, each of which has a reversible default in place. Contract: the "V3 arbitration contract" section of `docs/API.md`. Conventions carry over from `docs/V2_STREAMS.md`: contract first, one concern per commit, commit prefixes `[api] [agent] [gui] [eval] [contract] [docs]`, every stream green before merge, no invented probabilities, labels stay `similarity_based_uncalibrated`.
 
-## Decisions made in Grant's absence (reversible; flagged for review)
+## Grant's answers (2026-09-08) and what changed
+
+| # | Grant's answer | Applied as |
+|---|---|---|
+| 1 | Add transcript review, a way to improve the models and voice profiles consenting people keep across sessions; tolerant name matching (said "Ryan", transcript wrote "Brian", Ryan's agent stayed silent). | V3.1 contract in `docs/API.md`: utterance review endpoint feeding the existing segment correction (in-session model improvement), `retained_profiles` with a per-person `voice_profile_retention` release, fuzzy addressing in `turn_gate`. |
+| 2 | Data to disk is fine. | Summary written to `data/summaries/<session>.md` by default as well as the API record. The raw event-log ban stays until Grant says otherwise. |
+| 3 | Advocate-voice leak accepted as residual risk for v3. | Recorded as Grant's decision; mitigations unchanged. |
+| 4 | Make it clear in the privacy notice that data can be transmitted to other providers. | Provider-neutral notice text with a configured provider list (`VOICEPRINT_PROVIDERS`); console wording matched. |
+| 5 | Kyle will not take part in a demo without an ownership share. | No second person for the live smoke yet; nothing in code. |
+
+## Decisions made in Grant's absence (superseded by the answers above where they overlap)
 
 `HANDOFF_PROMPT.md` §E lists five questions to ask Grant. The build ran unattended, so each got a default. Reverse any of them and the affected code is small and named.
 

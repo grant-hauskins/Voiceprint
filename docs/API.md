@@ -227,3 +227,42 @@ Behavior on a catch: **redact in place** for channel/board/summary text (the row
 - `POST /setup`: accepts `conversation_type` and per-agent `role`. `negotiation` requires 2–4 humans, exactly two `voice` agents with distinct `speaks_for` values (the advocates) and exactly one `arbitrator`; an arbitrator is rejected in `casual`.
 - `POST /agents/{name}/control` for an arbitrator: `speak` = generate a contribution now, `hold` = pause/resume posting, `cancel` = drop any pending override.
 - Arbitrator reads use the **local MCP HTTP endpoint** (`http://127.0.0.1:8082/mcp?participant_id=<arbitrator>` with the MCP bearer token), not REST, so its `get_transcript`/`get_agent_channel` calls appear in `mcp_calls` and the proof panel, and its channel reads carry the agent credential.
+
+## V3.1 contract: transcript review, retained voice profiles, provider-neutral notice (Grant's answers, 2026-09-08)
+
+Grant's answers to `docs/V3_STREAMS.md`'s five questions: (2) writing data to disk is fine, (3) the advocate-voice leak is an accepted residual risk for v3, (4) the notice must make clear that data can be transmitted to providers other than OpenAI, (5) no second person is available for a demo yet. Plus one new requirement: better transcript accuracy through review, a way to improve the models, voice profiles that consenting people keep across sessions, and tolerant name matching (a person said "Ryan", the transcript wrote "Brian", Ryan's agent never knew it was addressed).
+
+### Schema v7
+
+```sql
+ALTER TABLE utterances ADD COLUMN reviewed_text TEXT;
+ALTER TABLE utterances ADD COLUMN reviewed_speaker_id TEXT;
+ALTER TABLE utterances ADD COLUMN reviewed_ms INTEGER;
+CREATE TABLE retained_profiles(subject_key TEXT PRIMARY KEY, subject_name TEXT NOT NULL, model TEXT NOT NULL, vector TEXT NOT NULL, sessions INTEGER NOT NULL DEFAULT 1, created_ms INTEGER NOT NULL, last_interaction_ms INTEGER NOT NULL, retention_deadline_ms INTEGER NOT NULL);
+```
+
+`subject_key = sha256(casefold(trimmed full name) + "\n" + casefold(trimmed contact))`, hex: the same operator-entered, unverified identity the release already records. `retained_profiles` has no session foreign key; it is a separate retention class with its own deadline and is never touched by session destruction.
+
+### Transcript review (operator, during the room)
+
+`POST /speaker/session/{id}/utterances/{utterance_id}/review` with `{"text":"...","speaker_id":"participant_2"}` (at least one field; `text` ≤ 4000; `speaker_id` an enrolled human of this session, refused for agent rows) returns 200 `{"utterance_id":42,"text":"...","speaker_id":"...","label":"reviewed","segments_corrected":3,"profile_updated":true}`. Effects, in one transaction: the review columns are set (`reviewed_ms` = now); when `speaker_id` is given and differs from the stored speaker, every segment of the session whose `[start_ms,end_ms)` lies inside the utterance's span receives the existing segment correction (a `corrections` row, a `correction_examples` row when the segment was verified single-speaker, `rebuildProfiles`), which is the in-session model improvement; an `utterance_reviewed` event carries the full updated utterance row. Requires operator token and room admission (`local_processing`); no browser Origin requirement (it is an operator edit, not a release).
+
+Utterance reads (`GET .../utterances`, `get_transcript`, events) present the reviewed values: `text` is the reviewed text when present (the original is returned as `original_text`, null when unreviewed), `speaker_id`/`speaker_name` are the reviewed speaker when present (`original_speaker_id` likewise), and `label` becomes `reviewed` when a speaker was reviewed (a human label, rank 4 like `agent`, so it survives every `min_label` filter; compact lines read `Name [reviewed]: words`). A text-only review keeps the acoustic label. `label_kind` stays `similarity_based_uncalibrated`; `reviewed` is a human label, not a calibrated one.
+
+### Retained voice profiles (per-person consent; improves across sessions)
+
+New optional release scope `voice_profile_retention`. Unlike the disclosure scopes it is **per person**, not room-wide: `GET .../consent` lists `retain_profile: true|false` on each participant and does not add a room-wide scope. Notice sentence: "Optional voice_profile_retention keeps your voiceprint (the enrollment embedding and its corrected updates, never audio or transcript) after this room ends so that later rooms you join start from it and refine it; it is kept until you withdraw it in the console or three years after your last session, whichever comes first, and it is deleted when you withdraw from a room."
+
+- **Seeding at enrollment** (`POST /speaker/session/init`): for each participant with `retain_profile` whose `subject_key` has a `retained_profiles` row with the same `model`, the stored profile anchor and vector become `normalize(0.5 × enrollment embedding + 0.5 × retained vector)`; the response's participants (add an array `participants:[{id,profile_seeded}]`) say which were seeded. A model mismatch ignores the retained row (it is not deleted).
+- **Update at purpose completion** (`POST .../end`, before destruction is scheduled): for each human with `retain_profile`, upsert the retained row from the session's final `profiles.vector`: `normalize(0.5 × retained + 0.5 × final)` when a row exists, else `final`; `sessions += 1`; `last_interaction_ms = now`; `retention_deadline_ms = now + 3 calendar years` (February 29 falls back to February 28, per `BIPA_V2.md`). Withdrawal (`.../consents/{pid}/revoke`), deletion requests and deadline expiry never write a retained profile; **a withdrawal additionally deletes the withdrawing person's retained profile** (`BIPA_V2.md`: do not keep a withdrawing person's voice).
+- `GET /privacy/profiles` (operator token) returns `{"profiles":[{subject_key,subject_name,model,sessions,created_ms,last_interaction_ms,retention_deadline_ms}]}`, never vectors. `DELETE /privacy/profiles/{subject_key}` (exact local browser Origin required, like consent writes: the person clicks it) returns `{"deleted":true}` or 404. The privacy sweeper deletes rows past their deadline. `PrivacyPolicy.retentionText()` gains one sentence describing this class.
+
+### Provider-neutral notice (answer 4)
+
+`noticeText()` no longer names OpenAI as the only recipient. The disclosure sentences say the audio, transcript and negotiation text go to "the AI provider(s) the operator has configured and reviewed (currently OpenAI Realtime and Responses through Cloudflare's tunnel; the operator may configure other providers such as xAI or Google Gemini under the same release)". Scope identifiers (`openai_audio`, `hosted_mcp`, `negotiation_text`) are unchanged for compatibility and the notice states that the `openai_` prefix is historical. `GET /privacy/notice` gains `"providers": [...]` from `VOICEPRINT_PROVIDERS` (comma-separated display names, default `OpenAI`), rendered into the notice text so the hash tracks the configured list. The console's release checkboxes use the same provider-neutral wording.
+
+### Runtime and console (answers 2 and 3; fuzzy addressing)
+
+- Answer 2: the closing summary is written **both** as the API record and as a file, by default `data/summaries/<session_id>.md` (directory created; `data/` is git-ignored); `--summary-file PATH` overrides the path and `--no-summary-file` disables the file. `docs/TURN_TAKING.md` §7's ban on raw event logs is unchanged: this answer covers the summary artifact only.
+- Answer 3: accepted residual risk; `docs/V3_STREAMS.md` records it as Grant's decision, not a default.
+- Fuzzy addressing: `turn_gate.addressed()` also matches a spoken token to an agent name when both are at least four characters and, after a light phonetic normalization (casefold; `y`→`i`; `ph`→`f`; `ck`→`k`; doubled letters collapsed), their `difflib` similarity ratio is ≥ 0.8 (so `brian` addresses `ryan`, `been` never addresses `ben`); the same rule applies to the "a line naming another agent is not an opening for me" check. When the match was inexact the pre-reply note appends one sentence naming the transcript's spelling, and the shared instruction layer tells every agent that the transcript may misspell or substitute a similar-sounding name. The console's transcript rows gain a Review control (edit text, pick the speaker) that calls the review endpoint, and the room step lists retained voiceprints with a per-person delete.
