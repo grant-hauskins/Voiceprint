@@ -2,7 +2,7 @@
 (function (global) {
   "use strict";
   const ID = /^[A-Za-z0-9_-]{1,80}$/;
-  const SAFE_LABELS = new Set(["high", "medium", "low", "unknown", "overlap", "agent"]);
+  const SAFE_LABELS = new Set(["high", "medium", "low", "unknown", "overlap", "agent", "reviewed"]);
   const terminal = state => ["revoked", "destroying", "destroyed", "legacy_blocked"].includes(state);
   const stamp = n => Number.isFinite(n) ? new Date(n).toLocaleTimeString() : "Time unavailable";
   const offset = n => Number.isFinite(n) ? `${Math.floor(n / 60000)}:${(n / 1000 % 60).toFixed(1).padStart(4, "0")}` : "—";
@@ -48,13 +48,66 @@
       runtime && runtime.session_id === session);
   }
   class Feed {
-    constructor(doc, transcript, calls, board) { this.doc = doc; this.transcript = transcript; this.calls = calls; this.board = board || doc.createElement("ol"); this.reset(); }
+    constructor(doc, transcript, calls, board) {
+      this.doc = doc; this.transcript = transcript; this.calls = calls; this.board = board || doc.createElement("ol");
+      // v3.1: the console attaches {allowed, humans, submit, fail} so a row can be reviewed; without it rows are read-only.
+      this.reviewer = null; this.reset();
+    }
     reset() {
-      this.cursor = 0; this.events = new Set(); this.utterances = new Set(); this.callIds = new Set(); this.boardIds = new Set();
+      this.cursor = 0; this.events = new Set(); this.utterances = new Set(); this.callIds = new Set(); this.boardIds = new Set(); this.rows = new Map();
       this.transcript.replaceChildren(node(this.doc, "li", "No utterances received.", "empty"));
       this.calls.replaceChildren(node(this.doc, "li", "No server calls received.", "empty"));
       this.board.replaceChildren(node(this.doc, "li", "No board lines received.", "empty"));
       this.lastCalls = new Map();
+    }
+    reviewed(data) { return data.original_text != null || data.original_speaker_id != null || data.label === "reviewed"; }
+    fillUtterance(li, data) {
+      // Renders (or re-renders in place) one transcript row from the API's utterance fields. Reviewed values are what
+      // the API now presents as text/speaker; the originals, when present, are shown struck through underneath.
+      const doc = this.doc, label = SAFE_LABELS.has(data.label) ? data.label : "unknown";
+      li.className = label; const meta = node(doc, "div", undefined, "meta");
+      meta.append(node(doc, "strong", data.speaker_name || data.speaker_id || "Unknown speaker"),
+        node(doc, "span", `${offset(data.start_ms)}–${offset(data.end_ms)}`), node(doc, "span", label, "chip"));
+      if (label !== "reviewed" && this.reviewed(data)) meta.append(node(doc, "span", "reviewed", "chip reviewed"));
+      if (Number.isFinite(data.similarity)) meta.append(node(doc, "span", `similarity ${data.similarity.toFixed(3)}`));
+      if (data.original_speaker_id != null) meta.append(node(doc, "span", `was: ${data.original_speaker_id}`, "was"));
+      li.replaceChildren(meta, node(doc, "p", data.text == null ? "Transcript omitted from this event." : data.text));
+      if (data.original_text != null) li.append(node(doc, "p", `was: ${data.original_text}`, "was"));
+      if (this.reviewer && this.reviewer.allowed()) {
+        const review = node(doc, "button", "Review", "ghost"); review.type = "button"; review.name = "review";
+        review.addEventListener("click", () => { review.disabled = true; this.reviewForm(li, data); }); li.append(review);
+      }
+      this.rows.set(data.utterance_id, {li, data});
+    }
+    reviewForm(li, data) {
+      // Inline edit under the row: text and/or speaker. Only changed fields are posted; the API is the authority on the result.
+      const doc = this.doc, form = node(doc, "form", undefined, "review-form"), humans = this.reviewer.humans(), agentRow = data.label === "agent";
+      const textLabel = node(doc, "label", "Corrected text"), text = node(doc, "input"); text.name = "review_text"; text.maxLength = 4000; text.autocomplete = "off"; text.value = data.text == null ? "" : String(data.text); textLabel.append(text);
+      const whoLabel = node(doc, "label", agentRow ? "Speaker (agent rows keep their speaker)" : "Speaker"), who = node(doc, "select"); who.name = "review_speaker"; who.disabled = agentRow;
+      const keep = node(doc, "option", "keep current"); keep.value = ""; who.append(keep);
+      for (const p of humans) { const option = node(doc, "option", p.name || p.id); option.value = p.id; who.append(option); }
+      who.value = !agentRow && humans.some(p => p.id === data.speaker_id) ? data.speaker_id : ""; whoLabel.append(who);
+      const save = node(doc, "button", "Save review"); save.type = "submit"; save.name = "review_save";
+      const cancel = node(doc, "button", "Cancel", "ghost"); cancel.type = "button"; cancel.name = "review_cancel";
+      cancel.addEventListener("click", () => this.fillUtterance(li, data));
+      form.append(textLabel, whoLabel, save, cancel);
+      form.addEventListener("submit", async e => {
+        e.preventDefault(); save.disabled = true;
+        try {
+          const body = {}, t = text.value.trim();
+          if (t !== (data.text == null ? "" : String(data.text))) { if (!t) throw new Error("Reviewed text cannot be empty."); body.text = t; }
+          if (!agentRow && who.value && who.value !== data.speaker_id) body.speaker_id = who.value;
+          if (!Object.keys(body).length) throw new Error("Change the text or the speaker before saving.");
+          const result = await this.reviewer.submit(data.utterance_id, body);
+          // The response carries only the reviewed fields; timing and the originals come from the row this page already holds.
+          const who2 = humans.find(p => p.id === result.speaker_id);
+          this.fillUtterance(li, {...data, ...result, utterance_id: data.utterance_id,
+            speaker_name: who2 ? who2.name : (result.speaker_id === data.speaker_id ? data.speaker_name : result.speaker_id),
+            original_text: data.original_text != null ? data.original_text : (body.text ? data.text : null),
+            original_speaker_id: data.original_speaker_id != null ? data.original_speaker_id : (body.speaker_id ? data.speaker_id : null)});
+        } catch (err) { save.disabled = false; this.reviewer.fail(err.message); }
+      });
+      li.append(form);
     }
     apply(page) {
       for (const event of Array.isArray(page.events) ? page.events : []) {
@@ -63,17 +116,14 @@
         if (this.events.has(event.event_id)) continue;
         this.events.add(event.event_id);
         const data = event.data || {};
-        if (event.type === "utterance" && data.utterance_id != null && !this.utterances.has(data.utterance_id)) {
+        const known = data.utterance_id != null && this.utterances.has(data.utterance_id);
+        if (event.type === "utterance_reviewed" && known) {
+          // A review updates the existing row in place; the event carries the full utterance row.
+          this.fillUtterance(this.rows.get(data.utterance_id).li, data);
+        } else if ((event.type === "utterance" || event.type === "utterance_reviewed") && data.utterance_id != null && !known) {
           if (!this.utterances.size) this.transcript.replaceChildren();
           this.utterances.add(data.utterance_id);
-          const label = SAFE_LABELS.has(data.label) ? data.label : "unknown";
-          const row = node(this.doc, "li", undefined, label);
-          const meta = node(this.doc, "div", undefined, "meta");
-          meta.append(node(this.doc, "strong", data.speaker_name || data.speaker_id || "Unknown speaker"),
-            node(this.doc, "span", `${offset(data.start_ms)}–${offset(data.end_ms)}`), node(this.doc, "span", label, "chip"));
-          if (Number.isFinite(data.similarity)) meta.append(node(this.doc, "span", `similarity ${data.similarity.toFixed(3)}`));
-          row.append(meta, node(this.doc, "p", data.text == null ? "Transcript omitted from this event." : data.text));
-          this.transcript.append(row);
+          const row = node(this.doc, "li"); this.fillUtterance(row, data); this.transcript.append(row);
         } else if (event.type === "mcp_call" && data.call_id != null && !this.callIds.has(data.call_id)) {
           if (!this.callIds.size) this.calls.replaceChildren();
           this.callIds.add(data.call_id);
@@ -107,8 +157,19 @@
       this.rawCursor = 0; this.rawIds = new Set(); this.rawRevealed = false; this.summaryFetched = ""; this.arbitratorSeen = new Map();
       // The launcher opens /ui?control=PORT when 8090 is busy on this computer; the origin stays the loopback API.
       const control = String(new URLSearchParams(location && location.search || "").get("control") || "");
-      this.control = `http://127.0.0.1:${/^\d{2,5}$/.test(control) ? control : "8090"}`;
+      this.controlUrl = `http://127.0.0.1:${/^\d{2,5}$/.test(control) ? control : "8090"}`;
       this.feed = new Feed(doc, this.$("transcript"), this.$("mcp-calls"), this.$("board"));
+      // v3.1: transcript review is an operator edit on an open room; the speaker choice is limited to this session's humans.
+      this.feed.reviewer = {
+        allowed: () => Boolean(this.token && this.session && this.consent && this.consent.allowed === true && !terminal(this.consent.state)),
+        humans: () => (this.people || []).filter(p => p && p.kind === "human" && ID.test(String(p.id))),
+        submit: (id, body) => this.request(this.path(`utterances/${encodeURIComponent(id)}/review`), {body}),
+        fail: message => this.say(message)
+      };
+    }
+    providers() {
+      const list = Array.isArray(this.notice && this.notice.providers) ? this.notice.providers.filter(p => typeof p === "string" && p.trim()) : [];
+      return `the AI provider(s) the operator has configured and reviewed (currently ${list.length ? list.join(", ") : "OpenAI"}; other providers such as xAI or Google Gemini may be configured under the same release)`;
     }
     $(id) { return this.doc.getElementById(id); }
     say(message) { this.$("message").textContent = message; }
@@ -119,7 +180,7 @@
         headers.Authorization = `Bearer ${this.token}`;
       }
       if (body !== undefined) headers["Content-Type"] = "application/json";
-      const response = await this.fetch((runtime ? this.control : "") + path,
+      const response = await this.fetch((runtime ? this.controlUrl : "") + path,
         {method: method || (body === undefined ? "GET" : "POST"), headers, body: body === undefined ? undefined : JSON.stringify(body), cache: "no-store", credentials: "omit", redirect: "error", signal: AbortSignal.timeout(12000)});
       let data;
       try { data = await response.json(); } catch (_) { throw new Error(`Service returned an invalid response (${response.status}).`); }
@@ -151,10 +212,10 @@
       const run = fn => async event => { event.preventDefault(); try { await fn(); } catch (e) { this.say(e.message); } };
       this.$("connect-form").addEventListener("submit", run(async () => {
         const token = this.$("token").value.trim(); this.disconnect(); this.token = token;
-        await this.loadNotice(); await this.loadRooms(); this.$("connection").textContent = "Operator connected"; this.say(""); this.renderStage();
+        await this.loadNotice(); await this.loadRooms(); await this.loadProfiles(); this.$("connection").textContent = "Operator connected"; this.say(""); this.renderStage();
       }));
       this.$("disconnect").addEventListener("click", () => { this.disconnect(); this.$("token").value = ""; });
-      this.$("refresh").addEventListener("click", run(() => this.loadRooms()));
+      this.$("refresh").addEventListener("click", run(async () => { await this.loadRooms(); await this.loadProfiles(); }));
       this.$("session-picker").addEventListener("change", run(() => this.open(this.$("session-picker").value)));
       this.$("open-form").addEventListener("submit", run(() => this.open(this.$("room-id").value.trim())));
       this.$("add-person").addEventListener("click", () => this.addPerson());
@@ -180,9 +241,30 @@
         const data = await this.request("/bootstrap", {runtime:true, publicRequest:true});
         if (data && typeof data.api_token === "string" && data.api_token) {
           this.disconnect(); this.token = data.api_token;
-          await this.loadNotice(); await this.loadRooms(); this.$("connection").textContent = "Operator connected (launcher)"; this.say("");
+          await this.loadNotice(); await this.loadRooms(); await this.loadProfiles(); this.$("connection").textContent = "Operator connected (launcher)"; this.say("");
         }
       } catch (_) { /* no launcher-started runtime: manual token entry remains available */ }
+    }
+    async loadProfiles() {
+      // Retained voiceprints are a separate retention class (per-person voice_profile_retention); the API never returns vectors.
+      const box = this.$("profiles"); if (!this.token) { box.replaceChildren(node(this.doc, "li", "Connect to list retained voiceprints.", "empty")); return; }
+      try {
+        const data = await this.request("/privacy/profiles"), profiles = Array.isArray(data.profiles) ? data.profiles : [];
+        box.replaceChildren();
+        if (!profiles.length) box.append(node(this.doc, "li", "No retained voiceprints. A person keeps one only by choosing voice_profile_retention in their release.", "empty"));
+        for (const p of profiles) {
+          if (typeof p.subject_key !== "string" || !p.subject_key) continue;
+          const li = node(this.doc, "li"), n = Number.isFinite(p.sessions) ? p.sessions : "?";
+          li.append(node(this.doc, "p", `${p.subject_name || "Unnamed"} · ${p.model || "unknown model"} · ${n} session${n === 1 ? "" : "s"} · last ${when(p.last_interaction_ms)} · kept until ${when(p.retention_deadline_ms)}`));
+          const remove = node(this.doc, "button", "Delete my retained voiceprint", "danger"); remove.type = "button"; remove.name = `delete-profile:${p.subject_key}`;
+          remove.addEventListener("click", async () => { remove.disabled = true; try { await this.deleteProfile(p.subject_key); } catch (e) { remove.disabled = false; this.say(e.message); } });
+          li.append(remove); box.append(li);
+        }
+      } catch (e) { box.replaceChildren(node(this.doc, "li", "Retained voiceprints unavailable.", "empty")); this.say(`Retained voiceprints unavailable: ${e.message}`); }
+    }
+    async deleteProfile(key) {
+      await this.request(`/privacy/profiles/${encodeURIComponent(key)}`, {method: "DELETE"});
+      this.say("Retained voiceprint deleted from the API."); await this.loadProfiles();
     }
     async pollRuntime() {
       if (!this.token || this.pollingRuntime) return;
@@ -337,7 +419,7 @@
       if (key === this.runtimeKey) return; this.runtimeKey = key;
       this.renderObjectives();
       const phase = r ? (r.phase || "live") : null;
-      this.$("phase").textContent = !this.token ? "Connect first" : !r ? `Runtime unavailable on ${this.control.slice(7)}` : phase;
+      this.$("phase").textContent = !this.token ? "Connect first" : !r ? `Runtime unavailable on ${this.controlUrl.slice(7)}` : phase;
       this.$("phase-detail").textContent = r && r.detail ? r.detail : !r && this.token ? "Start it with Voiceprint.cmd (or scripts\\dev.ps1 up) and this page will connect on its own." : "";
       this.$("mcp-url").textContent = r && r.mcp_url ? `Hosted MCP URL given to the provider: ${r.mcp_url}` : "";
       this.$("setup-form").hidden = phase !== "setup";
@@ -352,6 +434,8 @@
       for (const p of people) {
         const e = p.enrollment || {}, row = node(this.doc, "div", undefined, "person inline");
         row.append(node(this.doc, "strong", p.name), node(this.doc, "span", `${e.state || "pending"}${Number.isFinite(e.peak) ? ` · peak ${e.peak}${e.peak < 1500 ? " (too quiet)" : ""}` : ""}`, "chip"));
+        // Shown only when the runtime forwards the init response's profile_seeded flag (contract field); never inferred here.
+        if (e.profile_seeded === true) row.append(node(this.doc, "span", "seeded from retained voiceprint", "chip keeps"));
         if (phase === "enrollment") {
           const button = node(this.doc, "button", r.awaiting === p.id ? `Record ${p.name} now (8 s)` : "Waiting"); button.type = "button"; button.disabled = r.awaiting !== p.id;
           button.addEventListener("click", async () => { button.disabled = true; try { await this.recordParticipant(p.id); } catch (err) { this.say(err.message); } }); row.append(button);
@@ -373,6 +457,7 @@
       this.$("destruction").textContent = ""; this.$("room-id").value = "";
       this.$("token").value = ""; this.$("new-room-id").value = ""; this.$("new-roster").replaceChildren(); this.addPerson();
       this.$("openai-key").value = ""; this.runtimeKey = ""; this.gateForced = false; this.resetRoomState(); this.renderRuntime();
+      this.$("profiles").replaceChildren(node(this.doc, "li", "Connect to list retained voiceprints.", "empty"));
     }
     resetRoomState() {
       // Per-room memory that must not leak into the next room: objective version counters, reveal buttons, summary.
@@ -507,7 +592,8 @@
     }
     renderPerson(person) {
       const doc = this.doc, section = node(doc, "div", undefined, "person");
-      section.append(node(doc, "h3", `${person.name} · ${person.id}`));
+      const title = node(doc, "h3", `${person.name} · ${person.id}`); section.append(title);
+      if (person.retain_profile === true) title.append(node(doc, "span", "keeps voiceprint", "chip keeps"));
       if (person.bipa_consent_granted === true) {
         section.append(node(doc, "p", `Written release recorded ${stamp(person.consent_timestamp)}. Contact and signer identity are unverified.`));
         const revoke = node(doc, "button", "Withdraw release & stop entire room", "danger"); revoke.type = "button"; revoke.disabled = terminal(this.consent.state);
@@ -520,10 +606,13 @@
         const checkbox = (text) => { const label = node(doc, "label", undefined, "checkbox"), input = node(doc, "input"); input.type = "checkbox"; input.checked = false; label.append(input, node(doc, "span", text)); form.append(label); return input; };
         form.append(signatureLabel);
         const accept = checkbox("I personally reviewed the controller, purpose and retention notice above. I consent to the collection, storage and local processing of my voiceprint for this room and intend my typed name and this submission as my written electronic release."); accept.required = true;
-        const audio = checkbox("I also authorize disclosure of my voice audio to OpenAI for the room's voice agent features, as described in the notice.");
-        const mcp = checkbox("I also authorize hosted MCP disclosure of my named transcript and speaker attribution to OpenAI through Cloudflare, as described in the notice.");
-        const negotiation = checkbox("I also authorize negotiation_text disclosure: my typed negotiation objective is stored, given only to my own advocate agent, sent with the other objective, notes board and named transcript to OpenAI text models for the neutral arbitrator and the closing summary, and that summary is kept for 30 days.");
-        form.append(node(doc, "p", "The voice agents need the first two optional disclosures from every person in the room; negotiation rooms need all three from everyone. A release without them still counts locally, but the room then cannot use the agents and must be ended and re-signed.", "muted"));
+        // Provider-neutral wording (v3.1): the configured provider list comes from the notice; scope names keep their historical openai_ prefix.
+        const providers = this.providers();
+        const audio = checkbox(`I also authorize openai_audio disclosure of my voice audio to ${providers} for the room's voice agent features, as described in the notice. The openai_ prefix in the scope name is historical.`);
+        const mcp = checkbox(`I also authorize hosted_mcp disclosure of my named transcript and speaker attribution through Cloudflare to ${providers}, as described in the notice.`);
+        const negotiation = checkbox(`I also authorize negotiation_text disclosure: my typed negotiation objective is stored, given only to my own advocate agent, and sent with the other objective, notes board and named transcript to the text models of ${providers} for the neutral arbitrator and the closing summary; that summary is kept for 30 days.`);
+        const retention = checkbox("I also choose voice_profile_retention for myself. Optional voice_profile_retention keeps your voiceprint (the enrollment embedding and its corrected updates, never audio or transcript) after this room ends so that later rooms you join start from it and refine it; it is kept until you withdraw it in the console or three years after your last session, whichever comes first, and it is deleted when you withdraw from a room.");
+        form.append(node(doc, "p", "The voice agents need the first two optional disclosures from every person in the room; negotiation rooms need all three from everyone. A release without them still counts locally, but the room then cannot use the agents and must be ended and re-signed. Voice profile retention is each person's own choice and does not affect the room.", "muted"));
         const submit = node(doc, "button", "Participant: sign written release"); submit.type = "submit"; submit.disabled = !this.noticeReady;
         const feedback = node(doc, "p", "", "release-feedback"); feedback.setAttribute("role", "status");
         form.append(submit, feedback);
@@ -531,7 +620,7 @@
           e.preventDefault(); submit.disabled = true;
           try {
             if (!accept.checked || signature.value.trim() !== person.name) throw new Error("The participant must check the release and type their exact full name.");
-            await this.sign(person.id, signature.value.trim(), [audio.checked && "openai_audio", mcp.checked && "hosted_mcp", negotiation.checked && "negotiation_text"].filter(Boolean));
+            await this.sign(person.id, signature.value.trim(), [audio.checked && "openai_audio", mcp.checked && "hosted_mcp", negotiation.checked && "negotiation_text", retention.checked && "voice_profile_retention"].filter(Boolean));
             feedback.textContent = "Written release recorded. Wait for everyone before audio enrollment.";
           } catch (error) { feedback.textContent = error.message; accept.checked = false; }
           finally { submit.disabled = !this.noticeReady; }
@@ -708,7 +797,7 @@
     }
     renderAgents() {
       const enabled = allowedControls(this.consent, this.runtime, this.session);
-      this.$("runtime-state").textContent = !this.runtime ? `Runtime unavailable on ${this.control.slice(7)}` : this.runtime.session_id !== this.session ? `Runtime is serving a different room (${this.runtime.session_id}). Controls disabled.` : !enabled ? "Controls blocked: current local release, disclosure scopes and vendor review are required." : "Runtime connected to this room";
+      this.$("runtime-state").textContent = !this.runtime ? `Runtime unavailable on ${this.controlUrl.slice(7)}` : this.runtime.session_id !== this.session ? `Runtime is serving a different room (${this.runtime.session_id}). Controls disabled.` : !enabled ? "Controls blocked: current local release, disclosure scopes and vendor review are required." : "Runtime connected to this room";
       const mediating = this.mediating();
       const key = JSON.stringify([this.runtime, enabled, [...this.feed.lastCalls], [...mediating]]);
       if (key === this.agentKey) return; this.agentKey = key; this.$("agents").replaceChildren();

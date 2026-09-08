@@ -121,3 +121,24 @@ fetches the retained **Closing summary** once; 404 means nothing to show. The
 panel shows the text, model, saved time and retention deadline, with a
 *Delete summary* button that issues the DELETE. Attribution labels remain
 uncalibrated; this build is a demo, not for consequential negotiations.
+
+## v3.1: review, retained voiceprints, provider-neutral wording
+
+Each transcript row in the Conversation feed has a *Review* button while the
+room is open. It opens an inline form with the row's text and a speaker choice
+limited to this session's human participants (agent rows keep their speaker);
+*Save review* posts only the fields that changed to
+`.../utterances/{id}/review` and re-renders the row from the response. A
+reviewed row shows a `reviewed` chip and the original text or speaker struck
+through underneath; the feed's `utterance_reviewed` event updates the existing
+row in place. The release form gains a fifth, per-person checkbox,
+`voice_profile_retention`, whose sentence is the notice's; a participant whose
+consent reports `retain_profile` shows a "keeps voiceprint" chip. The room step
+lists **Retained voiceprints** from `/privacy/profiles` (name, model, sessions,
+last session, kept-until; never vectors) with a per-person *Delete my retained
+voiceprint* button that issues the DELETE and reloads the list. The disclosure
+checkboxes name "the AI provider(s) the operator has configured and reviewed",
+listing the notice's `providers` array (default OpenAI); the scope identifiers
+keep their historical `openai_` prefix. The runtime does not yet report whether
+an enrollment was seeded from a retained profile; the page shows that chip only
+if a `profile_seeded` flag arrives in the runtime's participant enrollment state.

@@ -31,6 +31,12 @@ a{color:var(--accent);text-decoration:none}
 .panel.summary{margin-bottom:18px;border-top:3px solid var(--ok)}#summary-text{margin:0;font:inherit;max-height:420px;overflow:auto;padding:12px;border:1px solid var(--line);border-radius:9px;background:var(--bg-2)}
 .objective{border-top:1px solid var(--line);padding:10px 0;margin:0}.objective summary{color:var(--ink)}.objective.recorded summary{color:var(--ok)}
 .objective .constraint{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;margin:6px 0}.objective .constraint label{flex:1 1 180px}.objective .status{color:var(--warn)}.objective .status:empty{display:none}
+/* v3.1: transcript review, retained voiceprints */
+.chip.reviewed,.chip.keeps{color:var(--ok);border-color:var(--ok)}h3 .chip{margin-left:8px;font-weight:500}
+.feed .was{color:var(--muted);font-size:13px;text-decoration:line-through;margin:2px 0 0}
+.feed button[name=review]{margin-top:6px;padding:4px 10px;font-size:12px}
+.review-form{display:flex;align-items:flex-end;gap:10px;flex-wrap:wrap;margin-top:8px}.review-form label{flex:1 1 220px;margin:0}.review-form input,.review-form select{max-width:none}
+#profiles{max-height:260px}#profiles li{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}#profiles p{margin:0}
 .agent-card.arbitrator .orb{border-radius:28%}.agent-card.arbitrator.speaking .state{color:var(--accent-2)}.agent-setup .role-note{margin:6px 0}
 .section-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:10px}
 .count{display:inline-block;min-width:26px;padding:1px 8px;border-radius:99px;background:var(--panel-2);font-size:13px;text-align:center;margin-left:6px}

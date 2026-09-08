@@ -10,6 +10,7 @@
     if (url === "/privacy/notice") data = {configured:true,controller_name:"Synthetic Controller",controller_address:"Test address only",controller_email:"test@example.invalid",notice_text:"SYNTHETIC TEST NOTICE. Speaker embeddings identify consenting speakers during this test room.",notice_sha256:"synthetic_hash",retention_text:"Destroy on session completion or withdrawal.",policy_version:"test",consent_method_version:"test",vendors:{openai_reviewed:true,cloudflare_reviewed:true}};
     else if (url === "/speaker/sessions?limit=100") data = {sessions:[]};
     else if (url === "/privacy/rooms") data = {rooms:[{session_id:"synthetic_room",state:"pending"}]};
+    else if (url === "/privacy/profiles") data = {profiles:[]};   // v3.1: retained voiceprints list, empty in the smoke
     else if (url.endsWith("/consent")) data = consent();
     else if (url.endsWith("/challenge")) data = {challenge:"synthetic_nonce",notice_sha256:"synthetic_hash",expires_at_ms:Date.now()+100000};
     else if (url.endsWith("/consents/person_1")) { const body = JSON.parse(options.body); if (body.accepted !== true || body.signature_text !== "Synthetic Person" || body.challenge !== "synthetic_nonce") throw Error("Invalid written grant"); granted = true; data={consent_id:"test_receipt"}; }

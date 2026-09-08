@@ -65,7 +65,7 @@ async function main() {
   const fetcher = async (url, options) => {
     calls.push({url,options});
     let data = {};
-    if (url === "/privacy/notice") data = {configured:true,controller_name:"Test Controller",controller_address:"Test address",controller_email:"test@example.invalid",notice_text:"Synthetic collection notice",notice_sha256:"notice_hash",retention_text:"Current room only",vendors:{},policy_version:"test",consent_method_version:"test"};
+    if (url === "/privacy/notice") data = {configured:true,controller_name:"Test Controller",controller_address:"Test address",controller_email:"test@example.invalid",notice_text:"Synthetic collection notice",notice_sha256:"notice_hash",retention_text:"Current room only",vendors:{},policy_version:"test",consent_method_version:"test",providers:["OpenAI","Synthetic Provider"]};
     if (url.endsWith("/challenge")) data = {challenge:"single_use",notice_sha256:"notice_hash",expires_at_ms:Date.now()+10000};
     return {ok:true,status:200,json:async()=>data};
   };
@@ -76,19 +76,31 @@ async function main() {
   ui.renderConsent();
   const person = ui.$("consents").children[0];
   const checkboxes = walk(person).filter(e=>e.type==="checkbox");
-  assert.equal(checkboxes.length,4); assert(checkboxes.every(e=>!e.checked));                       // v3: negotiation_text is the fourth optional scope
+  assert.equal(checkboxes.length,5); assert(checkboxes.every(e=>!e.checked));                       // v3.1: voice_profile_retention is the fifth, per-person choice
   assert.match(person.textContent, /negotiation_text disclosure/); assert.match(person.textContent, /negotiation rooms need all three/);
+  // Provider-neutral wording lists the notice's configured providers; the scope names keep their historical prefix.
+  const providerWording = "the AI provider(s) the operator has configured and reviewed (currently OpenAI, Synthetic Provider; other providers such as xAI or Google Gemini may be configured under the same release)";
+  assert.equal(person.textContent.split(providerWording).length - 1, 3);
+  assert.match(person.textContent, /openai_ prefix in the scope name is historical/);
+  assert.match(person.textContent, /voice_profile_retention keeps your voiceprint \(the enrollment embedding and its corrected updates, never audio or transcript\)/);
+  assert.match(person.textContent, /three years after your last session/);
+  assert.doesNotMatch(person.textContent, /audio to OpenAI for/);
   assert(!walk(person).some(e => e.tagName === "input" && e.value === "Synthetic Person"));
   const submit = walk(person).find(e=>e.tagName==="button"); assert(!submit.disabled);
   ui.poll = async()=>{};
-  // Signing through the form with every optional box checked sends all three scopes, in contract order.
+  // Signing through the form with every optional box checked sends all four scopes, in contract order.
   walk(person).find(e => e.tagName === "input" && e.type !== "checkbox").value = "Synthetic Person";
   for (const box of checkboxes) box.checked = true;
   await walk(person).find(e => e.tagName === "form").listeners.submit({preventDefault(){}});
   assert.match(walk(person).find(e => e.className === "release-feedback").textContent, /Written release recorded/);
   const grantRequest = calls.at(-1);
   assert.equal(grantRequest.url,"/speaker/session/room/consents/person_1");
-  assert.deepEqual(JSON.parse(grantRequest.options.body),{challenge:"single_use",notice_sha256:"notice_hash",signature_text:"Synthetic Person",accepted:true,disclosure_scopes:["openai_audio","hosted_mcp","negotiation_text"]});
+  assert.deepEqual(JSON.parse(grantRequest.options.body),{challenge:"single_use",notice_sha256:"notice_hash",signature_text:"Synthetic Person",accepted:true,disclosure_scopes:["openai_audio","hosted_mcp","negotiation_text","voice_profile_retention"]});
+  // Without a providers array the wording falls back to OpenAI; a consent reporting retain_profile shows the chip.
+  ui.notice.providers = undefined; ui.consent = {session_id:"room",state:"active",allowed:true,participants:[{id:"person_1",name:"Synthetic Person",bipa_consent_granted:true,retain_profile:true},{id:"person_2",name:"Other Person",bipa_consent_granted:false,retain_profile:false}]};
+  ui.consentKey = ""; ui.renderConsent();
+  assert.match(ui.$("consents").children[0].textContent, /keeps voiceprint/); assert.doesNotMatch(ui.$("consents").children[1].textContent, /keeps voiceprint/);
+  assert.match(ui.$("consents").children[1].textContent, /\(currently OpenAI; other providers/);
   assert.equal(grantRequest.options.headers.Authorization,"Bearer synthetic_operator_credential");
   assert.equal(grantRequest.options.cache,"no-store"); assert.equal(grantRequest.options.redirect,"error"); assert.equal(grantRequest.options.method,"POST");
   await ui.sign("person_1","Synthetic Person",["openai_audio"]);
@@ -118,17 +130,26 @@ async function main() {
   const runtimeCalls = [];
   let phase = "setup", awaiting = null, sessionId = null, reviewedVendors = {openai_reviewed:false, cloudflare_reviewed:true};
   let convType = "casual", granted = false, revealed = false, forbidObjectives = false, objectiveVersions = {}, summary = null;
+  let profiles = [{subject_key:"ab12cd34", subject_name:"Synthetic One", model:"synthetic_model", sessions:2, created_ms:1780000000000, last_interaction_ms:1780000100000, retention_deadline_ms:1874608100000}];
+  const reviews = [];
   const rawRows = [{row_id:1,sender_participant_id:"agent_1",sender_name:"Ava",tier:"raw",tag:null,text:"Ava to mediator: my side can move on timing.",redactions:0,timestamp_ms:1780000008000},
     {row_id:2,sender_participant_id:"agent_3",sender_name:"Mediator",tier:"raw",tag:"OBJECTIVE_ACHIEVED",text:"Zone found; price [withheld].",redactions:1,timestamp_ms:1780000009000}];
+  let arbGenerations = 3, avaHeld = false, arbPaused = false; const controls = [];   // control posts mutate the runtime's reported state
   const roomAgents = () => phase === "live" || phase === "ended" ? [
-    {name:"Ava", role:"voice", participant_id:"agent_1", provider:"p", model:"m", voice:"marin", eagerness:"balanced", held:false, responding:true},
+    {name:"Ava", role:"voice", participant_id:"agent_1", provider:"p", model:"m", voice:"marin", eagerness:"balanced", held:avaHeld, responding:true},
     {name:"Ben", role:"voice", participant_id:"agent_2", provider:"p", model:"m", voice:"cedar", eagerness:"quiet", held:true, responding:false},
-    {name:"Mediator", role:"arbitrator", participant_id:"agent_3", provider:"openai_responses", model:"gpt-5", held:false, responding:false, arbitrator:{generations:arbGenerations, ingested_rows:12, last_trigger:"contribution", pending_tag:null, cooldown_until_ms:0, paused:false}}] : [];
-  let arbGenerations = 3;
+    {name:"Mediator", role:"arbitrator", participant_id:"agent_3", provider:"openai_responses", model:"gpt-5", held:false, responding:false, arbitrator:{generations:arbGenerations, ingested_rows:12, last_trigger:"contribution", pending_tag:null, cooldown_until_ms:0, paused:arbPaused}}] : [];
   const runtimeFetcher = async (url, options) => {
     runtimeCalls.push({url, options});
     let data = {};
     if (url === "http://127.0.0.1:8123/bootstrap") { assert(!options.headers.Authorization); data = {phase, session_id:sessionId, gui:true, api_token:"launcher_token"}; }
+    else if (/^http:\/\/127\.0\.0\.1:8123\/agents\/[^/]+\/control$/.test(url)) {
+      const name = decodeURIComponent(url.split("/")[4]), body = JSON.parse(options.body);
+      controls.push({name, body, method:options.method, auth:options.headers.Authorization});
+      if (name === "Ava" && body.action === "hold") avaHeld = !avaHeld;
+      if (name === "Mediator" && body.action === "hold") arbPaused = !arbPaused;
+      data = {ok:true};
+    }
     else if (url === "http://127.0.0.1:8123/agents") data = {session_id:sessionId, agents:roomAgents(), phase, detail:`in ${phase}`, awaiting, needs_openai_key:phase === "setup", conversation_type:convType,
       agent_configs:[{name:"Ava", role:"voice", voice:"marin", model:"m", eagerness:"balanced", instructions:"Answer in haiku.", speaks_for:""}, {name:"Ben", voice:"cedar", model:"m", eagerness:"quiet", instructions:"", speaks_for:""}],
       voices:["marin","cedar","sage"], eagerness_levels:["quiet","balanced","eager"], max_agents:3,
@@ -140,8 +161,15 @@ async function main() {
     else if (url === "/privacy/notice") data = {configured:true,controller_name:"Test Controller",controller_address:"Test address",controller_email:"test@example.invalid",notice_text:"Synthetic",notice_sha256:"h",retention_text:"r",vendors:reviewedVendors,policy_version:"t",consent_method_version:"t"};
     else if (url === "/speaker/sessions?limit=100") data = {sessions:[]};
     else if (url === "/privacy/rooms") data = {rooms:[]};
-    else if (url.endsWith("/consent")) data = granted ? {session_id:"room_auto",state:"active",allowed:true,participants:[{id:"participant_1",name:"Synthetic One",bipa_consent_granted:true},{id:"participant_2",name:"Synthetic Two",bipa_consent_granted:true}],scopes:{local_processing:true,openai_audio:true,hosted_mcp:true,negotiation_text:true}}
+    else if (url === "/privacy/profiles") data = {profiles};
+    else if (url.startsWith("/privacy/profiles/")) { assert.equal(options.method, "DELETE"); const key = decodeURIComponent(url.slice("/privacy/profiles/".length)); profiles = profiles.filter(p => p.subject_key !== key); data = {deleted:true}; }
+    else if (url.endsWith("/consent")) data = granted ? {session_id:"room_auto",state:"active",allowed:true,participants:[{id:"participant_1",name:"Synthetic One",bipa_consent_granted:true,retain_profile:true},{id:"participant_2",name:"Synthetic Two",bipa_consent_granted:true,retain_profile:false}],scopes:{local_processing:true,openai_audio:true,hosted_mcp:true,negotiation_text:true}}
       : {session_id:"room_auto",state:"pending",allowed:false,participants:[]};
+    else if (url.endsWith("/participants")) data = {participants:[{id:"participant_1",name:"Synthetic One",kind:"human"},{id:"participant_2",name:"Synthetic Two",kind:"human"},{id:"agent_1",name:"Ava",kind:"agent"}]};
+    else if (url.includes("/utterances/") && url.endsWith("/review")) {
+      const body = JSON.parse(options.body); reviews.push({url, method:options.method, body});
+      data = {utterance_id:1, text: body.text === undefined ? "Synthetic test text." : body.text, speaker_id: body.speaker_id === undefined ? "person_1" : body.speaker_id, label: body.speaker_id === undefined ? "high" : "reviewed", segments_corrected: body.speaker_id === undefined ? 0 : 3, profile_updated: body.speaker_id !== undefined};
+    }
     else if (url.includes("/events?")) data = fixture;
     else if (url.includes("/agent_channel?")) data = {session_id:"room_auto", next_after_id:2, revealed, rows: revealed ? rawRows : []};   // the API omits raw rows until everyone revealed
     else if (url.endsWith("/agent_channel/reveal")) { const body = JSON.parse(options.body); revealed = body.revealed; data = {session_id:"room_auto", revealed_by: revealed ? [body.participant_id] : [], revealed:false}; }
@@ -158,9 +186,20 @@ async function main() {
     return {ok:true,status:200,json:async()=>data};
   };
   const launched = new Console(new Document(), runtimeFetcher, {hostname:"127.0.0.1",protocol:"http:",search:"?control=8123"});
-  assert.equal(launched.control, "http://127.0.0.1:8123");
-  assert.equal(new Console(new Document(), runtimeFetcher, {hostname:"127.0.0.1",protocol:"http:",search:"?control=evil"}).control, "http://127.0.0.1:8090");
+  assert.equal(launched.controlUrl, "http://127.0.0.1:8123");
+  assert.equal(new Console(new Document(), runtimeFetcher, {hostname:"127.0.0.1",protocol:"http:",search:"?control=evil"}).controlUrl, "http://127.0.0.1:8090");
   await launched.bootstrap(); assert.equal(launched.token, "launcher_token");
+  // Retained voiceprints: listed on connect from GET /privacy/profiles (never vectors); the delete button issues the DELETE and reloads.
+  assert.equal(runtimeCalls.filter(c => c.url === "/privacy/profiles").length, 1);
+  assert.equal(rows(launched.$("profiles")).length, 1);
+  assert.match(launched.$("profiles").textContent, /Synthetic One · synthetic_model · 2 sessions · last .+ · kept until .+/);
+  const deleteProfile = buttons(launched.$("profiles"))[0]; assert.equal(deleteProfile.textContent, "Delete my retained voiceprint"); assert.match(deleteProfile.className, /danger/);
+  await deleteProfile.listeners.click();
+  const profileDeletion = runtimeCalls.find(c => c.url.startsWith("/privacy/profiles/"));
+  assert.equal(profileDeletion.url, "/privacy/profiles/ab12cd34"); assert.equal(profileDeletion.options.method, "DELETE"); assert.equal(profileDeletion.options.body, undefined);
+  assert.equal(profileDeletion.options.headers.Authorization, "Bearer launcher_token");
+  assert.equal(runtimeCalls.filter(c => c.url === "/privacy/profiles").length, 2); assert.equal(rows(launched.$("profiles")).length, 0);
+  assert.match(launched.$("profiles").textContent, /No retained voiceprints/); assert.match(launched.$("message").textContent, /Retained voiceprint deleted/);
   await launched.pollRuntime();
   assert.equal(launched.$("phase").textContent, "setup"); assert(!launched.$("setup-form").hidden); assert(!launched.$("key-label").hidden);
   assert(!launched.$("gate").hidden); assert(launched.$("gate-close").hidden); assert(!launched.$("room-section").hidden);   // inescapable setup gate
@@ -226,6 +265,43 @@ async function main() {
   granted = true; convType = "negotiation";
   await launched.poll();
   assert.equal(launched.$("utterance-count").textContent, "4");
+  assert.match(launched.$("consents").children[0].textContent, /keeps voiceprint/); assert.doesNotMatch(launched.$("consents").children[1].textContent, /keeps voiceprint/);
+  // Transcript review: the Review button opens an inline form; only changed fields are posted; the row re-renders from the response.
+  const transcriptRows = rows(launched.$("transcript")); assert.equal(transcriptRows.length, 4);
+  const first = transcriptRows[0], reviewButton = first.querySelector('[name="review"]');
+  assert.equal(reviewButton.textContent, "Review"); assert.doesNotMatch(first.textContent, /reviewed/);
+  reviewButton.listeners.click(); assert(reviewButton.disabled);                                                                      // one open form per row
+  const reviewText = first.querySelector('[name="review_text"]'), reviewSpeaker = first.querySelector('[name="review_speaker"]');
+  assert.equal(reviewText.value, "Synthetic test text."); assert.equal(reviewSpeaker.value, ""); assert(!reviewSpeaker.disabled);   // person_1 is not on this roster: "keep current"
+  assert.deepEqual(reviewSpeaker.children.map(o => o.value), ["", "participant_1", "participant_2"]);                              // humans only, never the agent
+  let reviewForm = walk(first).find(e => e.tagName === "form");
+  await reviewForm.listeners.submit({preventDefault(){}});                                                                            // nothing changed: refused locally
+  assert.equal(reviews.length, 0); assert.match(launched.$("message").textContent, /Change the text or the speaker/);
+  reviewText.value = "Synthetic corrected text.";
+  await reviewForm.listeners.submit({preventDefault(){}});
+  assert.equal(reviews.length, 1); assert.equal(reviews[0].url, "/speaker/session/room_auto/utterances/1/review"); assert.equal(reviews[0].method, "POST");
+  assert.deepEqual(reviews[0].body, {text:"Synthetic corrected text."});
+  assert(!walk(first).some(e => e.tagName === "form"));                                                                             // form closed after save
+  assert.match(first.textContent, /Synthetic corrected text\./); assert.match(first.textContent, /was: Synthetic test text\./);
+  assert(walk(first).some(e => e.className === "chip reviewed")); assert.equal(first.className, "high");                            // text-only review keeps the acoustic label
+  first.querySelector('[name="review"]').listeners.click();
+  const secondSpeaker = first.querySelector('[name="review_speaker"]'); secondSpeaker.value = "participant_2";
+  assert.equal(first.querySelector('[name="review_text"]').value, "Synthetic corrected text.");
+  await walk(first).find(e => e.tagName === "form").listeners.submit({preventDefault(){}});
+  assert.equal(reviews.length, 2); assert.deepEqual(reviews[1].body, {speaker_id:"participant_2"});
+  assert.equal(first.className, "reviewed"); assert.match(first.textContent, /Synthetic Two/); assert.match(first.textContent, /was: person_1/);
+  assert.equal(launched.feed.utterances.size, 4); assert.equal(rows(launched.$("transcript")).length, 4);
+  // Agent rows: the speaker cannot be changed; cancel restores the row without a request.
+  const agentRow = transcriptRows[1]; agentRow.querySelector('[name="review"]').listeners.click();
+  assert(agentRow.querySelector('[name="review_speaker"]').disabled);
+  agentRow.querySelector('[name="review_cancel"]').listeners.click(); assert(!walk(agentRow).some(e => e.tagName === "form")); assert.equal(reviews.length, 2);
+  // An utterance_reviewed event updates the existing row in place (same utterance_id: no new row).
+  launched.feed.apply({events:[{event_id:20, type:"utterance_reviewed", data:{utterance_id:1, speaker_id:"participant_1", speaker_name:"Synthetic One", original_speaker_id:"person_1", start_ms:0, end_ms:1500, label:"reviewed", similarity:0.72, text:"Synthetic server text.", original_text:"Synthetic test text."}}], next_after_id:20});
+  assert.equal(launched.feed.utterances.size, 4); assert.equal(rows(launched.$("transcript")).length, 4); assert.equal(rows(launched.$("transcript"))[0], first);
+  assert.match(first.textContent, /Synthetic One/); assert.match(first.textContent, /Synthetic server text\./); assert.match(first.textContent, /was: Synthetic test text\./); assert.doesNotMatch(first.textContent, /corrected/);
+  assert(walk(first).some(e => e.className === "was")); assert.equal(walk(first).filter(e => e.className === "chip").length, 1);
+  launched.feed.apply({events:[{event_id:21, type:"utterance_reviewed", data:{utterance_id:9, speaker_id:"participant_2", speaker_name:"Synthetic Two", start_ms:7000, end_ms:8000, label:"reviewed", text:"Late row.", original_text:"Lat row."}}], next_after_id:21});
+  assert.equal(launched.feed.utterances.size, 5); assert.match(rows(launched.$("transcript"))[4].textContent, /was: Lat row\./);                 // unseen id: rendered as a new reviewed row
   const cards = launched.$("agents").children;
   assert.equal(cards.length, 3);
   assert.match(cards[0].className, /speaking/); assert.match(cards[1].className, /held/);
@@ -239,6 +315,32 @@ async function main() {
   assert(!walk(cards[2]).some(e => e.tagName === "select")); assert(walk(cards[2]).some(e => e.className === "orb"));
   arbGenerations = 4; await launched.poll();
   assert.match(launched.$("agents").children[2].textContent, /Mediating/); assert.match(launched.$("agents").children[2].className, /speaking/);   // generation count rose
+  // Hold / Cancel click path: buttons are enabled, a click re-checks consent and the runtime, posts the control with the bearer token, then polls.
+  const card = i => launched.$("agents").children[i], stateOf = c => walk(c).find(e => e.className === "state").textContent;
+  const holdButton = buttons(card(0))[1]; assert.equal(holdButton.title, "Hold"); assert(buttons(card(0)).every(b => !b.disabled));
+  let before = runtimeCalls.length;
+  await holdButton.listeners.click();
+  const sequence = runtimeCalls.slice(before).map(c => c.url);
+  assert.deepEqual(sequence.slice(0, 3), ["/speaker/session/room_auto/consent", "http://127.0.0.1:8123/agents", "http://127.0.0.1:8123/agents/Ava/control"]);
+  assert(sequence.slice(3).some(u => u.includes("/events?")));                                                                      // poll() followed the control
+  assert.equal(controls.length, 1); assert.deepEqual(controls[0], {name:"Ava", body:{action:"hold"}, method:"POST", auth:"Bearer launcher_token"});
+  assert.match(card(0).className, /held/); assert.equal(stateOf(card(0)), "Held"); assert.equal(buttons(card(0))[1].title, "Release hold");
+  assert.match(buttons(card(0))[1].textContent, /Release hold/);
+  await buttons(card(0))[2].listeners.click(); assert.deepEqual(controls.at(-1), {name:"Ava", body:{action:"cancel"}, method:"POST", auth:"Bearer launcher_token"});
+  await buttons(card(0))[1].listeners.click(); assert.deepEqual(controls.at(-1).body, {action:"hold"});                                // release hold posts hold again
+  assert.doesNotMatch(card(0).className, /held/); assert.equal(stateOf(card(0)), "Speaking"); assert.equal(buttons(card(0))[1].title, "Hold");
+  // Arbitrator card: Pause posts hold, Drop override posts cancel, Resume posts hold again.
+  await buttons(card(2))[1].listeners.click(); assert.deepEqual(controls.at(-1), {name:"Mediator", body:{action:"hold"}, method:"POST", auth:"Bearer launcher_token"});
+  assert.equal(stateOf(card(2)), "Paused"); assert.match(card(2).className, /held/); assert.equal(buttons(card(2))[1].title, "Resume");
+  await buttons(card(2))[2].listeners.click(); assert.deepEqual(controls.at(-1), {name:"Mediator", body:{action:"cancel"}, method:"POST", auth:"Bearer launcher_token"});
+  await buttons(card(2))[1].listeners.click(); assert.deepEqual(controls.at(-1).body, {action:"hold"}); assert.notEqual(stateOf(card(2)), "Paused"); assert.equal(buttons(card(2))[1].title, "Pause");
+  // Blocked: the runtime now serves another room, so the click posts nothing and says why; the cards come back once it matches again.
+  sessionId = "other_room"; before = controls.length;
+  await buttons(card(0))[1].listeners.click();
+  assert.equal(controls.length, before); assert.match(launched.$("message").textContent, /Control blocked/); assert.match(launched.$("runtime-state").textContent, /different room/);
+  assert(buttons(card(0)).every(b => b.disabled));
+  sessionId = "room_auto"; await launched.poll(); assert(buttons(card(0)).every(b => !b.disabled)); assert.equal(controls.length, before);
+  assert.equal(controls.length, 6);
   // Raw channel: hidden until everyone reveals; the page shows no rows and keeps its cursor at 0 while hidden.
   const rawRequest = runtimeCalls.find(c => c.url.includes("/agent_channel?"));
   assert.equal(rawRequest.url, "/speaker/session/room_auto/agent_channel?after_id=0&limit=200&tier=raw");
@@ -342,6 +444,6 @@ async function main() {
 
   const manual = new Console(new Document(), async (url) => { if (url.endsWith("/bootstrap")) throw new Error("no runtime"); return {ok:true,status:200,json:async()=>({})}; }, {hostname:"127.0.0.1",protocol:"http:"});
   await manual.bootstrap(); assert.equal(manual.token, "");               // no launcher: paste the token as before
-  console.log("DOM/mock API checks passed: 4 replay rows, 2 calls, 1 board row, dedupe, XSS text, effective gates, unchecked releases, negotiation_text scope, nonce binding, withdrawal clearing, objectives masked, raw channel gated by the API, arbitrator card, summary.");
+  console.log("DOM/mock API checks passed: 4 replay rows, 2 calls, 1 board row, dedupe, XSS text, effective gates, unchecked releases, negotiation_text scope, nonce binding, withdrawal clearing, objectives masked, raw channel gated by the API, arbitrator card, summary, transcript review, retained voiceprints, provider-neutral release wording, hold/cancel click path.");
 }
 main().catch(error=>{console.error(error);process.exitCode=1;});
