@@ -71,3 +71,74 @@ The loopback notice is not a substitute for publishing the operator's public
 retention policy. Individual accounts, verified identity/contact and legally
 authorized representative signing are deferred; the page must not be used
 when those unsupported capabilities are needed.
+
+## v3: negotiation rooms
+
+Setup gains a **Conversation type** (casual or negotiation) and a **Role** per
+agent card (voice or arbitrator). An arbitrator card hides the voice, eagerness
+and speaks-for fields: that agent is text only, sees both objectives, reads the
+transcript and the agent channel through our MCP server and posts to the notes
+board. Before posting `/setup` the page mirrors the runtime's rule (a
+negotiation is exactly two voice agents speaking for two different people plus
+one arbitrator; a casual room has no arbitrator); the runtime remains the
+authority.
+
+The release form has a fourth checkbox, the optional `negotiation_text`
+disclosure. Negotiation rooms need all three optional disclosures from everyone;
+the API computes the effective scope and refuses objectives, the arbitrator's
+vendor calls and the summary otherwise.
+
+**Objectives** appear in the gate after the releases whenever the runtime says
+the room is a negotiation (reopen with *Releases* to add a version). Each person
+takes the keyboard in turn and types a shareable position plus labelled
+constraint values, or loads a `.txt`/`.json` file that is parsed on this
+computer into those fields; the file itself is never sent. Saving posts only the
+fields; every save is a new server version (`trigger` is `initial` then
+`edited in console`). After a save the block collapses, its inputs are cleared
+and only "Objective v<n> recorded · <k> constraints" remains, so the next person
+cannot read it. The page never reads objectives back. A 403 is shown as
+"Every person must sign with the negotiation_text disclosure first."
+
+The **Notes board** panel lists the arbitrator's board lines from the event
+feed with the sender, time, a tag chip and an "n withheld" chip when the server
+redacted registered values before storing the line. The **Raw agent channel**
+beside it is polled with `tier=raw`; the API omits those rows and reports
+`revealed:false` until every person in the room has clicked their own
+*Reveal to <name>* button (each click posts that person's `revealed` flag from
+this page's origin). While hidden the page shows no rows, keeps nothing and
+restarts its cursor at zero, so a later reveal shows the whole stream. A
+hidden response clears any rows already shown. Per-person button state is known
+only from this page's own posts; after a reload every button reads *Reveal*
+until clicked again.
+
+Arbitrator cards show "Mediating" while the runtime reports it responding or
+shortly after its generation count rises, "Paused" when held, otherwise
+"Listening", with *Post now*, *Pause*/*Resume* and *Drop override* controls and
+the same server-recorded MCP evidence line as voice agents.
+
+When the runtime phase turns `ended` (and whenever a room is opened) the page
+fetches the retained **Closing summary** once; 404 means nothing to show. The
+panel shows the text, model, saved time and retention deadline, with a
+*Delete summary* button that issues the DELETE. Attribution labels remain
+uncalibrated; this build is a demo, not for consequential negotiations.
+
+## v3.1: review, retained voiceprints, provider-neutral wording
+
+Each transcript row in the Conversation feed has a *Review* button while the
+room is open. It opens an inline form with the row's text and a speaker choice
+limited to this session's human participants (agent rows keep their speaker);
+*Save review* posts only the fields that changed to
+`.../utterances/{id}/review` and re-renders the row from the response. A
+reviewed row shows a `reviewed` chip and the original text or speaker struck
+through underneath; the feed's `utterance_reviewed` event updates the existing
+row in place. The release form gains a fifth, per-person checkbox,
+`voice_profile_retention`, whose sentence is the notice's; a participant whose
+consent reports `retain_profile` shows a "keeps voiceprint" chip. The room step
+lists **Retained voiceprints** from `/privacy/profiles` (name, model, sessions,
+last session, kept-until; never vectors) with a per-person *Delete my retained
+voiceprint* button that issues the DELETE and reloads the list. The disclosure
+checkboxes name "the AI provider(s) the operator has configured and reviewed",
+listing the notice's `providers` array (default OpenAI); the scope identifiers
+keep their historical `openai_` prefix. The runtime does not yet report whether
+an enrollment was seeded from a retained profile; the page shows that chip only
+if a `profile_seeded` flag arrives in the runtime's participant enrollment state.

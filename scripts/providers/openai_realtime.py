@@ -5,8 +5,10 @@ import json
 import os
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from realtime_openai import REALTIME_URL, instructions, persona
+from realtime_openai import REALTIME_URL, compose_prompt
 import voiceprint_client as vp
+
+ALLOWED_TOOLS = ["get_transcript", "get_current_speaker", "get_agent_channel", "post_agent_channel"]
 
 
 def participant_url(url, participant_id):
@@ -17,11 +19,16 @@ def participant_url(url, participant_id):
 
 
 class OpenAIRealtime:
-    def __init__(self, config, session_id, names, participant_id, mcp_url, mcp_token=None, connector=None, consent=None):
+    def __init__(self, config, session_id, names, participant_id, mcp_url, mcp_token=None, connector=None, consent=None,
+                 objective=None, principal_name=None):
         self.config, self.session_id, self.names = config, session_id, names
         self.participant_id, self.mcp_url, self.mcp_token = participant_id, mcp_url, mcp_token
         self.connector, self.ws = connector, None
         self.consent = consent
+        self.objective, self.principal_name = objective, principal_name     # an advocate's own principal only
+
+    def prompt(self):
+        return compose_prompt(self.config, self.session_id, self.names, self.objective, self.principal_name)
 
     async def authorized(self):
         await asyncio.to_thread(vp.require_consent, self.consent, "openai_audio")
@@ -42,16 +49,12 @@ class OpenAIRealtime:
                                        additional_headers={"Authorization": "Bearer " + key}, max_size=None)
         tool = {"type": "mcp", "server_label": "voiceprint",
                 "server_url": participant_url(self.mcp_url, self.participant_id),
-                "allowed_tools": ["get_transcript", "get_current_speaker"], "require_approval": "never"}
+                "allowed_tools": list(ALLOWED_TOOLS), "require_approval": "never"}
         if self.mcp_token:
             tool["authorization"] = self.mcp_token
-        prompt = instructions(self.config.name, self.session_id, self.names)
-        flavor = persona(self.config.name, getattr(self.config, "speaks_for", ""), self.config.instructions_extra)
-        if flavor:
-            prompt += "\n\n" + flavor
         await self._send({"type": "session.update", "session": {
             "type": "realtime", "model": self.config.model, "output_modalities": ["audio"],
-            "instructions": prompt,
+            "instructions": self.prompt(),
             "audio": {"input": {"format": {"type": "audio/pcm", "rate": 24000},
                                 "turn_detection": {"type": "server_vad", "create_response": False, "interrupt_response": False},
                                 "transcription": {"model": "gpt-4o-mini-transcribe", "language": "en"}},
@@ -91,6 +94,11 @@ class OpenAIRealtime:
 
     async def cancel(self):
         await self._send({"type": "response.cancel"})
+
+    async def update_instructions(self, prompt):
+        """A new objective version mid-conversation: replace only the instructions of the open session."""
+        await self.authorized()
+        await self._send({"type": "session.update", "session": {"type": "realtime", "instructions": prompt}})
 
     async def events(self):
         async for raw in self.ws:

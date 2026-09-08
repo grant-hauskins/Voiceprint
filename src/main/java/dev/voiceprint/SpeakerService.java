@@ -30,6 +30,8 @@ final class SpeakerService {
         buffers.remove(session); failures.remove(session); notifyAll(); destructionWakeup.run(); return result;
     }
     synchronized ObjectNode destructionStatus(String session) { return privacy.destruction(session); }
+    synchronized ObjectNode retainedProfiles() { return privacy.retainedProfiles(); }
+    synchronized ObjectNode deleteRetainedProfile(String subjectKey) { return privacy.deleteRetainedProfile(subjectKey); }
     synchronized void requireConsent(String session, String scope) { privacy.require(session, scope); }
     synchronized void setDestructionWakeup(Runnable wakeup) { destructionWakeup = wakeup; }
     synchronized void sweepPrivacy() {
@@ -77,14 +79,20 @@ final class SpeakerService {
         privacy.require(session, "local_processing");
         return store.transaction(() -> {
             store.execute("INSERT INTO sessions(id,status,created_ms) VALUES(?,'active',?)", session, clock.millis());
+            var seeded = Json.arr();
             for (int i = 0; i < participants.size(); i++) {
-                var p = participants.get(i); var result = results.get(i); String vector = Store.vectorJson(Audio.normalize(result.embedding()));
-                store.execute("INSERT INTO profiles VALUES(?,?,?,?,?,?)", session, p.get("id").asText(), p.get("name").asText(), result.modelId(), vector, vector);
-                store.execute("INSERT INTO participants VALUES(?,?,?,'human',NULL,?)", session, p.get("id").asText(), p.get("name").asText(), result.modelId());
-                privacy.linkOpening(session, p.get("id").asText(), audio.get(i));
+                var p = participants.get(i); var result = results.get(i); String id = p.get("id").asText();
+                double[] enrollment = Audio.normalize(result.embedding());
+                // A retaining person's earlier voiceprint starts this room's profile; anchor and vector both begin from the blend.
+                double[] start = privacy.seed(privacy.retainer(session, id), result.modelId(), enrollment);
+                String vector = Store.vectorJson(start == null ? enrollment : start);
+                store.execute("INSERT INTO profiles VALUES(?,?,?,?,?,?)", session, id, p.get("name").asText(), result.modelId(), vector, vector);
+                store.execute("INSERT INTO participants VALUES(?,?,?,'human',NULL,?)", session, id, p.get("name").asText(), result.modelId());
+                privacy.linkOpening(session, id, audio.get(i));
+                seeded.add(Json.obj().put("id", id).put("profile_seeded", start != null));
             }
             return Json.obj().put("session_id", session).put("profiles_created", participants.size()).put("status", "ready")
-                .put("confidence_kind", "uncalibrated").put("chunk_ms", 250).put("context_ms", 1500);
+                .put("confidence_kind", "uncalibrated").put("chunk_ms", 250).put("context_ms", 1500).set("participants", seeded);
         });
     }
 
@@ -334,10 +342,125 @@ final class SpeakerService {
     }
     static ObjectNode safeMcpArguments(JsonNode arguments) {
         var safe = Json.obj();
-        for (String key : List.of("session_id", "speaker_id", "segment_id", "actual_speaker")) if (arguments.has(key)) safe.put(key, "[redacted]");
+        for (String key : List.of("session_id", "speaker_id", "segment_id", "actual_speaker", "text")) if (arguments.has(key)) safe.put(key, "[redacted]");
         for (String key : List.of("limit", "after_id", "after_sequence")) if (arguments.path(key).isIntegralNumber()) safe.set(key, arguments.path(key));
         if (Set.of("high", "medium", "low").contains(arguments.path("min_label").asText())) safe.put("min_label", arguments.path("min_label").asText());
+        if (Set.of("board", "raw").contains(arguments.path("tier").asText())) safe.put("tier", arguments.path("tier").asText());
+        if (TAGS.contains(arguments.path("tag").asText())) safe.put("tag", arguments.path("tag").asText());
         return safe;
+    }
+    static final Set<String> TAGS = Set.of("OBJECTIVE_ACHIEVED", "REFOCUS_NEEDED");
+
+    // ---- V3: objectives, agent channel, reveal gate and summary (docs/API.md, V3 arbitration contract) ----
+
+    private String principal(String session, JsonNode request, String key) {
+        String id = Json.id(request, key);
+        if (!privacy.roster(session).contains(id)) throw new ApiException(404, "participant_not_found", "Participant is not a human in this room's released roster.");
+        return id;
+    }
+    /** Every POST is a new version; constraint values are what the redaction guard watches. */
+    synchronized ObjectNode createObjective(String session, JsonNode request) {
+        privacy.require(session, "local_processing"); privacy.require(session, "negotiation_text");
+        String principal = principal(session, request, "principal_id");
+        String position = Json.text(request, "position", 2000), trigger = Json.text(request, "trigger", 200);
+        String source = Json.text(request, "source", 20);
+        if (!Set.of("typed", "uploaded").contains(source)) throw new ApiException(400, "invalid_input", "source must be typed or uploaded.");
+        JsonNode given = request.path("constraints");
+        if (!given.isArray() || given.size() > 20) throw new ApiException(400, "invalid_input", "constraints must be an array of at most 20 items.");
+        var constraints = Json.arr();
+        for (JsonNode c : given) constraints.add(Json.obj().put("label", Json.text(c, "label", 80)).put("value", Json.text(c, "value", 200)));
+        return store.transaction(() -> {
+            long now = clock.millis();
+            long version = store.insertObjective(session, principal, position, constraints.toString(), source, trigger, now);
+            return Json.obj().put("session_id", session).put("principal_id", principal).put("version", version).put("created_ms", now);
+        });
+    }
+    synchronized ObjectNode objectives(String session, boolean history) {
+        privacy.require(session, "local_processing"); privacy.require(session, "negotiation_text");
+        return Json.obj().put("session_id", session).set("objectives", store.objectives(session, history));
+    }
+    /** The guard runs on the write path against every latest objective's values; the row is stored already redacted. */
+    synchronized ObjectNode postChannel(String session, JsonNode request) {
+        privacy.require(session, "local_processing");
+        if (!store.session(session).status().equals("active")) throw new ApiException(409, "session_ended", "This session has ended.");
+        String sender = Json.id(request, "sender_participant_id");
+        if (!store.participant(session, sender).path("kind").asText().equals("agent")) throw new ApiException(400, "invalid_participant", "Only registered agents post to the agent channel.");
+        String tier = Json.text(request, "tier", 10);
+        if (!Set.of("board", "raw").contains(tier)) throw new ApiException(400, "invalid_input", "tier must be board or raw.");
+        String tag = null;
+        if (request.has("tag") && !request.get("tag").isNull()) {
+            tag = Json.text(request, "tag", 40);
+            if (!TAGS.contains(tag)) throw new ApiException(400, "invalid_input", "tag must be OBJECTIVE_ACHIEVED or REFOCUS_NEEDED.");
+        }
+        var guarded = Redaction.redact(Json.text(request, "text", 4000), store.constraintValues(session));
+        String stored = tag;
+        ObjectNode result = store.transaction(() -> {
+            long now = clock.millis();
+            long id = store.insertChannel(session, sender, tier, stored, guarded.text(), guarded.hits(), now);
+            if (tier.equals("board")) store.event(session, now, "agent_channel", store.channelRow(session, id));
+            return Json.obj().put("session_id", session).put("row_id", id).put("tier", tier).put("redactions", guarded.hits()).put("text", guarded.text());
+        });
+        notifyAll();
+        return result;
+    }
+    private boolean revealed(String session) {
+        var reveals = store.reveals(session);
+        var roster = privacy.roster(session);
+        return !roster.isEmpty() && reveals.containsAll(roster);
+    }
+    /** Reveal gate: the hosted MCP path sees every tier; anyone else sees raw rows only once every human has revealed. */
+    synchronized ObjectNode channel(String session, long after, int limit, String tier, boolean hosted) {
+        privacy.require(session, "local_processing");
+        store.session(session); validatePage(after, limit);
+        if (tier == null || tier.equals("all")) tier = null;
+        else if (!Set.of("board", "raw").contains(tier)) throw new ApiException(400, "invalid_query", "tier must be board, raw or all.");
+        boolean revealed = revealed(session);
+        ArrayNode fetched = store.channel(session, after, limit, tier);
+        long next = fetched.isEmpty() ? after : fetched.get(fetched.size() - 1).path("row_id").asLong();
+        var rows = Json.arr(); var text = new StringBuilder();
+        for (var row : fetched) {
+            if (!hosted && !revealed && row.path("tier").asText().equals("raw")) continue;
+            rows.add(row);
+            var time = java.time.LocalTime.ofInstant(java.time.Instant.ofEpochMilli(row.path("timestamp_ms").asLong()), java.time.ZoneId.systemDefault());
+            String who = row.path("sender_name").isNull() ? row.path("sender_participant_id").asText() : row.path("sender_name").asText();
+            text.append('#').append(row.path("row_id").asLong()).append(' ').append(String.format("%02d:%02d:%02d", time.getHour(), time.getMinute(), time.getSecond()))
+                .append(' ').append(who).append(" [").append(row.path("tier").asText()).append(']');
+            if (!row.path("tag").isNull()) text.append('(').append(row.path("tag").asText()).append(')');
+            text.append(": ").append(row.path("text").asText()).append('\n');
+        }
+        return Json.obj().put("session_id", session).put("next_after_id", next).put("revealed", revealed).put("text", text.toString()).set("rows", rows);
+    }
+    synchronized ObjectNode reveal(String session, JsonNode request) {
+        privacy.require(session, "local_processing");
+        String participant = principal(session, request, "participant_id");
+        if (!request.path("revealed").isBoolean()) throw new ApiException(400, "invalid_input", "revealed must be true or false.");
+        boolean revealed = request.path("revealed").asBoolean();
+        store.transaction(() -> { store.reveal(session, participant, revealed, clock.millis()); return null; });
+        var by = Json.arr(); for (String id : store.reveals(session)) by.add(id);
+        return Json.obj().put("session_id", session).put("revealed", revealed(session)).set("revealed_by", by);
+    }
+    /** Written by the runtime before POST .../end; retained on its own 30-day deadline after the room is destroyed. */
+    synchronized ObjectNode saveSummary(String session, JsonNode request) {
+        privacy.require(session, "local_processing"); privacy.require(session, "negotiation_text");
+        if (!store.session(session).status().equals("active")) throw new ApiException(409, "session_ended", "This session has ended.");
+        String text = Json.text(request, "text", 20000), model = Json.text(request, "model", 200);
+        long board = Json.integer(request, "board_rows", 0, Integer.MAX_VALUE), transcript = Json.integer(request, "transcript_rows", 0, Integer.MAX_VALUE);
+        return store.transaction(() -> {
+            long now = clock.millis(), deadline = now + PrivacyPolicy.SUMMARY_RETENTION_MS;
+            store.saveSummary(session, text, model, board, transcript, now, deadline);
+            return Json.obj().put("session_id", session).put("created_ms", now).put("retention_deadline_ms", deadline);
+        });
+    }
+    /** Operator read after the room is gone: no room admission, because destruction has already removed the room's authority. */
+    synchronized ObjectNode summary(String session) {
+        var row = store.summary(session);
+        if (row == null) throw new ApiException(404, "summary_not_found", "No summary is retained for this session.");
+        return row;
+    }
+    synchronized ObjectNode deleteSummary(String session) {
+        boolean deleted = store.transaction(() -> store.deleteSummary(session));
+        if (!deleted) throw new ApiException(404, "summary_not_found", "No summary is retained for this session.");
+        return Json.obj().put("session_id", session).put("deleted", true);
     }
     synchronized ObjectNode corrections(String session, long after, int limit) {
         privacy.require(session, "local_processing");
@@ -451,32 +574,81 @@ final class SpeakerService {
         store.session(session);
         String segmentId = Json.id(request, "segment_id"), actual = Json.id(request, "actual_speaker");
         if (store.profiles(session).stream().noneMatch(p -> p.id().equals(actual))) throw new ApiException(404, "speaker_not_found", "Speaker is not enrolled in this session.");
-        return store.transaction(() -> {
-            try (var q = store.prepare("SELECT body,embedding,eligible FROM segments WHERE session_id=? AND id=?", session, segmentId); var r = q.executeQuery()) {
-                if (!r.next()) throw new ApiException(404, "segment_not_found", "Segment is not in this session.");
-                ObjectNode body = (ObjectNode) Json.parse(r.getString(1)); String embedding = r.getString(2); boolean eligible = r.getBoolean(3);
-                String previous = body.path("speaker_id").isNull() ? null : body.path("speaker_id").asText();
-                if (actual.equals(previous) && body.path("source").asText().equals("human_correction"))
-                    return Json.obj().put("correction_logged", false).put("already_applied", true).put("profile_updated", false).set("attribution", body);
-                store.execute("INSERT INTO corrections(session_id,segment_id,previous_speaker,actual_speaker,created_ms,profile_updated) VALUES(?,?,?,?,?,?)",
-                    session, segmentId, previous, actual, clock.millis(), eligible);
-                if (eligible) {
-                    store.execute("INSERT INTO correction_examples VALUES(?,?,?,?) ON CONFLICT(segment_id) DO UPDATE SET speaker_id=excluded.speaker_id,embedding=excluded.embedding", segmentId, session, actual, embedding);
-                    store.rebuildProfiles(session);
-                }
-                // Preserve model score and original identity; a human label does not calibrate the model.
-                if (!body.has("original_confidence")) body.set("original_confidence", body.get("confidence"));
-                body.put("speaker_id", actual).put("source", "human_correction").put("corrected_at_ms", clock.millis())
-                    .putNull("confidence").put("confidence_kind", "human_label").put("trusted", false).put("uncertain", true);
-                store.execute("UPDATE segments SET speaker_id=?,body=? WHERE id=?", actual, body.toString(), segmentId);
-                var response = Json.obj().put("correction_logged", true).put("profile_updated", eligible)
-                    .put("profile_update_reason", eligible ? "clean_speech_example" : "segment_not_verified_as_single_speaker");
-                return response.set("attribution", body);
+        return store.transaction(() -> correctSegment(session, segmentId, actual));
+    }
+    /** Inside a transaction: one segment's human correction, its example when the audio was verified single-speaker, and the profile rebuild. */
+    private ObjectNode correctSegment(String session, String segmentId, String actual) throws java.sql.SQLException {
+        try (var q = store.prepare("SELECT body,embedding,eligible FROM segments WHERE session_id=? AND id=?", session, segmentId); var r = q.executeQuery()) {
+            if (!r.next()) throw new ApiException(404, "segment_not_found", "Segment is not in this session.");
+            ObjectNode body = (ObjectNode) Json.parse(r.getString(1)); String embedding = r.getString(2); boolean eligible = r.getBoolean(3);
+            String previous = body.path("speaker_id").isNull() ? null : body.path("speaker_id").asText();
+            if (actual.equals(previous) && body.path("source").asText().equals("human_correction"))
+                return Json.obj().put("correction_logged", false).put("already_applied", true).put("profile_updated", false).set("attribution", body);
+            store.execute("INSERT INTO corrections(session_id,segment_id,previous_speaker,actual_speaker,created_ms,profile_updated) VALUES(?,?,?,?,?,?)",
+                session, segmentId, previous, actual, clock.millis(), eligible);
+            if (eligible) {
+                store.execute("INSERT INTO correction_examples VALUES(?,?,?,?) ON CONFLICT(segment_id) DO UPDATE SET speaker_id=excluded.speaker_id,embedding=excluded.embedding", segmentId, session, actual, embedding);
+                store.rebuildProfiles(session);
             }
+            // Preserve model score and original identity; a human label does not calibrate the model.
+            if (!body.has("original_confidence")) body.set("original_confidence", body.get("confidence"));
+            body.put("speaker_id", actual).put("source", "human_correction").put("corrected_at_ms", clock.millis())
+                .putNull("confidence").put("confidence_kind", "human_label").put("trusted", false).put("uncertain", true);
+            store.execute("UPDATE segments SET speaker_id=?,body=? WHERE id=?", actual, body.toString(), segmentId);
+            var response = Json.obj().put("correction_logged", true).put("profile_updated", eligible)
+                .put("profile_update_reason", eligible ? "clean_speech_example" : "segment_not_verified_as_single_speaker");
+            return response.set("attribution", body);
+        }
+    }
+    /**
+     * Operator review of one transcript row (docs/API.md, V3.1): the reviewed text and speaker sit beside the originals, and a
+     * speaker change corrects every segment inside the row's span through the same path as POST /correct, which is the in-session model improvement.
+     */
+    synchronized ObjectNode reviewUtterance(String session, long utteranceId, JsonNode request) {
+        privacy.require(session, "local_processing");
+        store.session(session);
+        String text = request.has("text") && !request.get("text").isNull() ? Json.text(request, "text", 4000) : null;
+        String speaker = request.has("speaker_id") && !request.get("speaker_id").isNull() ? Json.id(request, "speaker_id") : null;
+        if (text == null && speaker == null) throw new ApiException(400, "invalid_input", "Supply text, speaker_id or both.");
+        String source, original, current; long start, end;
+        try (var q = store.prepare("SELECT source,speaker_id,reviewed_speaker_id,start_ms,end_ms FROM utterances WHERE session_id=? AND id=?", session, utteranceId); var r = q.executeQuery()) {
+            if (!r.next()) throw new ApiException(404, "utterance_not_found", "Utterance is not in this session.");
+            source = r.getString(1); original = r.getString(2); current = r.getString(3) == null ? original : r.getString(3); start = r.getLong(4); end = r.getLong(5);
+        } catch (java.sql.SQLException e) { throw new IllegalStateException(e); }
+        if (speaker != null) {
+            if (source.equals("agent")) throw new ApiException(400, "invalid_input", "An agent row's attribution is declared by its producer; review its text only.");
+            if (store.profiles(session).stream().noneMatch(p -> p.id().equals(speaker))) {
+                boolean agent = store.participants(session).findValuesAsText("id").contains(speaker);
+                throw new ApiException(agent ? 400 : 404, agent ? "invalid_participant" : "speaker_not_found", "speaker_id must be a human enrolled in this session.");
+            }
+        }
+        boolean changed = speaker != null && !speaker.equals(current);
+        ObjectNode result = store.transaction(() -> {
+            long now = clock.millis(); int corrected = 0; boolean profileUpdated = false;
+            store.reviewUtterance(session, utteranceId, text, speaker, now);
+            if (changed) {
+                var segments = new ArrayList<String>();
+                // Segment spans are 250 ms from sequence*250; the stored body is the authority on the span.
+                try (var q = store.prepare("SELECT id,body FROM segments WHERE session_id=? AND sequence*250>=? AND sequence*250<? ORDER BY sequence", session, start, end); var r = q.executeQuery()) {
+                    while (r.next()) { var body = Json.parse(r.getString(2)); if (body.path("start_ms").asLong() >= start && body.path("end_ms").asLong() <= end) segments.add(r.getString(1)); }
+                }
+                for (String segment : segments) {
+                    var outcome = correctSegment(session, segment, speaker);
+                    if (outcome.path("correction_logged").asBoolean()) corrected++;
+                    profileUpdated |= outcome.path("profile_updated").asBoolean();
+                }
+            }
+            var row = store.utterance(session, utteranceId);
+            store.event(session, now, "utterance_reviewed", row);
+            return row.put("session_id", session).put("segments_corrected", corrected).put("profile_updated", profileUpdated);
         });
+        notifyAll();
+        return result;
     }
 
     synchronized ObjectNode end(String session) {
+        // Retaining people take their final in-session voiceprint with them before the room's graph is scheduled for destruction.
+        privacy.retainProfiles(session);
         privacy.schedule(session, "purpose_completed", null);
         buffers.remove(session); failures.remove(session);
         notifyAll(); destructionWakeup.run();

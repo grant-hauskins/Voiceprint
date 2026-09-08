@@ -15,7 +15,7 @@
     <span class="brand-text"><span class="brand-name" id="app-title">Voiceprint</span><span class="brand-message" id="app-message">Local room console</span></span>
   </a>
   <nav class="menu" id="menu" aria-label="Sections">
-    <a href="#agents-panel">Agents</a><a href="#transcript-panel">Conversation</a><a href="#proof-panel">Evidence</a><button type="button" id="review-releases" class="ghost">Releases</button>
+    <a href="#agents-panel">Agents</a><a href="#transcript-panel">Conversation</a><a href="#board-panel">Notes</a><a href="#proof-panel">Evidence</a><button type="button" id="review-releases" class="ghost">Releases</button>
   </nav>
   <div class="header-status"><span class="pill" id="connection">Disconnected</span><span class="pill phase" id="phase">Connect first</span></div>
 </header>
@@ -32,6 +32,13 @@
     </div>
     <p id="message" role="status" aria-live="polite"></p>
     <p id="destruction" role="status" aria-live="polite"></p>
+  </section>
+
+  <section class="panel summary" id="summary-panel" aria-labelledby="summary-title" hidden>
+    <div class="section-heading"><div><span class="eyebrow">RETAINED ARTIFACT</span><h2 id="summary-title">Closing summary</h2></div><button type="button" id="summary-delete" class="danger">Delete summary</button></div>
+    <p id="summary-meta" class="muted"></p>
+    <pre id="summary-text" class="preserve"></pre>
+    <p class="muted">Written by the arbitrator's text model from the notes board and the named transcript. Stored on the API for 30 days after the room ended unless deleted here.</p>
   </section>
 
   <div class="grid">
@@ -61,6 +68,23 @@
       <p class="muted">Recorded by our MCP server. Agent labels are caller declared; tool success does not prove the agent used its result.</p>
       <ol id="mcp-calls" class="feed"><li class="empty">No server calls received.</li></ol>
     </section>
+
+    <section class="panel board" id="board-panel" aria-labelledby="board-title">
+      <div class="board-columns">
+        <div>
+          <div class="section-heading"><h2 id="board-title">Notes board <span class="count" id="board-count">0</span></h2></div>
+          <p class="muted">Written by the arbitrator; the server withholds any registered private value before storing a line. Attribution labels remain uncalibrated; this is a demo, not for consequential negotiations.</p>
+          <ol id="board" class="feed"><li class="empty">No board lines received.</li></ol>
+        </div>
+        <div>
+          <div class="section-heading"><h3 id="raw-title">Raw agent channel <span class="count" id="raw-count">0</span></h3></div>
+          <p class="muted">What the agents say to each other. The API serves these rows only after every person in the room has revealed them; each person can hide them again.</p>
+          <div id="reveal-controls" class="inline"></div>
+          <p id="raw-state" class="muted">Waiting for authorization</p>
+          <ol id="raw-channel" class="feed"><li class="empty">No raw rows shown.</li></ol>
+        </div>
+      </div>
+    </section>
   </div>
 </main>
 
@@ -85,6 +109,8 @@
       <h3 id="runtime-title">Room and agents</h3>
       <form id="setup-form" hidden>
         <label id="key-label">OpenAI API key (kept in the runtime's memory only) <input id="openai-key" type="password" autocomplete="off"></label>
+        <label>Conversation type <select id="conversation-type"><option value="casual">casual</option><option value="negotiation">negotiation</option></select></label>
+        <p class="muted">A negotiation needs two voice agents that each speak for a different person (the advocates) and one text-only arbitrator; every person must also sign the negotiation_text disclosure.</p>
         <h4>People within microphone range</h4>
         <div id="setup-roster"></div>
         <button type="button" id="setup-add" class="ghost">Add person</button>
@@ -106,6 +132,9 @@
           <p class="muted">Include every person within microphone range. The roster is fixed for this capture.</p>
         </form>
       </details>
+      <h4 id="profiles-title">Retained voiceprints</h4>
+      <p class="muted">Voiceprints kept after a room ended by people who chose voice_profile_retention in their release (the embedding only, never audio or transcript). Each person deletes their own here; a withdrawal from a room deletes it too.</p>
+      <ul id="profiles" class="feed" aria-labelledby="profiles-title"><li class="empty">Connect to list retained voiceprints.</li></ul>
     </section>
 
     <section aria-labelledby="notice-title" class="gate-section notice" id="notice-section">
@@ -122,6 +151,12 @@
       <h3 id="release-title">Participant releases</h3>
       <div id="consents"></div>
       <p id="enrollment-help" class="preserve muted"></p>
+    </section>
+
+    <section class="gate-section" id="objectives-section" aria-labelledby="objectives-title" hidden>
+      <h3 id="objectives-title">Objectives</h3>
+      <p class="muted">Each person privately enters what they want and the figures they will not disclose. The position and constraints are stored on the API and given only to that person's own advocate agent; the arbitrator sees both. An uploaded file is parsed on this computer and only the fields are sent. Values are hidden here after saving; every save is a new version.</p>
+      <div id="objectives"></div>
     </section>
 
     <section class="gate-section" id="enrollment-section" aria-labelledby="enrollment-title">

@@ -54,7 +54,7 @@ final class PrivacyGate {
         var room = room(session); var participants = Json.arr();
         boolean valid = policy.configured() && PrivacyPolicy.VERSION.equals(room.path("policy_version").asText())
             && room.path("state").asText().equals("active") && clock.millis() < room.path("retention_deadline_ms").asLong();
-        boolean audio = true, hosted = true;
+        boolean audio = true, hosted = true, negotiation = true;
         try (var p = store.prepare("SELECT * FROM biometric_consents WHERE session_id=? ORDER BY participant_id", session); var r = p.executeQuery()) {
             while (r.next()) {
                 boolean granted = r.getBoolean("bipa_consent_granted") && r.getObject("revoked_at_ms") == null
@@ -62,19 +62,87 @@ final class PrivacyGate {
                     && r.getObject("consent_timestamp") != null && r.getString("subject_name").equals(r.getString("signature_text"));
                 var member = Json.obj().put("id", r.getString("participant_id")).put("name", r.getString("subject_name")).put("bipa_consent_granted", granted);
                 if (r.getObject("consent_timestamp") == null) member.putNull("consent_timestamp"); else member.put("consent_timestamp", r.getLong("consent_timestamp"));
-                participants.add(member); valid &= granted;
                 var scopes = Json.parse(r.getString("disclosure_scopes"));
-                audio &= contains(scopes, "openai_audio"); hosted &= contains(scopes, "hosted_mcp");
+                // Retention is per person, never room-wide: one person's choice neither needs nor grants another's.
+                participants.add(member.put("retain_profile", granted && contains(scopes, RETENTION))); valid &= granted;
+                audio &= contains(scopes, "openai_audio"); hosted &= contains(scopes, "hosted_mcp"); negotiation &= contains(scopes, "negotiation_text");
             }
         } catch (SQLException e) { throw new IllegalStateException(e); }
         valid &= participants.size() >= 2;
         room.put("policy_version", PrivacyPolicy.VERSION).put("consent_method_version", PrivacyPolicy.METHOD).put("allowed", valid);
         room.set("participants", participants);
         room.set("scopes", Json.obj().put("local_processing", valid).put("openai_audio", valid && audio && policy.openaiReviewed())
-            .put("hosted_mcp", valid && hosted && policy.openaiReviewed() && policy.cloudflareReviewed()));
+            .put("hosted_mcp", valid && hosted && policy.openaiReviewed() && policy.cloudflareReviewed())
+            .put("negotiation_text", valid && negotiation && policy.openaiReviewed()));
         return room;
     }
+    /** Human roster of the room: every biometric_consents participant, whether or not enrollment has happened yet. */
+    List<String> roster(String session) {
+        var result = new ArrayList<String>();
+        try (var p = store.prepare("SELECT participant_id FROM biometric_consents WHERE session_id=? ORDER BY participant_id", session); var r = p.executeQuery()) { while (r.next()) result.add(r.getString(1)); }
+        catch (SQLException e) { throw new IllegalStateException(e); }
+        return result;
+    }
     private static boolean contains(JsonNode array, String value) { for (var item : array) if (item.asText().equals(value)) return true; return false; }
+    static final String RETENTION = "voice_profile_retention";
+    /** The same operator-entered, unverified identity the release records; casefold is approximated by upper-then-lower in the root locale. */
+    static String subjectKey(String name, String contact) {
+        return PrivacyPolicy.sha256((fold(name) + "\n" + fold(contact)).getBytes(StandardCharsets.UTF_8));
+    }
+    private static String fold(String text) { return Objects.toString(text, "").strip().toUpperCase(Locale.ROOT).toLowerCase(Locale.ROOT); }
+    record Retainer(String participant, String subjectKey, String name) {}
+    /** Humans of the room whose current release includes voice_profile_retention. */
+    List<Retainer> retainers(String session) {
+        var result = new ArrayList<Retainer>();
+        try (var p = store.prepare("SELECT participant_id,subject_name,subject_contact,disclosure_scopes FROM biometric_consents WHERE session_id=? AND bipa_consent_granted=1 AND revoked_at_ms IS NULL ORDER BY participant_id", session); var r = p.executeQuery()) {
+            while (r.next()) if (contains(Json.parse(r.getString(4)), RETENTION)) result.add(new Retainer(r.getString(1), subjectKey(r.getString(2), r.getString(3)), r.getString(2)));
+        } catch (SQLException e) { throw new IllegalStateException(e); }
+        return result;
+    }
+    Retainer retainer(String session, String participant) {
+        for (var r : retainers(session)) if (r.participant().equals(participant)) return r;
+        return null;
+    }
+    /** Enrollment start for a retaining person: half the fresh embedding, half the retained one; a different model is ignored, not deleted. */
+    double[] seed(Retainer retainer, String model, double[] enrollment) {
+        if (retainer == null) return null;
+        var retained = store.retainedProfile(retainer.subjectKey());
+        if (retained == null || !retained.model().equals(model) || retained.vector().length != enrollment.length) return null;
+        return blend(enrollment, retained.vector());
+    }
+    private static double[] blend(double[] a, double[] b) {
+        double[] mixed = new double[a.length];
+        for (int i = 0; i < mixed.length; i++) mixed[i] = .5 * a[i] + .5 * b[i];
+        return Audio.normalize(mixed);
+    }
+    static long threeYears(long now) { return Instant.ofEpochMilli(now).atZone(ZoneOffset.UTC).plusYears(3).toInstant().toEpochMilli(); }
+    /** Purpose completion only: each retaining person's final in-session vector refreshes their retained voiceprint. Withdrawal, deletion and expiry never write one. */
+    void retainProfiles(String session) {
+        // Only a currently valid room writes: stale releases or a passed room deadline are treated like expiry.
+        if (!status(session).path("allowed").asBoolean()) return;
+        var retainers = retainers(session);
+        if (retainers.isEmpty()) return;
+        var profiles = new HashMap<String, Store.Profile>();
+        for (var p : store.profiles(session)) profiles.put(p.id(), p);
+        store.transaction(() -> {
+            long now = clock.millis(), deadline = threeYears(now);
+            for (var r : retainers) {
+                var profile = profiles.get(r.participant());
+                if (profile == null) continue;
+                var retained = store.retainedProfile(r.subjectKey());
+                boolean compatible = retained != null && retained.model().equals(profile.model()) && retained.vector().length == profile.vector().length;
+                store.upsertRetainedProfile(r.subjectKey(), r.name(), profile.model(), compatible ? blend(retained.vector(), profile.vector()) : profile.vector(), now, deadline);
+                audit(session, r.participant(), "voiceprint_retained", Json.obj().put("sessions", retained == null ? 1 : retained.sessions() + 1));
+            }
+            return null;
+        });
+    }
+    ObjectNode retainedProfiles() { return Json.obj().set("profiles", store.retainedProfiles()); }
+    ObjectNode deleteRetainedProfile(String subjectKey) {
+        boolean deleted = store.transaction(() -> store.deleteRetainedProfile(subjectKey));
+        if (!deleted) throw new ApiException(404, "profile_not_found", "No retained voiceprint has that subject key.");
+        return Json.obj().put("subject_key", subjectKey).put("deleted", true);
+    }
     void require(String session, String scope) {
         try { if (status(session).path("scopes").path(scope).asBoolean(false)) return; }
         catch (ApiException e) { if (e.status != 404) throw e; }
@@ -110,7 +178,7 @@ final class PrivacyGate {
         var scopes = request.path("disclosure_scopes");
         if (!scopes.isArray()) throw new ApiException(403, "release_rejected", "Select disclosure scopes explicitly, or use an empty list.");
         var unique = new HashSet<String>();
-        for (var scope : scopes) if (!scope.isTextual() || !Set.of("openai_audio", "hosted_mcp").contains(scope.asText()) || !unique.add(scope.asText())) throw new ApiException(403, "release_rejected", "Invalid disclosure scope.");
+        for (var scope : scopes) if (!scope.isTextual() || !Set.of("openai_audio", "hosted_mcp", "negotiation_text", RETENTION).contains(scope.asText()) || !unique.add(scope.asText())) throw new ApiException(403, "release_rejected", "Invalid disclosure scope.");
         if (!notice.equals(policy.noticeHash())) throw new ApiException(403, "release_rejected", "Review the current notice before signing.");
         return store.transaction(() -> {
             long now = clock.millis(); String consentId;
@@ -172,6 +240,14 @@ final class PrivacyGate {
             store.execute("UPDATE privacy_rooms SET state='destroying',roster_version=roster_version+1,purpose_completed_ms=? WHERE session_id=?", now, session);
             store.execute("UPDATE biometric_consents SET bipa_consent_granted=0,revoked_at_ms=COALESCE(revoked_at_ms,?) WHERE session_id=?", now, session);
             store.execute("UPDATE consent_challenges SET consumed=1 WHERE session_id=?", session);
+            // A withdrawal or explicit deletion takes the retained summary with it; purpose completion and expiry are the retention path.
+            if (reason.equals("withdrawal") || reason.equals("deletion_requested")) store.deleteSummary(session);
+            // A withdrawing person's voice is not kept because someone else still consents: their retained voiceprint goes in the same transaction.
+            if (reason.equals("withdrawal") && participant != null) {
+                try (var p = store.prepare("SELECT subject_name,subject_contact FROM biometric_consents WHERE session_id=? AND participant_id=?", session, participant); var row = p.executeQuery()) {
+                    if (row.next() && store.deleteRetainedProfile(subjectKey(row.getString(1), row.getString(2)))) audit(session, participant, "voiceprint_deleted", Json.obj().put("reason", reason));
+                }
+            }
             store.execute("INSERT OR IGNORE INTO destruction_jobs(session_id,state,created_ms) VALUES(?,'pending',?)", session, now);
             long job;
             try (var p = store.prepare("SELECT job_id FROM destruction_jobs WHERE session_id=?", session); var row = p.executeQuery()) { row.next(); job = row.getLong(1); }
@@ -191,6 +267,8 @@ final class PrivacyGate {
     }
     void sweep() {
         for (String session : expiredRooms()) schedule(session, "deadline_expired", null);
+        // Summaries are a separately retained artifact with their own 30-day deadline, not part of the session graph.
+        try { store.deleteExpiredSummaries(clock.millis()); store.deleteExpiredRetainedProfiles(clock.millis()); } catch (SQLException e) { throw new IllegalStateException(e); }
         var jobs = new ArrayList<Long>();
         try (var p = store.prepare("SELECT job_id FROM destruction_jobs WHERE state!='complete' AND (lease_until_ms IS NULL OR lease_until_ms<=?) ORDER BY job_id LIMIT 100", clock.millis()); var r = p.executeQuery()) { while (r.next()) jobs.add(r.getLong(1)); }
         catch (SQLException e) { throw new IllegalStateException(e); }
@@ -207,6 +285,8 @@ final class PrivacyGate {
             if (!sqliteDone) {
                 store.transaction(() -> {
                     store.execute("DELETE FROM sessions WHERE id=?", session);
+                    // These reference the privacy room rather than the session, so no cascade reaches them.
+                    for (String table : List.of("objectives", "agent_channel", "channel_reveals")) store.execute("DELETE FROM " + table + " WHERE session_id=?", session);
                     store.execute("UPDATE biometric_consents SET opening_audio_sha256=NULL WHERE session_id=?", session);
                     store.execute("DELETE FROM consent_challenges WHERE session_id=?", session);
                     store.execute("UPDATE destruction_items SET attempts=attempts+1 WHERE job_id=? AND destination='sqlite_session_graph'", job);
@@ -215,7 +295,7 @@ final class PrivacyGate {
                 try (var p = store.prepare("PRAGMA wal_checkpoint(TRUNCATE)"); var r = p.executeQuery()) { if (r.getInt(1) != 0) throw new SQLException("WAL checkpoint busy"); }
                 store.execute("VACUUM");
                 try (var p = store.prepare("PRAGMA wal_checkpoint(TRUNCATE)"); var r = p.executeQuery()) { if (r.getInt(1) != 0) throw new SQLException("WAL checkpoint busy after compaction"); }
-                for (String table : List.of("sessions", "profiles", "participants", "segments", "corrections", "correction_examples", "utterances", "events", "floor", "mcp_calls")) {
+                for (String table : List.of("sessions", "profiles", "participants", "segments", "corrections", "correction_examples", "utterances", "events", "floor", "mcp_calls", "objectives", "agent_channel", "channel_reveals")) {
                     String column = table.equals("sessions") ? "id" : "session_id";
                     try (var p = store.prepare("SELECT count(*) FROM " + table + " WHERE " + column + "=?", session); var r = p.executeQuery()) { if (r.getLong(1) != 0) throw new SQLException("Session graph remains"); }
                 }

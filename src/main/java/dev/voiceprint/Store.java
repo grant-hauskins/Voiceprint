@@ -12,15 +12,19 @@ final class Store implements AutoCloseable {
     record Session(String id, String status, long nextSequence, long elapsedMs) {}
     record Profile(String id, String name, String model, double[] anchor, double[] vector) {}
     record Lease(String participant, long expiresAt) {}
+    record Retained(String subjectKey, String name, String model, double[] vector, long sessions, long created, long lastInteraction, long deadline) {}
     interface Work<T> { T run() throws Exception; }
     Store(Path path) throws Exception {
         Path parent = path.toAbsolutePath().getParent(); Files.createDirectories(parent);
         db = DriverManager.getConnection("jdbc:sqlite:" + path.toAbsolutePath());
+        try { migrate(); } catch (Exception e) { db.close(); throw e; }
+    }
+    private void migrate() throws Exception {
         try (var s = db.createStatement()) {
             s.execute("PRAGMA foreign_keys=ON"); s.execute("PRAGMA journal_mode=WAL"); s.execute("PRAGMA busy_timeout=3000");
             s.execute("PRAGMA secure_delete=ON");
             int version; try (var r = s.executeQuery("PRAGMA user_version")) { version = r.getInt(1); }
-            if (version > 5) throw new IllegalStateException("Database schema is newer than this application");
+            if (version > 7) throw new IllegalStateException("Database schema is newer than this application");
             s.execute("CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,status TEXT NOT NULL,created_ms INTEGER NOT NULL,next_sequence INTEGER NOT NULL DEFAULT 0,elapsed_ms INTEGER NOT NULL DEFAULT 0)");
             s.execute("CREATE TABLE IF NOT EXISTS profiles(session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,id TEXT NOT NULL,name TEXT NOT NULL,model TEXT NOT NULL,anchor TEXT NOT NULL,vector TEXT NOT NULL,PRIMARY KEY(session_id,id))");
             s.execute("CREATE TABLE IF NOT EXISTS segments(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,sequence INTEGER NOT NULL,hash TEXT NOT NULL,speaker_id TEXT,body TEXT NOT NULL,embedding TEXT,eligible INTEGER NOT NULL,UNIQUE(session_id,sequence))");
@@ -51,7 +55,7 @@ final class Store implements AutoCloseable {
                     s.execute("CREATE INDEX events_session ON events(session_id,id)");
                     s.execute("CREATE TABLE mcp_calls(id INTEGER PRIMARY KEY AUTOINCREMENT,session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,timestamp_ms INTEGER NOT NULL,caller_ip TEXT NOT NULL,participant_id TEXT,tool TEXT NOT NULL,arguments TEXT NOT NULL,bytes INTEGER NOT NULL,failed INTEGER NOT NULL)");
                     s.execute("CREATE INDEX mcp_calls_session ON mcp_calls(session_id,id)");
-                    try (var rows = db.createStatement(); var r = rows.executeQuery(UTTERANCE_SELECT + " ORDER BY u.id")) {
+                    try (var rows = db.createStatement(); var r = rows.executeQuery(utteranceSelect(false) + " ORDER BY u.id")) {  // review columns arrive in v7
                         while (r.next()) event(r.getString("session_id"), r.getLong("created_ms"), "utterance", utteranceRow(r));
                     }
                     s.execute("PRAGMA user_version=4");
@@ -71,6 +75,31 @@ final class Store implements AutoCloseable {
                     // Unknown old data is preserved but never silently authorized or auto-purged.
                     s.execute("INSERT INTO privacy_rooms(session_id,purpose_id,state,created_ms,last_interaction_ms,retention_deadline_ms,policy_version) SELECT id,'legacy_unknown','legacy_blocked',created_ms,created_ms,created_ms,'legacy_unknown' FROM sessions");
                     s.execute("PRAGMA user_version=5");
+                    db.commit();
+                } catch (Exception e) { db.rollback(); throw e; }
+                finally { db.setAutoCommit(true); }
+            }
+            if (version < 6) {
+                // Objectives, channel and reveals hang off the privacy room (it predates enrollment); purge deletes them explicitly.
+                db.setAutoCommit(false);
+                try {
+                    s.execute("CREATE TABLE objectives(id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL REFERENCES privacy_rooms(session_id), principal_id TEXT NOT NULL, version INTEGER NOT NULL, position TEXT NOT NULL, constraints TEXT NOT NULL, source TEXT NOT NULL CHECK(source IN ('typed','uploaded')), trigger TEXT NOT NULL, created_ms INTEGER NOT NULL, UNIQUE(session_id,principal_id,version))");
+                    s.execute("CREATE TABLE agent_channel(id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL REFERENCES privacy_rooms(session_id), sender_participant_id TEXT NOT NULL, tier TEXT NOT NULL CHECK(tier IN ('board','raw')), tag TEXT, text TEXT NOT NULL, redactions INTEGER NOT NULL DEFAULT 0, timestamp_ms INTEGER NOT NULL)");
+                    s.execute("CREATE INDEX agent_channel_session ON agent_channel(session_id,id)");
+                    s.execute("CREATE TABLE channel_reveals(session_id TEXT NOT NULL REFERENCES privacy_rooms(session_id), participant_id TEXT NOT NULL, revealed_ms INTEGER NOT NULL, PRIMARY KEY(session_id,participant_id))");
+                    s.execute("CREATE TABLE summaries(session_id TEXT PRIMARY KEY, text TEXT NOT NULL, model TEXT NOT NULL, board_rows INTEGER NOT NULL, transcript_rows INTEGER NOT NULL, created_ms INTEGER NOT NULL, retention_deadline_ms INTEGER NOT NULL)");
+                    s.execute("PRAGMA user_version=6");
+                    db.commit();
+                } catch (Exception e) { db.rollback(); throw e; }
+                finally { db.setAutoCommit(true); }
+            }
+            if (version < 7) {
+                // Review columns sit beside the originals; retained voiceprints are their own retention class, untouched by session destruction.
+                db.setAutoCommit(false);
+                try {
+                    for (String column : new String[] {"reviewed_text TEXT", "reviewed_speaker_id TEXT", "reviewed_ms INTEGER"}) s.execute("ALTER TABLE utterances ADD COLUMN " + column);
+                    s.execute("CREATE TABLE retained_profiles(subject_key TEXT PRIMARY KEY,subject_name TEXT NOT NULL,model TEXT NOT NULL,vector TEXT NOT NULL,sessions INTEGER NOT NULL DEFAULT 1,created_ms INTEGER NOT NULL,last_interaction_ms INTEGER NOT NULL,retention_deadline_ms INTEGER NOT NULL)");
+                    s.execute("PRAGMA user_version=7");
                     db.commit();
                 } catch (Exception e) { db.rollback(); throw e; }
                 finally { db.setAutoCommit(true); }
@@ -140,13 +169,22 @@ final class Store implements AutoCloseable {
         } catch (SQLException e) { throw new IllegalStateException(e); }
     }
     ArrayNode utterances(String session, long after, int limit, int minRank) {
-        try (var p = prepare(UTTERANCE_SELECT + " WHERE u.session_id=? AND u.id>? AND (CASE u.label WHEN 'agent' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END)>=? ORDER BY u.id LIMIT ?", session, after, minRank, limit); var r = p.executeQuery()) {
+        try (var p = prepare(UTTERANCE_SELECT + " WHERE u.session_id=? AND u.id>? AND (CASE " + LABEL + " WHEN 'agent' THEN 4 WHEN 'reviewed' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END)>=? ORDER BY u.id LIMIT ?", session, after, minRank, limit); var r = p.executeQuery()) {
             var result = Json.arr();
             while (r.next()) result.add(utteranceRow(r));
             return result;
         } catch (SQLException e) { throw new IllegalStateException(e); }
     }
-    private static final String UTTERANCE_SELECT = "SELECT u.id,u.speaker_id,p.name,u.start_ms,u.end_ms,u.text,u.source,u.similarity,u.margin,u.overlap_ratio,u.abstain_ratio,u.label,u.candidates,u.session_id,u.created_ms FROM utterances u LEFT JOIN participants p ON p.session_id=u.session_id AND p.id=u.speaker_id";
+    /** Reads present the reviewed speaker and text; a speaker review makes the label 'reviewed', a human label ranked like 'agent'. */
+    private static final String LABEL = "(CASE WHEN u.reviewed_speaker_id IS NULL THEN u.label ELSE 'reviewed' END)";
+    private static String utteranceSelect(boolean reviewable) {
+        String text = reviewable ? "u.reviewed_text" : "NULL", who = reviewable ? "u.reviewed_speaker_id" : "NULL", when = reviewable ? "u.reviewed_ms" : "NULL";
+        return "SELECT u.id,COALESCE(" + who + ",u.speaker_id),p.name,u.start_ms,u.end_ms,COALESCE(" + text + ",u.text),u.source,u.similarity,u.margin,u.overlap_ratio,u.abstain_ratio,"
+            + "CASE WHEN " + who + " IS NULL THEN u.label ELSE 'reviewed' END,u.candidates,u.session_id,u.created_ms,"
+            + "CASE WHEN " + text + " IS NULL THEN NULL ELSE u.text END,CASE WHEN " + who + " IS NULL THEN NULL ELSE u.speaker_id END," + when
+            + " FROM utterances u LEFT JOIN participants p ON p.session_id=u.session_id AND p.id=COALESCE(" + who + ",u.speaker_id)";
+    }
+    private static final String UTTERANCE_SELECT = utteranceSelect(true);
     private static ObjectNode utteranceRow(ResultSet r) throws SQLException {
         var row = Json.obj().put("utterance_id", r.getLong(1)).put("speaker_id", r.getString(2)).put("speaker_name", r.getString(3))
             .put("start_ms", r.getLong(4)).put("end_ms", r.getLong(5)).put("text", r.getString(6)).put("source", r.getString(7));
@@ -154,6 +192,8 @@ final class Store implements AutoCloseable {
         row.put("label", r.getString(12));
         String candidates = r.getString(13);
         row.set("candidates", candidates == null ? Json.arr() : Json.parse(candidates));
+        row.put("original_text", r.getString(16)).put("original_speaker_id", r.getString(17));
+        long reviewed = r.getLong(18); if (r.wasNull()) row.putNull("reviewed_ms"); else row.put("reviewed_ms", reviewed);
         return row;
     }
     ObjectNode utterance(String session, long id) throws SQLException {
@@ -198,6 +238,105 @@ final class Store implements AutoCloseable {
             return result;
         } catch (SQLException e) { throw new IllegalStateException(e); }
     }
+    /** Latest version per principal ordered by principal, or every version ordered by ID. */
+    ArrayNode objectives(String session, boolean history) {
+        String sql = history ? "SELECT * FROM objectives WHERE session_id=? ORDER BY id"
+            : "SELECT * FROM objectives o WHERE session_id=? AND version=(SELECT max(version) FROM objectives WHERE session_id=o.session_id AND principal_id=o.principal_id) ORDER BY principal_id";
+        try (var p = prepare(sql, session); var r = p.executeQuery()) {
+            var result = Json.arr();
+            while (r.next()) {
+                var row = Json.obj().put("principal_id", r.getString("principal_id")).put("version", r.getLong("version")).put("position", r.getString("position"));
+                row.set("constraints", Json.parse(r.getString("constraints")));
+                result.add(row.put("source", r.getString("source")).put("trigger", r.getString("trigger")).put("created_ms", r.getLong("created_ms")));
+            }
+            return result;
+        } catch (SQLException e) { throw new IllegalStateException(e); }
+    }
+    /** Inside a transaction: the next version for this principal is max+1, never an in-place edit. */
+    long insertObjective(String session, String principal, String position, String constraints, String source, String trigger, long now) throws SQLException {
+        execute("INSERT INTO objectives(session_id,principal_id,version,position,constraints,source,trigger,created_ms) SELECT ?,?,COALESCE(max(version),0)+1,?,?,?,?,? FROM objectives WHERE session_id=? AND principal_id=?",
+            session, principal, position, constraints, source, trigger, now, session, principal);
+        try (var p = prepare("SELECT version FROM objectives WHERE id=?", lastInsertId()); var r = p.executeQuery()) { r.next(); return r.getLong(1); }
+    }
+    /** Union of constraint values from every principal's latest objective; what the guard watches. */
+    List<String> constraintValues(String session) {
+        var values = new ArrayList<String>();
+        for (var objective : objectives(session, false)) for (var c : objective.path("constraints")) if (c.path("value").isTextual()) values.add(c.path("value").asText());
+        return values;
+    }
+    private static final String CHANNEL_SELECT = "SELECT c.id,c.sender_participant_id,p.name,c.tier,c.tag,c.text,c.redactions,c.timestamp_ms FROM agent_channel c LEFT JOIN participants p ON p.session_id=c.session_id AND p.id=c.sender_participant_id";
+    private static ObjectNode channelRow(ResultSet r) throws SQLException {
+        return Json.obj().put("row_id", r.getLong(1)).put("sender_participant_id", r.getString(2)).put("sender_name", r.getString(3)).put("tier", r.getString(4))
+            .put("tag", r.getString(5)).put("text", r.getString(6)).put("redactions", r.getInt(7)).put("timestamp_ms", r.getLong(8));
+    }
+    /** Rows after the cursor; a null tier means every tier. */
+    ArrayNode channel(String session, long after, int limit, String tier) {
+        try (var p = prepare(CHANNEL_SELECT + " WHERE c.session_id=? AND c.id>? AND (? IS NULL OR c.tier=?) ORDER BY c.id LIMIT ?", session, after, tier, tier, limit); var r = p.executeQuery()) {
+            var result = Json.arr(); while (r.next()) result.add(channelRow(r)); return result;
+        } catch (SQLException e) { throw new IllegalStateException(e); }
+    }
+    ObjectNode channelRow(String session, long id) throws SQLException {
+        try (var p = prepare(CHANNEL_SELECT + " WHERE c.session_id=? AND c.id=?", session, id); var r = p.executeQuery()) {
+            if (!r.next()) throw new IllegalStateException("Stored channel row missing");
+            return channelRow(r);
+        }
+    }
+    long insertChannel(String session, String sender, String tier, String tag, String text, int redactions, long now) throws SQLException {
+        execute("INSERT INTO agent_channel(session_id,sender_participant_id,tier,tag,text,redactions,timestamp_ms) VALUES(?,?,?,?,?,?,?)", session, sender, tier, tag, text, redactions, now);
+        return lastInsertId();
+    }
+    List<String> reveals(String session) {
+        var result = new ArrayList<String>();
+        try (var p = prepare("SELECT participant_id FROM channel_reveals WHERE session_id=? ORDER BY participant_id", session); var r = p.executeQuery()) { while (r.next()) result.add(r.getString(1)); }
+        catch (SQLException e) { throw new IllegalStateException(e); }
+        return result;
+    }
+    void reveal(String session, String participant, boolean revealed, long now) throws SQLException {
+        if (revealed) execute("INSERT INTO channel_reveals VALUES(?,?,?) ON CONFLICT(session_id,participant_id) DO UPDATE SET revealed_ms=excluded.revealed_ms", session, participant, now);
+        else execute("DELETE FROM channel_reveals WHERE session_id=? AND participant_id=?", session, participant);
+    }
+    void saveSummary(String session, String text, String model, long boardRows, long transcriptRows, long now, long deadline) throws SQLException {
+        execute("INSERT OR REPLACE INTO summaries VALUES(?,?,?,?,?,?,?)", session, text, model, boardRows, transcriptRows, now, deadline);
+    }
+    ObjectNode summary(String session) {
+        try (var p = prepare("SELECT * FROM summaries WHERE session_id=?", session); var r = p.executeQuery()) {
+            if (!r.next()) return null;
+            return Json.obj().put("session_id", session).put("text", r.getString("text")).put("model", r.getString("model")).put("board_rows", r.getLong("board_rows"))
+                .put("transcript_rows", r.getLong("transcript_rows")).put("created_ms", r.getLong("created_ms")).put("retention_deadline_ms", r.getLong("retention_deadline_ms"));
+        } catch (SQLException e) { throw new IllegalStateException(e); }
+    }
+    boolean deleteSummary(String session) throws SQLException {
+        try (var p = prepare("DELETE FROM summaries WHERE session_id=?", session)) { return p.executeUpdate() > 0; }
+    }
+    void deleteExpiredSummaries(long now) throws SQLException { execute("DELETE FROM summaries WHERE retention_deadline_ms<=?", now); }
+    /** Inside a transaction: the operator's text and speaker sit beside the originals, which are never overwritten. */
+    void reviewUtterance(String session, long id, String text, String speaker, long now) throws SQLException {
+        execute("UPDATE utterances SET reviewed_text=COALESCE(?,reviewed_text),reviewed_speaker_id=COALESCE(?,reviewed_speaker_id),reviewed_ms=? WHERE session_id=? AND id=?", text, speaker, now, session, id);
+    }
+    Retained retainedProfile(String subjectKey) {
+        try (var p = prepare("SELECT * FROM retained_profiles WHERE subject_key=?", subjectKey); var r = p.executeQuery()) {
+            if (!r.next()) return null;
+            return new Retained(r.getString("subject_key"), r.getString("subject_name"), r.getString("model"), vector(r.getString("vector")), r.getLong("sessions"), r.getLong("created_ms"), r.getLong("last_interaction_ms"), r.getLong("retention_deadline_ms"));
+        } catch (SQLException e) { throw new IllegalStateException(e); }
+    }
+    /** Inside a transaction: a first room inserts the vector; a later room replaces it and counts one more session. */
+    void upsertRetainedProfile(String subjectKey, String name, String model, double[] vector, long now, long deadline) throws SQLException {
+        execute("INSERT INTO retained_profiles VALUES(?,?,?,?,1,?,?,?) ON CONFLICT(subject_key) DO UPDATE SET subject_name=excluded.subject_name,model=excluded.model,vector=excluded.vector,sessions=sessions+1,last_interaction_ms=excluded.last_interaction_ms,retention_deadline_ms=excluded.retention_deadline_ms",
+            subjectKey, name, model, vectorJson(vector), now, now, deadline);
+    }
+    /** Never the vector. */
+    ArrayNode retainedProfiles() {
+        try (var p = prepare("SELECT * FROM retained_profiles ORDER BY last_interaction_ms DESC,subject_key"); var r = p.executeQuery()) {
+            var result = Json.arr();
+            while (r.next()) result.add(Json.obj().put("subject_key", r.getString("subject_key")).put("subject_name", r.getString("subject_name")).put("model", r.getString("model")).put("sessions", r.getLong("sessions"))
+                .put("created_ms", r.getLong("created_ms")).put("last_interaction_ms", r.getLong("last_interaction_ms")).put("retention_deadline_ms", r.getLong("retention_deadline_ms")));
+            return result;
+        } catch (SQLException e) { throw new IllegalStateException(e); }
+    }
+    boolean deleteRetainedProfile(String subjectKey) throws SQLException {
+        try (var p = prepare("DELETE FROM retained_profiles WHERE subject_key=?", subjectKey)) { return p.executeUpdate() > 0; }
+    }
+    void deleteExpiredRetainedProfiles(long now) throws SQLException { execute("DELETE FROM retained_profiles WHERE retention_deadline_ms<=?", now); }
     void rebuildProfiles(String session) throws SQLException {
         for (Profile p : profiles(session)) {
             double[] sum = new double[p.anchor.length]; int count = 0;

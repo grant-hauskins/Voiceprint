@@ -412,9 +412,10 @@ class Stream:
         return api(self.base, f"/speaker/session/{self.session}/end", {})
 
 
-def enroll(base, session, names, record, replay_wavs=None, consent=None, on_reject=None):
+def enroll(base, session, names, record, replay_wavs=None, consent=None, on_reject=None, on_response=None):
     """Enroll `names` (list) and return {participant_id: name}. `record(name)` returns 8 s of PCM16 from the mic.
-    `on_reject(message)` is told when the API rejects the statements and everyone is recorded again."""
+    `on_reject(message)` is told when the API rejects the statements and everyone is recorded again.
+    `on_response(init_response)` receives the accepted init body (its participants[] carry profile_seeded, V3.1)."""
     ids = {f"participant_{i}": name for i, name in enumerate(names, 1)}
     require_consent(consent)
     while True:
@@ -425,7 +426,9 @@ def enroll(base, session, names, record, replay_wavs=None, consent=None, on_reje
             participants.append({"id": pid, "name": name, "opening_statement_audio": base64.b64encode(pcm).decode()})
         try:
             require_consent(consent)
-            api(base, "/speaker/session/init", {"session_id": session, "sample_rate": 16000, "audio_format": "pcm_s16le", "participants": participants})
+            response = api(base, "/speaker/session/init", {"session_id": session, "sample_rate": 16000, "audio_format": "pcm_s16le", "participants": participants})
+            if on_response is not None:
+                on_response(response)
             return ids
         except RuntimeError as error:
             if "422" not in str(error) or replay_wavs:

@@ -49,7 +49,8 @@ final class RestServer implements AutoCloseable {
                 throw new ApiException(401, "unauthorized", "A valid bearer token is required.");
             if (path.equals("/health") && method.equals("GET")) { respond(exchange, 200, Json.obj().put("status", "ok").put("service", "voiceprint").put("model_readiness", "checked_on_inference")); return; }
             if (token == null || token.isBlank()) throw new ApiException(503, "operator_auth_required", "Configure an operator API token before using privacy or conversation endpoints.");
-            boolean consentWrite = method.equals("POST") && (path.equals("/privacy/rooms") || path.contains("/consents/"));
+            boolean consentWrite = method.equals("POST") && (path.equals("/privacy/rooms") || path.contains("/consents/") || path.endsWith("/agent_channel/reveal"))
+                || method.equals("DELETE") && path.startsWith("/privacy/profiles/");  // the person clicks the delete themselves
             if (consentWrite && origins == null) throw new ApiException(403, "origin_rejected", "Consent submission requires the exact local browser origin.");
             String admissionSession = null;
             String scope = "true".equals(exchange.getRequestHeaders().getFirst("X-Voiceprint-Hosted-MCP")) ? "hosted_mcp" : "local_processing";
@@ -58,8 +59,12 @@ final class RestServer implements AutoCloseable {
                 if (admissionSession == null || !admissionSession.matches("[A-Za-z0-9_-]{1,80}")) throw new ApiException(403, "prior_written_release_required", "Supply the authorized room in X-Voiceprint-Session before sending enrollment audio.");
             } else {
                 String[] admission = path.split("/");
-                if (admission.length == 5 && admission[1].equals("speaker") && admission[2].equals("session")
-                    && Set.of("audio", "utterances", "correct", "current", "profiles", "participants", "transcript", "corrections", "floor", "events").contains(admission[4])) admissionSession = admission[3];
+                boolean room = admission.length >= 5 && admission[1].equals("speaker") && admission[2].equals("session");
+                // The summary outlives the room: only writing it needs admission; reading or deleting it happens after destruction.
+                if (room && admission.length == 5 && Set.of("audio", "utterances", "correct", "current", "profiles", "participants", "transcript", "corrections", "floor", "events", "objectives", "agent_channel", "summary").contains(admission[4])
+                    && !(admission[4].equals("summary") && !method.equals("POST"))) admissionSession = admission[3];
+                if (room && admission.length == 6 && admission[4].equals("agent_channel") && admission[5].equals("reveal")) admissionSession = admission[3];
+                if (room && admission.length == 7 && admission[4].equals("utterances") && admission[6].equals("review")) admissionSession = admission[3];
             }
             // Admission happens before the app reads, decodes or hashes any unauthorized audio body.
             if (admissionSession != null) service.requireConsent(admissionSession, scope);
@@ -75,6 +80,12 @@ final class RestServer implements AutoCloseable {
             }
             if (path.equals("/privacy/rooms") && method.equals("POST")) { respond(exchange, 201, service.createPrivacyRoom(body)); return; }
             if (path.equals("/privacy/rooms") && method.equals("GET")) { respond(exchange, 200, service.privacyRooms()); return; }
+            if (path.equals("/privacy/profiles") && method.equals("GET")) { respond(exchange, 200, service.retainedProfiles()); return; }
+            if (path.startsWith("/privacy/profiles/") && method.equals("DELETE")) {
+                String key = path.substring("/privacy/profiles/".length());
+                if (!key.matches("[0-9a-f]{64}")) throw new ApiException(400, "invalid_input", "subject_key must be a 64-character hex SHA-256.");
+                respond(exchange, 200, service.deleteRetainedProfile(key)); return;
+            }
             if (path.equals("/speaker/session/init") && method.equals("POST")) {
                 if (!body.path("session_id").asText().equals(admissionSession)) throw new ApiException(403, "roster_mismatch", "Enrollment room does not match its authorization header.");
                 synchronized (service) { respond(exchange, 201, service.init(body)); } return;
@@ -97,10 +108,25 @@ final class RestServer implements AutoCloseable {
                 var registration = service.register(session, body);
                 respond(exchange, registration.created() ? 201 : 200, registration.response()); return;
             }
+            if (parts.length == 6 && parts[4].equals("agent_channel") && parts[5].equals("reveal") && method.equals("POST")) {
+                synchronized (service) { service.requireConsent(session, scope); respond(exchange, 200, service.reveal(session, body)); } return;
+            }
             ObjectNode result;
+            int status = method.equals("POST") && Set.of("objectives", "agent_channel", "summary").contains(action) ? 201 : 200;
             if (parts.length == 4 && method.equals("DELETE")) result = service.delete(session);
+            else if (parts.length == 7 && parts[4].equals("utterances") && parts[6].equals("review") && method.equals("POST")) {
+                if (!parts[5].matches("[1-9][0-9]{0,17}")) throw new ApiException(400, "invalid_input", "utterance_id must be a positive integer.");
+                result = service.reviewUtterance(session, Long.parseLong(parts[5]), body);
+            }
             else if (parts.length != 5) throw new ApiException(404, "not_found", "Endpoint does not exist.");
             else result = switch (method + " " + action) {
+                case "POST objectives" -> service.createObjective(session, body);
+                case "GET objectives" -> service.objectives(session, Set.of("1", "true").contains(query.getOrDefault("history", "0")));
+                case "POST agent_channel" -> service.postChannel(session, body);
+                case "GET agent_channel" -> service.channel(session, number(query, "after_id", 0), (int) number(query, "limit", 100), query.getOrDefault("tier", "all"), scope.equals("hosted_mcp"));
+                case "POST summary" -> service.saveSummary(session, body);
+                case "GET summary" -> service.summary(session);
+                case "DELETE summary" -> service.deleteSummary(session);
                 case "POST audio" -> service.ingest(session, body);
                 case "GET current" -> service.current(session);
                 case "GET profiles" -> service.profiles(session);
@@ -121,7 +147,7 @@ final class RestServer implements AutoCloseable {
             };
             synchronized (service) {
                 if (admissionSession != null) service.requireConsent(admissionSession, scope);
-                respond(exchange, 200, result);
+                respond(exchange, status, result);
             }
         } catch (ApiException e) { respond(exchange, e.status, Json.error(e.code, e.getMessage())); }
         catch (Exception e) { System.err.println("Request failed: " + e.getClass().getSimpleName()); respond(exchange, 500, Json.error("internal_error", "Request could not be completed.")); }

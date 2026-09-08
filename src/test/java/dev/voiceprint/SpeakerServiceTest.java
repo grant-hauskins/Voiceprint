@@ -177,7 +177,7 @@ class SpeakerServiceTest {
         assertEquals("legacy", store.utterances("old", 0, 100, 0).get(0).path("text").asText());
         assertEquals("legacy_blocked", service.consentStatus("old").path("state").asText());
         assertEquals(403, assertThrows(ApiException.class, () -> service.utterances("old", 0, 100, null)).status);
-        try (var s = store.db.createStatement(); var r = s.executeQuery("PRAGMA user_version")) { assertEquals(5, r.getInt(1)); }
+        try (var s = store.db.createStatement(); var r = s.executeQuery("PRAGMA user_version")) { assertEquals(7, r.getInt(1)); }
     }
     @Test void malformedAudioAndNonintegralSequenceRejected() {
         PrivacyTestSupport.init(service, initRequest("test"));

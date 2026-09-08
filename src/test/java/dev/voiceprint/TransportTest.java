@@ -40,7 +40,7 @@ class TransportTest {
         var lines = output.toString(StandardCharsets.UTF_8).lines().map(Json::parse).toList();
         assertEquals(4, lines.size());
         assertEquals("2025-11-25", lines.get(0).path("result").path("protocolVersion").asText());
-        assertEquals(5, lines.get(1).path("result").path("tools").size());
+        assertEquals(7, lines.get(1).path("result").path("tools").size());
         for (var tool : lines.get(1).path("result").path("tools"))   // every property schema must be an object, or clients drop the tool
             for (var property : tool.path("inputSchema").path("properties")) assertTrue(property.isObject(), tool.path("name").asText());
         assertEquals("waiting", lines.get(2).path("result").path("structuredContent").path("status").asText());
@@ -55,7 +55,7 @@ class TransportTest {
             // tools/list without any prior initialize: hosted clients may send each request from a different worker.
             var list = client.send(post.apply("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}").build(), HttpResponse.BodyHandlers.ofString());
             assertEquals(200, list.statusCode()); assertTrue(list.headers().firstValue("Content-Type").orElse("").startsWith("application/json"));
-            assertEquals(5, Json.parse(list.body()).path("result").path("tools").size());
+            assertEquals(7, Json.parse(list.body()).path("result").path("tools").size());
             // initialize twice is fine and echoes a supported requested version.
             String init = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"t\",\"version\":\"1\"}}}";
             assertEquals("2025-06-18", Json.parse(client.send(post.apply(init).build(), HttpResponse.BodyHandlers.ofString()).body()).path("result").path("protocolVersion").asText());

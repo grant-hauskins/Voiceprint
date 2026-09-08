@@ -62,12 +62,13 @@ final class McpHttpServer implements AutoCloseable {
             if (arguments.isMissingNode()) arguments = Json.obj();
             ObjectNode response;
             int status = 200;
+            String participant = participantTag(exchange.getRequestURI().getRawQuery());
             try {
                 if (toolCall) {
                     if (recorder == null) throw new ApiException(403, "privacy_gate_unavailable", "Hosted disclosure requires the authoritative privacy gate.");
                     recorder.authorizeHosted(tool, arguments);
                 }
-                response = McpServer.dispatch(message, client, api, apiToken, null, true);
+                response = McpServer.dispatch(message, client, api, apiToken, null, true, participant);
             } catch (ApiException e) { response = McpServer.error(message.get("id"), -32003, e.getMessage()); status = 403; }
             if (response == null) { exchange.sendResponseHeaders(202, -1); return; }
             // Independent evidence that a hosted agent used the tool: written by this process, not reported by the agent.
@@ -86,7 +87,7 @@ final class McpHttpServer implements AutoCloseable {
                 int size = response.toString().getBytes(StandardCharsets.UTF_8).length;
                 boolean failed = response.has("error") || response.path("result").path("isError").asBoolean(false);
                 System.err.println(java.time.LocalTime.now().withNano(0) + " MCP " + rpc + " " + detail + " from " + via + " -> " + (failed ? "error" : "ok") + " " + size + " bytes");
-                if (toolCall && recorder != null) recorder.recordMcpCall(via, participantTag(exchange.getRequestURI().getRawQuery()), safeTool, arguments, size, failed);
+                if (toolCall && recorder != null) recorder.recordMcpCall(via, participant, safeTool, arguments, size, failed);
                 respond(exchange, status, response);
             }
         } catch (Exception e) { System.err.println("MCP request failed: " + e.getClass().getSimpleName()); respond(exchange, 500, Json.error("internal_error", "Request could not be completed.")); }
