@@ -76,7 +76,7 @@ class GuiSmoke(unittest.TestCase):
         self.assertIsNotNone(executable, "Node is required for the production JavaScript renderer smoke test.")
         result = subprocess.run([executable, str(WEB / "test_dom.js")], capture_output=True, text=True, timeout=30)
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
-        self.assertIn("4 replay rows, 2 calls", result.stdout)
+        self.assertIn("4 replay rows, 2 calls, 1 board row", result.stdout)
 
     def test_no_audio_or_persistent_credential_storage(self):
         source = (WEB / "app.js").read_text(encoding="utf-8")

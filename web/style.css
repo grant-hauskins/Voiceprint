@@ -21,9 +21,17 @@ a{color:var(--accent);text-decoration:none}
 .stage{max-width:1500px;margin:auto;padding:18px 24px 40px}
 .toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:14px 22px;padding:14px 18px;border:1px solid var(--line);border-radius:var(--radius);background:var(--panel);margin-bottom:18px}
 .toolbar p{margin:0}.toolbar-actions{margin-left:auto;display:flex;gap:10px;flex-wrap:wrap}
-.grid{display:grid;grid-template-columns:minmax(0,2fr) minmax(300px,1fr);grid-template-areas:"agents room" "transcript proof";gap:18px}
+.grid{display:grid;grid-template-columns:minmax(0,2fr) minmax(300px,1fr);grid-template-areas:"agents room" "transcript proof" "board board";gap:18px}
 .panel{border:1px solid var(--line);border-radius:var(--radius);background:var(--panel);padding:18px 20px;min-width:0}
 .panel.agents{grid-area:agents}.panel.room{grid-area:room}.panel.transcript{grid-area:transcript}.panel.proof{grid-area:proof;border-top:3px solid var(--accent)}
+/* v3: notes board + raw channel, closing summary, objectives */
+.panel.board{grid-area:board;border-top:3px solid var(--accent-2)}
+.board-columns{display:grid;grid-template-columns:minmax(0,3fr) minmax(280px,2fr);gap:22px}.board-columns h3{margin-top:0}
+.chip.tag{color:var(--accent-2);border-color:var(--accent-2);font-weight:700}.chip.withheld{color:var(--warn);border-color:var(--warn)}
+.panel.summary{margin-bottom:18px;border-top:3px solid var(--ok)}#summary-text{margin:0;font:inherit;max-height:420px;overflow:auto;padding:12px;border:1px solid var(--line);border-radius:9px;background:var(--bg-2)}
+.objective{border-top:1px solid var(--line);padding:10px 0;margin:0}.objective summary{color:var(--ink)}.objective.recorded summary{color:var(--ok)}
+.objective .constraint{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;margin:6px 0}.objective .constraint label{flex:1 1 180px}.objective .status{color:var(--warn)}.objective .status:empty{display:none}
+.agent-card.arbitrator .orb{border-radius:28%}.agent-card.arbitrator.speaking .state{color:var(--accent-2)}.agent-setup .role-note{margin:6px 0}
 .section-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:10px}
 .count{display:inline-block;min-width:26px;padding:1px 8px;border-radius:99px;background:var(--panel-2);font-size:13px;text-align:center;margin-left:6px}
 .stat{font-size:16px;font-weight:650}
@@ -87,5 +95,5 @@ address{font-style:normal;font-weight:650}
 .gate-foot{display:flex;justify-content:space-between;align-items:center;gap:12px;padding-top:12px}
 form[hidden],div[hidden],button[hidden],label[hidden]{display:none}
 :focus-visible{outline:3px solid var(--accent);outline-offset:3px}
-@media(max-width:960px){.grid{grid-template-columns:1fr;grid-template-areas:"agents" "room" "transcript" "proof"}.app-header{gap:12px;padding:10px 14px}.menu{display:none}.stage{padding:12px 14px}}
+@media(max-width:960px){.grid{grid-template-columns:1fr;grid-template-areas:"agents" "room" "transcript" "proof" "board"}.board-columns{grid-template-columns:1fr}.app-header{gap:12px;padding:10px 14px}.menu{display:none}.stage{padding:12px 14px}}
 @media(prefers-reduced-motion:reduce){.speaking .orb,.speaking .orb::after,.mic[data-state=on] .mic-dot{animation:none}}
