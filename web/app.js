@@ -71,7 +71,7 @@
       this.runtimeKey = ""; this.autoOpened = ""; this.pollingRuntime = false; this.agentSetupKey = ""; this.gateForced = false;
       // The launcher opens /ui?control=PORT when 8090 is busy on this computer; the origin stays the loopback API.
       const control = String(new URLSearchParams(location && location.search || "").get("control") || "");
-      this.control = `http://127.0.0.1:${/^\d{2,5}$/.test(control) ? control : "8090"}`;
+      this.controlUrl = `http://127.0.0.1:${/^\d{2,5}$/.test(control) ? control : "8090"}`;
       this.feed = new Feed(doc, this.$("transcript"), this.$("mcp-calls"));
     }
     $(id) { return this.doc.getElementById(id); }
@@ -83,7 +83,7 @@
         headers.Authorization = `Bearer ${this.token}`;
       }
       if (body !== undefined) headers["Content-Type"] = "application/json";
-      const response = await this.fetch((runtime ? this.control : "") + path,
+      const response = await this.fetch((runtime ? this.controlUrl : "") + path,
         {method: body === undefined ? "GET" : "POST", headers, body: body === undefined ? undefined : JSON.stringify(body), cache: "no-store", credentials: "omit", redirect: "error", signal: AbortSignal.timeout(12000)});
       let data;
       try { data = await response.json(); } catch (_) { throw new Error(`Service returned an invalid response (${response.status}).`); }
@@ -269,7 +269,7 @@
       const r = this.runtime, key = JSON.stringify([this.token ? 1 : 0, this.vendorsReviewed(), r]);
       if (key === this.runtimeKey) return; this.runtimeKey = key;
       const phase = r ? (r.phase || "live") : null;
-      this.$("phase").textContent = !this.token ? "Connect first" : !r ? `Runtime unavailable on ${this.control.slice(7)}` : phase;
+      this.$("phase").textContent = !this.token ? "Connect first" : !r ? `Runtime unavailable on ${this.controlUrl.slice(7)}` : phase;
       this.$("phase-detail").textContent = r && r.detail ? r.detail : !r && this.token ? "Start it with Voiceprint.cmd (or scripts\\dev.ps1 up) and this page will connect on its own." : "";
       this.$("mcp-url").textContent = r && r.mcp_url ? `Hosted MCP URL given to the provider: ${r.mcp_url}` : "";
       this.$("setup-form").hidden = phase !== "setup";
@@ -490,7 +490,7 @@
     }
     renderAgents() {
       const enabled = allowedControls(this.consent, this.runtime, this.session);
-      this.$("runtime-state").textContent = !this.runtime ? `Runtime unavailable on ${this.control.slice(7)}` : this.runtime.session_id !== this.session ? `Runtime is serving a different room (${this.runtime.session_id}). Controls disabled.` : !enabled ? "Controls blocked: current local release, disclosure scopes and vendor review are required." : "Runtime connected to this room";
+      this.$("runtime-state").textContent = !this.runtime ? `Runtime unavailable on ${this.controlUrl.slice(7)}` : this.runtime.session_id !== this.session ? `Runtime is serving a different room (${this.runtime.session_id}). Controls disabled.` : !enabled ? "Controls blocked: current local release, disclosure scopes and vendor review are required." : "Runtime connected to this room";
       const key = JSON.stringify([this.runtime, enabled, [...this.feed.lastCalls]]);
       if (key === this.agentKey) return; this.agentKey = key; this.$("agents").replaceChildren();
       for (const a of this.runtime?.agents || []) {
