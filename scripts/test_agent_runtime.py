@@ -24,12 +24,15 @@ class FakeConsent:
     def __init__(self):
         self.failed = threading.Event()
         self.scopes = []
+        self.missing_scopes = set()
         self.valid_until = time.monotonic() + 100
 
     def require(self, scope="local_processing"):
         self.scopes.append(scope)
         if self.failed.is_set():
             raise vp.ConsentError("revoked")
+        if scope in self.missing_scopes:
+            raise vp.ConsentError(f"scope {scope} not released")
         return {}
 
 
@@ -39,9 +42,41 @@ class FakeApi:
         self.rows = []
         self.calls = []
         self.fail_renew = False
+        self.objectives = []            # GET .../objectives rows
+        self.objectives_status = None   # e.g. 403 to refuse the read
+        self.channel = []               # stored agent_channel rows
+        self.summaries = []
+        self.summary_failures = 0       # POST .../summary raises this many times first
+        self.ended = False
 
     async def request(self, method, path, body=None):
         self.calls.append((method, path, body))
+        if path.endswith("/objectives") and method == "GET":
+            if self.objectives_status:
+                error = RuntimeError(f"HTTP {self.objectives_status}")
+                error.status = self.objectives_status
+                raise error
+            return {"session_id": "room", "objectives": list(self.objectives)}
+        if path.endswith("/agent_channel") and method == "POST":
+            row = {"row_id": len(self.channel) + 1, "sender_participant_id": body["sender_participant_id"], "tier": body["tier"],
+                   "tag": body.get("tag"), "text": body["text"], "redactions": 0, "timestamp_ms": 0}
+            self.channel.append(row)
+            return {"session_id": "room", "row_id": row["row_id"], "tier": row["tier"], "redactions": 0, "text": row["text"]}
+        if "/agent_channel?" in path and method == "GET":
+            after = int(path.split("after_id=")[1].split("&")[0])
+            tier = path.split("tier=")[1].split("&")[0] if "tier=" in path else "all"
+            rows = [r for r in self.channel if r["row_id"] > after and (tier == "all" or r["tier"] == tier)]
+            return {"session_id": "room", "rows": rows, "next_after_id": rows[-1]["row_id"] if rows else after, "revealed": False,
+                    "text": "\n".join(f"#{r['row_id']} 00:00:00 X [{r['tier']}]: {r['text']}" for r in rows)}
+        if path.endswith("/summary") and method == "POST":
+            if self.summary_failures:
+                self.summary_failures -= 1
+                raise RuntimeError("summary store unavailable")
+            self.summaries.append(body)
+            return {"session_id": "room", "created_ms": 1, "retention_deadline_ms": 2}
+        if path.endswith("/end") and method == "POST":
+            self.ended = True
+            return {}
         if path.endswith("/floor") and method == "POST":
             pid = body["participant_id"]
             if self.fail_renew:
@@ -73,12 +108,61 @@ class FakeProvider:
     def __init__(self):
         self.replies = []
         self.cancels = 0
+        self.prompts = []
+        self.objective = None
+        self.principal_name = None
 
     async def request_reply(self, note=None):
         self.replies.append(note)
 
     async def cancel(self):
         self.cancels += 1
+
+    async def update_instructions(self, prompt):
+        self.prompts.append(prompt)
+
+
+class FakeResponses:
+    """Scripted Responses API: each generate() pops the next result (a dict, or an exception to raise)."""
+    def __init__(self, results=()):
+        self.results = list(results)
+        self.calls = []
+        self.model = "fake-text-model"
+
+    def generate(self, instructions, input_text, schema_name, schema):
+        self.calls.append((schema_name, instructions, input_text))
+        if not self.results:
+            return {"board": None, "raw_note": None, "prompt_to": None, "prompt": None, "tag": None, "reason": "nothing new"}
+        result = self.results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+class FakeMcp:
+    """Local MCP endpoint double: compact transcript/channel lines served by cursor, like McpServer's structuredContent."""
+    def __init__(self):
+        self.transcript = []      # (id, line)
+        self.channel = []
+        self.calls = []
+
+    def add_line(self, speaker, text, label="high"):
+        uid = len(self.transcript) + 1
+        self.transcript.append((uid, f"#{uid} 0:{uid:02d}.0-0:{uid + 1:02d}.0 {speaker} [{label}]: {text}"))
+        return uid
+
+    def add_note(self, sender, text, tier="raw"):
+        rid = len(self.channel) + 1
+        self.channel.append((rid, f"#{rid} 12:00:{rid:02d} {sender} [{tier}]: {text}"))
+        return rid
+
+    def call(self, tool, arguments):
+        self.calls.append((tool, arguments))
+        rows, key = (self.transcript, "transcript") if tool == "get_transcript" else (self.channel, "channel")
+        after = arguments.get("after_id", 0)
+        page = [(i, line) for i, line in rows if i > after][:arguments.get("limit", 100)]
+        return {"session_id": arguments["session_id"], "next_after_id": page[-1][0] if page else after, "count": len(page),
+                key: "\n".join(line for _, line in page) or "(no utterances yet)"}
 
 
 class FakePlayer:
@@ -103,6 +187,30 @@ def make_room():
     room = ar.Room(configs, "room", {"participant_1": "Human", "participant_3": "Ava", "participant_4": "Ben"},
                    FakeApi(), ar.EventLog(None, "room"), FakeConsent())
     room.agents = [ar.Agent(c, f"participant_{i}", FakeProvider(), FakePlayer(), room) for c, i in zip(configs, (3, 4))]
+    return room
+
+
+OBJECTIVE_ROWS = [
+    {"principal_id": "participant_1", "version": 1, "position": "wants to sell the property", "source": "typed", "trigger": "initial", "created_ms": 1,
+     "constraints": [{"label": "floor", "value": "300000"}, {"label": "close by", "value": "June 30"}]},
+    {"principal_id": "participant_2", "version": 1, "position": "wants to buy the property", "source": "typed", "trigger": "initial", "created_ms": 2,
+     "constraints": [{"label": "ceiling", "value": "320000"}]}]
+
+
+def make_negotiation_room(responses=None, mcp=None):
+    """Two humans, two advocates (Ava for One, Ben for Two) and a text-only arbitrator, with objectives already read."""
+    import objectives as ob
+    from arbitrator import Arbitrator
+    configs = [ar.AgentConfig("Ava", speaks_for="Synthetic One"), ar.AgentConfig("Ben", voice="cedar", speaks_for="Synthetic Two"),
+               ar.with_role(ar.AgentConfig("Mediator"), "arbitrator")]
+    names = {"participant_1": "Synthetic One", "participant_2": "Synthetic Two", "participant_3": "Ava", "participant_4": "Ben", "participant_5": "Mediator"}
+    api = FakeApi()
+    api.objectives = [dict(row) for row in OBJECTIVE_ROWS]
+    room = ar.Room(configs, "room", names, api, ar.EventLog(None, "room"), FakeConsent(), "negotiation")
+    room.objectives = ob.parse_objectives({"objectives": api.objectives})
+    room.agents = [ar.Agent(c, f"participant_{i}", FakeProvider(), FakePlayer(), room) for c, i in zip(configs[:2], (3, 4))]
+    room.arbitrator = Arbitrator(configs[2], "participant_5", room, responses or FakeResponses(), mcp or FakeMcp(), poll_s=0)
+    room.arbitrator.objectives = room.objectives
     return room
 
 
@@ -232,6 +340,74 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(room.agents[1].gate.manual, "speak")
         self.assertEqual(room.agents[1].gate.eagerness, "eager")
 
+    async def test_k_section_4_guard_cuts_spoken_leak_and_redacts_stored_text(self):
+        """§4 (runtime mirror): an advocate's streamed transcript that spells its own constraint is cut and never stored;
+        a finished transcript is stored redacted. The other side's values are not held at all."""
+        room = make_negotiation_room()
+        ava, ben = room.agents
+        self.assertEqual(ava.guard_values, ("300000", "June 30"))
+        self.assertEqual(ben.guard_values, ("320000",))
+        self.assertTrue(ava.gate.raise_hand)                                     # negotiation advocate: raise-hand by default
+        await ava.begin("speak")
+        await ava.event({"type": "response.created", "response": {"id": "r1"}})
+        await ava.event({"type": "response.output_audio.delta", "response_id": "r1", "delta": base64.b64encode(b"\0\0").decode()})
+        self.assertTrue(ava.player.playing)
+        await ava.event({"type": "response.output_audio_transcript.delta", "response_id": "r1", "item_id": "i", "delta": "Our floor is three hundred"})
+        self.assertEqual(ava.provider.cancels, 0)
+        await ava.event({"type": "response.output_audio_transcript.delta", "response_id": "r1", "item_id": "i", "delta": " thousand dollars."})
+        self.assertEqual(ava.provider.cancels, 1)
+        self.assertFalse(ava.player.playing)
+        await ava.event({"type": "response.output_audio_transcript.done", "response_id": "r1", "item_id": "i", "transcript": "Our floor is three hundred thousand dollars."})
+        self.assertEqual(room.api.rows, [])
+        guard = [row["guard"] for row in room.log.snapshot() if "guard" in row]
+        self.assertEqual(guard, [{"action": "cut", "stage": "spoken_delta", "redactions": 1}])
+        self.assertNotIn("three hundred", json.dumps(room.log.snapshot()))
+        room.api.holder = None
+        await ava.tick(time.monotonic()); ava.active = False; ava.final_done = False
+        await ava.begin("speak")
+        await ava.event({"type": "response.created", "response": {"id": "r2"}})
+        await ava.event({"type": "response.output_audio_transcript.delta", "response_id": "r2", "item_id": "j", "delta": "We could close by June 15, 320000 is fine."})
+        self.assertEqual(ava.provider.cancels, 1)                                # the other side's value is not Ava's to guard
+        await ava.event({"type": "response.output_audio_transcript.done", "response_id": "r2", "item_id": "j", "transcript": "$300,000 by June 30 then."})
+        self.assertEqual(room.api.rows[0]["text"], "[withheld] by [withheld] then.")
+        guard = [row["guard"] for row in room.log.snapshot() if "guard" in row]
+        self.assertEqual(guard[-1], {"action": "redacted", "stage": "stored_utterance", "redactions": 2})
+        casual = make_room().agents[0]
+        self.assertEqual(casual.guard_values, ()); self.assertFalse(casual.gate.raise_hand)
+
+    async def test_objective_version_change_reprompts_only_that_advocate(self):
+        room = make_negotiation_room()
+        ava, ben = room.agents
+        room.api.objectives[0] = dict(OBJECTIVE_ROWS[0], version=2, constraints=[{"label": "floor", "value": "310000"}], trigger="offer heard")
+        await room.refresh_objectives()
+        self.assertEqual(len(ava.provider.prompts), 1)
+        self.assertIn("310000", ava.provider.prompts[0]); self.assertNotIn("300000", ava.provider.prompts[0])
+        self.assertIn("Synthetic One's personal agent", ava.provider.prompts[0])
+        from realtime_openai import SHARED_INSTRUCTIONS
+        self.assertIn(SHARED_INSTRUCTIONS, ava.provider.prompts[0])
+        self.assertEqual(ava.guard_values, ("310000",))
+        self.assertEqual(ben.provider.prompts, [])
+        self.assertEqual(room.arbitrator.objectives["participant_1"].version, 2)
+        await room.refresh_objectives()
+        self.assertEqual(len(ava.provider.prompts), 1)                           # same version: no re-prompt
+        room.api.objectives_status = 403
+        room.objectives_forbidden = False
+        await room.refresh_objectives()
+        self.assertTrue(room.objectives_forbidden)
+        self.assertNotIn("310000", json.dumps(room.log.snapshot()))
+
+    async def test_arbitrator_state_and_routing_in_room(self):
+        room = make_negotiation_room()
+        state = room.state()
+        self.assertEqual(state["conversation_type"], "negotiation")
+        self.assertEqual([a["name"] for a in state["agents"]], ["Ava", "Ben", "Mediator"])
+        self.assertEqual([a["role"] for a in state["agents"]], ["voice", "voice", "arbitrator"])
+        self.assertEqual(sorted(state["agents"][2]["arbitrator"]), ["cooldown_until_ms", "generations", "ingested_rows", "last_trigger", "paused", "pending_tag"])
+        self.assertNotIn("voice", state["agents"][2])
+        self.assertFalse(room.request_override("participant_9", "x", "REFOCUS_NEEDED"))
+        room.agents[1].gate.manual = "hold"
+        self.assertFalse(room.request_override("Ben", "x", "REFOCUS_NEEDED"))     # hold is the operator's decision
+
 
 class GateAndConfigTest(unittest.TestCase):
     def test_persona_prompt_and_toml_fields(self):
@@ -251,6 +427,60 @@ class GateAndConfigTest(unittest.TestCase):
     def test_default_configuration(self):
         configs = ar.load_config(Path(ar.__file__).with_name("agents.toml"))
         self.assertEqual([(c.name, c.voice, c.eagerness) for c in configs], [("Ava", "marin", "balanced"), ("Ben", "cedar", "quiet")])
+        self.assertEqual([c.role for c in configs], ["voice", "voice"])
+
+    def test_uniform_instruction_layer_and_objective_injection(self):
+        """BUILD_SPEC_V3 §0 #1: every agent gets the shared layer; only an advocate gets its own objective."""
+        import objectives as ob
+        from realtime_openai import SHARED_INSTRUCTIONS, compose_prompt, instructions, persona
+        self.assertEqual(persona("Ava"), "")
+        objective = ob.Objective("participant_1", 3, "wants to sell", (("floor", "300000"),), "typed", "initial", 0)
+        text = persona("Ava", "Synthetic One", "Be terse.", objective, "Synthetic One")
+        self.assertIn("Be terse.", text); self.assertTrue(text.endswith("proposal instead."))
+        self.assertIn("- floor: 300000", text); self.assertIn("NEVER state", text)
+        config = ar.AgentConfig("Ava", speaks_for="Synthetic One")
+        prompt = compose_prompt(config, "room", {"participant_1": "Synthetic One"}, objective, "Synthetic One")
+        room_rules = instructions("Ava", "room", {"participant_1": "Synthetic One"})
+        self.assertTrue(prompt.startswith(room_rules + "\n\n" + SHARED_INSTRUCTIONS + "\n\n"))
+        self.assertIn("get_agent_channel", SHARED_INSTRUCTIONS); self.assertIn("post_agent_channel", SHARED_INSTRUCTIONS)
+        plain = compose_prompt(ar.AgentConfig("Ava"), "room", {})
+        self.assertTrue(plain.endswith(SHARED_INSTRUCTIONS))
+
+    def test_role_configuration_rules(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "agents.toml"
+            path.write_text('[[agents]]\nname = "Mediator"\nrole = "arbitrator"\nprovider = "openai_responses"\nmodel = "gpt-5"\n', encoding="utf-8")
+            config = ar.load_config(path)[0]
+            self.assertEqual((config.role, config.provider, config.model), ("arbitrator", "openai_responses", "gpt-5"))
+            for content in ('[[agents]]\nname = "Mediator"\nrole = "arbitrator"\n',                                   # realtime provider for an arbitrator
+                            '[[agents]]\nname = "Ava"\nprovider = "openai_responses"\n',                              # text provider for a voice agent
+                            '[[agents]]\nname = "Mediator"\nrole = "judge"\n',
+                            '[[agents]]\nname = "Mediator"\nrole = "arbitrator"\nprovider = "openai_responses"\nspeaks_for = "Grant"\n'):
+                path.write_text(content, encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    ar.load_config(path)
+        arbitrator = ar.with_role(ar.AgentConfig("Mediator"), "arbitrator")
+        self.assertEqual((arbitrator.provider, arbitrator.model), ("openai_responses", "gpt-5"))
+        back = ar.with_role(arbitrator, "voice")
+        self.assertEqual((back.provider, back.model), ("openai_realtime", "gpt-realtime-2.1"))
+        self.assertEqual(ar.persona_record(arbitrator)["role"], "arbitrator")
+        with tempfile.TemporaryDirectory() as tmp, patch.object(ar, "PERSONA_DIR", Path(tmp)):
+            ar.save_personas([arbitrator])
+            self.assertEqual(ar.load_personas()["Mediator"]["role"], "arbitrator")
+            merged = ar.merge_personas([ar.AgentConfig("Ava")])
+            self.assertEqual([(c.name, c.role, c.provider) for c in merged], [("Ava", "voice", "openai_realtime"), ("Mediator", "arbitrator", "openai_responses")])
+
+    def test_room_validation_for_conversation_types(self):
+        ava, ben = ar.AgentConfig("Ava", speaks_for="One"), ar.AgentConfig("Ben", speaks_for="Two")
+        mediator = ar.with_role(ar.AgentConfig("Mediator"), "arbitrator")
+        ar.validate_room("casual", [ava, ben]); ar.validate_room("negotiation", [ava, ben, mediator])
+        for conversation_type, configs in (("casual", [ava, mediator]), ("negotiation", [ava, ben]), ("negotiation", [ava, mediator]),
+                                           ("negotiation", [ava, ar.AgentConfig("Ben", speaks_for="one"), mediator]),
+                                           ("negotiation", [ava, ar.AgentConfig("Ben"), mediator]),
+                                           ("negotiation", [ava, ben, mediator, ar.with_role(ar.AgentConfig("Judge"), "arbitrator")]),
+                                           ("negotiation", [ava, ben, ar.AgentConfig("Cy"), mediator]), ("debate", [ava])):
+            with self.assertRaises(ValueError, msg=(conversation_type, configs)):
+                ar.validate_room(conversation_type, configs)
 
     def test_duplicate_names_and_unknown_fields_rejected(self):
         for content in ('[[agents]]\nname="Ava"\n[[agents]]\nname="ava"', '[[agents]]\nname="Ava"\nsecret="bad"'):
@@ -416,6 +646,24 @@ class PrivacyTest(unittest.TestCase):
         self.assertEqual(len(log.snapshot()), 2)
         self.assertEqual(log.dropped, 1)
 
+    def test_v3_event_kinds_keep_only_allowlisted_fields(self):
+        log = ar.EventLog(None, "room")
+        log.emit("arbitrator", {"action": "posted", "trigger": "contribution", "tag": None, "confirmed": None, "ingested_rows": 4, "generations": 1,
+                                "tier": "board", "redactions": 0, "text": "PRIVATE-VALUE", "board": "PRIVATE-VALUE", "prompt": "PRIVATE-VALUE"}, "Mediator", "participant_5")
+        log.emit("guard", {"action": "cut", "stage": "spoken_delta", "redactions": 1, "value": "PRIVATE-VALUE", "transcript": "PRIVATE-VALUE"})
+        log.emit("summary", {"action": "saved", "attempts": 1, "board_rows": 2, "transcript_rows": 9, "reason": None, "text": "PRIVATE-VALUE"})
+        log.emit("control", {"action": "override", "value": "OBJECTIVE_ACHIEVED", "held": False, "prompt": "PRIVATE-VALUE"})
+        log.emit("openai", {"type": "response.output_audio_transcript.delta", "response_id": "r", "delta": "PRIVATE-VALUE"})
+        rows = log.snapshot()
+        self.assertNotIn("PRIVATE-VALUE", json.dumps(rows))
+        self.assertEqual(rows[0]["arbitrator"], {"action": "posted", "trigger": "contribution", "tag": None, "confirmed": None, "ingested_rows": 4, "generations": 1, "tier": "board", "redactions": 0})
+        self.assertEqual(rows[1]["guard"], {"action": "cut", "stage": "spoken_delta", "redactions": 1})
+        self.assertEqual(rows[2]["summary"], {"action": "saved", "attempts": 1, "board_rows": 2, "transcript_rows": 9, "reason": None})
+        self.assertEqual(rows[3]["control"]["value"], "OBJECTIVE_ACHIEVED")
+        item = {"type": "mcp_call", "name": "post_agent_channel", "arguments": "PRIVATE-VALUE", "output": "ok"}
+        self.assertEqual(ar.EventLog.tool_evidence(item)["name"], "post_agent_channel")
+        self.assertEqual(ar.EventLog.tool_evidence(dict(item, name="delete_everything"))["name"], "other")
+
 
 class ControlsHttpTest(unittest.TestCase):
     def setUp(self):
@@ -459,6 +707,26 @@ class ControlsHttpTest(unittest.TestCase):
     def test_invalid_control_and_unknown_agent(self):
         self.assertEqual(self.request("/agents/Ben/control", "POST", {"action": "eagerness", "value": "pushy"})[0], 400)
         self.assertEqual(self.request("/agents/Nobody/control", "POST", {"action": "speak"})[0], 404)
+
+    def test_arbitrator_state_and_controls_over_http(self):
+        room = make_negotiation_room()
+        server = ar.control_server(room, port=0, token="test-bearer")
+        base, self.base = self.base, f"http://127.0.0.1:{server.server_port}"
+        try:
+            status, body, _ = self.request()
+            self.assertEqual((status, body["conversation_type"]), (200, "negotiation"))
+            mediator = body["agents"][2]
+            self.assertEqual((mediator["name"], mediator["role"], mediator["provider"], mediator["model"]), ("Mediator", "arbitrator", "openai_responses", "gpt-5"))
+            self.assertNotIn("voice", mediator); self.assertEqual(mediator["arbitrator"]["paused"], False)
+            self.assertEqual(body["agents"][0]["role"], "voice")
+            self.assertEqual(self.request("/agents/Mediator/control", "POST", {"action": "eagerness", "value": "eager"})[0], 400)
+            for action in ("speak", "hold", "cancel"):
+                status, body, _ = self.request("/agents/Mediator/control", "POST", {"action": action})
+                self.assertEqual((status, body["agent"]["role"]), (200, "arbitrator"))
+            self.assertEqual([room.controls.get_nowait() for _ in range(3)], [("Mediator", a, None) for a in ("speak", "hold", "cancel")])
+        finally:
+            self.base = base
+            server.shutdown(); server.server_close()
 
 
 class LifecycleHttpTest(unittest.TestCase):
@@ -555,6 +823,38 @@ class LifecycleHttpTest(unittest.TestCase):
             fresh = ar.Runtime(gui=True, configs=configs)
             self.assertEqual([(c.name, c.voice, c.instructions_extra[:4]) for c in fresh.configs], [("Ava", "marin", "from"), ("Ben", "sage", "Only"), ("Cy", "marin", "\u00e9\u00e9\u00e9\u00e9")])
             self.assertNotIn("Only words", json.dumps(runtime.bootstrap()))
+
+    def test_setup_validation_for_negotiation_rooms(self):
+        """docs/API.md V3 /setup: 2-4 humans, exactly two advocates for different people, exactly one arbitrator; no arbitrator in casual."""
+        people = [{"name": "Synthetic One", "contact": "one@example.invalid"}, {"name": "Synthetic Two", "contact": "555-0100"}]
+        key = {"openai_api_key": "k" * 40}
+        ava, ben = {"name": "Ava", "speaks_for": "Synthetic One"}, {"name": "Ben", "speaks_for": "Synthetic Two"}
+        mediator = {"name": "Mediator", "role": "arbitrator"}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(ar, "PERSONA_DIR", Path(tmp)):
+            rejected = [
+                {"participants": people, "conversation_type": "debate", "agents": [ava, ben, mediator], **key},
+                {"participants": people, "conversation_type": "casual", "agents": [ava, ben, mediator], **key},          # arbitrator in casual
+                {"participants": people, "conversation_type": "negotiation", "agents": [ava, ben], **key},               # no arbitrator
+                {"participants": people, "conversation_type": "negotiation", "agents": [ava, mediator], **key},          # one advocate
+                {"participants": people, "conversation_type": "negotiation", "agents": [ava, dict(ben, speaks_for="Synthetic One"), mediator], **key},
+                {"participants": people, "conversation_type": "negotiation", "agents": [ava, {"name": "Ben"}, mediator], **key},
+                {"participants": people, "conversation_type": "negotiation", "agents": [ava, ben, mediator, {"name": "Judge", "role": "arbitrator"}], **key},
+                {"participants": people, "conversation_type": "negotiation", "agents": [ava, ben, dict(mediator, speaks_for="Synthetic One")], **key},
+                {"participants": people, "conversation_type": "negotiation", "agents": [ava, ben, dict(mediator, role="referee")], **key},
+                {"participants": people, "conversation_type": "negotiation", **key},                                     # agents.toml has no arbitrator
+                {"participants": people[:1], "conversation_type": "negotiation", "agents": [ava, ben, mediator], **key},
+            ]
+            for body in rejected:
+                self.assertEqual(self.request("/setup", "POST", body)[0], 409, body)
+            self.assertEqual(self.runtime.state()["conversation_type"], "casual")
+            status, _ = self.request("/setup", "POST", {"participants": people, "conversation_type": "negotiation", "agents": [ava, ben, mediator], **key})
+            self.assertEqual(status, 200)
+            self.runtime.wait_setup()
+            self.assertEqual(self.runtime.state()["conversation_type"], "negotiation")
+            configs = {c.name: c for c in self.runtime.active_configs()}
+            self.assertEqual((configs["Mediator"].role, configs["Mediator"].provider, configs["Mediator"].model), ("arbitrator", "openai_responses", "gpt-5"))
+            self.assertEqual([c["role"] for c in self.runtime.state()["agent_configs"]], ["voice", "voice", "arbitrator"])
+            self.assertEqual(sorted(self.runtime.state()["roles"]), ["arbitrator", "voice"])
 
     def test_enrollment_start_and_stop_follow_phases(self):
         self.runtime.participants = [{"id": "participant_1", "name": "Synthetic One"}]

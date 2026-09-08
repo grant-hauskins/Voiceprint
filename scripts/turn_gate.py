@@ -27,9 +27,11 @@ class GateState:
     agent_last_spoke_at: float = -1e9
     last_overlap_at: float = -1e9
     manual: str = None                       # "speak": one reply now (consumed once). "hold": sticky mute until released.
+                                             # "override": a verified arbitrator prompt; consumed once, ignores cooldown/address.
     history: list = field(default_factory=list)   # recent utterances (dicts), newest last
     others_speaking: bool = False             # another registered agent holds the room floor
     room_agent_names: tuple = ()               # names in the registry, including this agent
+    raise_hand: bool = False                   # participation policy: no soft opportunities, only address or override
 
     def note_utterance(self, utterance, now=None):
         now = time.monotonic() if now is None else now
@@ -74,6 +76,12 @@ def decide(state, now, current_status, last_utterance_end_at):
     if state.manual == "speak":
         state.manual = None
         return "speak"
+    if state.manual == "override":
+        # A verified arbitrator prompt skips cooldown, address and eagerness, never the room inhibitors.
+        if current_status in ("speaking", "overlap") or now - state.last_overlap_at < OVERLAP_HOLD_S:
+            return "wait"
+        state.manual = None
+        return "speak"
     humans = [u for u in state.history if u.get("speaker_id") != state.agent_speaker_id or u.get("speaker_id") is None]
     if not humans:
         return "wait"
@@ -105,8 +113,8 @@ def decide(state, now, current_status, last_utterance_end_at):
             return "clarify"      # we were asked something but are not sure by whom
         return "speak" if silence >= 0.3 else "wait"
     # Soft opportunity: a clean, question-like turn followed by silence.
-    if state.eagerness == "quiet":
-        return "wait"
+    if state.raise_hand or state.eagerness == "quiet":
+        return "wait"                        # raise-hand advocates need an address or a verified override
     if last.get("label") == "high" and question_like(last.get("text")) and silence >= SILENCE_AFTER_TURN_S[state.eagerness]:
         return "speak"
     if state.eagerness == "eager" and silence >= SILENCE_AFTER_TURN_S["eager"] * 2 and last.get("label") in ("high", "medium"):

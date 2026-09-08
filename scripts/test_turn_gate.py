@@ -78,6 +78,36 @@ class GateTest(unittest.TestCase):
         state.note_utterance(utt("Ava, what time is it?", speaker="participant_3"), now=10)  # its own echo through the mic
         self.assertEqual(tg.decide(state, 12, "silence", 10), "wait")
 
+    def test_override_respects_inhibitors_but_not_cooldown_or_address(self):
+        """BUILD_SPEC_V3 §5: a verified override skips the queue, never the room's turn/overlap inhibitors."""
+        self.state.note_agent_spoke(now=10)                                   # inside the 6 s balanced cooldown
+        self.state.manual = "override"
+        self.assertEqual(tg.decide(self.state, 11, "speaking", 10), "wait")   # a human turn is open
+        self.assertEqual(self.state.manual, "override")                       # not consumed by an inhibitor
+        self.assertEqual(tg.decide(self.state, 11, "overlap", 10), "wait")
+        self.state.last_overlap_at = 10.5
+        self.assertEqual(tg.decide(self.state, 11, "silence", 10), "wait")    # overlap hold
+        self.assertEqual(tg.decide(self.state, 14, "silence", 10), "speak")   # no history, no address, cooldown ignored
+        self.assertIsNone(self.state.manual)                                  # consumed once
+        self.assertEqual(tg.decide(self.state, 14, "silence", 10), "wait")
+        self.state.manual = "override"; self.state.others_speaking = True
+        self.assertEqual(tg.decide(self.state, 30, "silence", 10), "wait")    # the floor still wins
+        self.state.others_speaking = False; self.state.manual = "hold"
+        self.assertEqual(tg.decide(self.state, 30, "silence", 10), "wait")
+
+    def test_raise_hand_blocks_soft_opportunities_but_not_direct_address(self):
+        """BUILD_SPEC_V3 §5: negotiation advocates raise a hand; direct address always overrides the default."""
+        self.state.raise_hand = True
+        self.state.note_utterance(utt("What should we order?"), now=10)
+        self.assertEqual(tg.decide(self.state, 15, "silence", 10), "wait")    # would be "speak" in balanced mode
+        self.state.eagerness = "eager"
+        self.assertEqual(tg.decide(self.state, 15, "silence", 10), "wait")
+        self.state.note_utterance(utt("Ava, what do you think?"), now=16)
+        self.assertEqual(tg.decide(self.state, 16.5, "silence", 16), "speak")
+        self.state.note_agent_spoke(now=17)
+        self.state.note_utterance(utt("Ava, is that right?", label="low"), now=18)
+        self.assertEqual(tg.decide(self.state, 18.5, "silence", 18), "clarify")
+
 
 if __name__ == "__main__":
     unittest.main()

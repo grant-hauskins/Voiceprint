@@ -43,9 +43,20 @@ def instructions(agent_name, session_id, names):
     )
 
 
-def persona(agent_name, speaks_for="", standing_instructions=""):
-    """Operator-authored flavor appended after the room rules: whose agent this is, and its standing instructions.
-    The room rules above still govern tool use and turn-taking; the persona changes what the agent says, not when."""
+SHARED_INSTRUCTIONS = (
+    "Shared rules for every agent in this room. You are one of several agents; some of you represent a person. "
+    "If you have a principal, speak only for that person and never for anyone else. Never state, quote, approximate or "
+    "confirm a private constraint of anyone, in any form: not as digits, words, currency, a rounded figure or a range. "
+    "If the arbitrator's note asks you to raise something, raise it in your own words. Use get_agent_channel to read the "
+    "arbitrator's notes and post_agent_channel for short private notes to the arbitrator; those notes must never contain "
+    "private figures either. Keep every reply short."
+)
+
+
+def persona(agent_name, speaks_for="", standing_instructions="", objective=None, principal_name=None):
+    """Operator-authored flavor appended after the room rules: whose agent this is, its standing instructions and, for an
+    advocate, its own principal's objective (injected here, never fetched over a tool). The room rules above still govern
+    tool use and turn-taking; the persona changes what the agent says, not when."""
     parts = []
     if speaks_for:
         parts.append(f"You are {speaks_for}'s personal agent in this room. Speak on {speaks_for}'s behalf: when {speaks_for} is asked "
@@ -54,7 +65,17 @@ def persona(agent_name, speaks_for="", standing_instructions=""):
     if standing_instructions:
         parts.append("Standing instructions from your operator, which apply to every reply unless they conflict with the room rules above:\n"
                      + standing_instructions)
+    if objective is not None:
+        from objectives import render_objective_for_prompt
+        parts.append(render_objective_for_prompt(objective, principal_name or speaks_for or "your principal"))
     return "\n\n".join(parts)
+
+
+def compose_prompt(config, session_id, names, objective=None, principal_name=None):
+    """Room rules, then the uniform layer every agent gets, then this agent's persona (and objective, if it is an advocate)."""
+    prompt = instructions(config.name, session_id, names) + "\n\n" + SHARED_INSTRUCTIONS
+    flavor = persona(config.name, getattr(config, "speaks_for", ""), getattr(config, "instructions_extra", ""), objective, principal_name)
+    return prompt + ("\n\n" + flavor if flavor else "")
 
 
 HOSTAPI_PREFERENCE = ("MME", "Windows DirectSound", "Windows WASAPI", "Windows WDM-KS")   # MME resamples for us; WDM-KS is picky

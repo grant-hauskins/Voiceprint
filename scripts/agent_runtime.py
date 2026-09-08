@@ -33,10 +33,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit
 
+import objectives as ob
+import participation as pp
 import turn_gate as tg
 import voiceprint_client as vp
+from arbitrator import Arbitrator, McpClient
 from providers import make_provider
-from realtime_openai import Player, describe_device, resample_16k_to_24k, resolve_device
+from providers.openai_responses import OpenAIResponses
+from realtime_openai import Player, compose_prompt, describe_device, resample_16k_to_24k, resolve_device
 
 
 @dataclass(frozen=True)
@@ -49,10 +53,46 @@ class AgentConfig:
     output_device: str = "HD 4.40,BenQ"
     instructions_extra: str = ""
     speaks_for: str = ""          # full name of the person in the room this agent represents, or empty
+    role: str = "voice"           # "voice" (realtime, may be an advocate) or "arbitrator" (text only, negotiation rooms)
 
 
 MAX_INSTRUCTIONS = 6000
 PERSONA_DIR = Path(__file__).resolve().parents[1] / "data" / "agents"
+PROVIDERS = ("openai_realtime", "xai_speech", "gemini_live", "openai_responses")
+ARBITRATOR_MODEL = "gpt-5"
+TOOL_NAMES = ("get_transcript", "get_current_speaker", "get_agent_channel", "post_agent_channel")
+
+
+def with_role(config, role):
+    """An arbitrator is a text model on the Responses API; a voice agent never is. Provider/model follow the role."""
+    if role not in pp.ROLES:
+        raise ValueError("Role must be voice or arbitrator")
+    if role == "arbitrator":
+        if config.provider != "openai_responses":
+            return dataclasses.replace(config, role=role, provider="openai_responses", model=ARBITRATOR_MODEL)
+    elif config.provider == "openai_responses":
+        return dataclasses.replace(config, role=role, provider=AgentConfig.provider, model=AgentConfig.model)
+    return dataclasses.replace(config, role=role)
+
+
+def validate_room(conversation_type, configs):
+    """docs/API.md V3 /setup rules: a negotiation has exactly two advocates for different people and one arbitrator;
+    a casual room has no arbitrator. Human count and speaks_for membership are checked by the caller."""
+    if conversation_type not in pp.CONVERSATION_TYPES:
+        raise ValueError("Conversation type must be casual or negotiation")
+    arbitrators = [c for c in configs if c.role == "arbitrator"]
+    voices = [c for c in configs if c.role == "voice"]
+    if conversation_type == "casual":
+        if arbitrators:
+            raise ValueError("An arbitrator only joins a negotiation; choose that conversation type or remove the arbitrator")
+        return
+    if len(voices) != 2:
+        raise ValueError("A negotiation needs exactly two voice agents, one speaking for each side")
+    principals = [c.speaks_for.strip().casefold() for c in voices]
+    if not all(principals) or len(set(principals)) != 2:
+        raise ValueError("Each negotiation voice agent must speak for a different person in the room")
+    if len(arbitrators) != 1:
+        raise ValueError("A negotiation needs exactly one arbitrator")
 
 
 def clean_instructions(text):
@@ -76,7 +116,8 @@ def persona_path(name):
 
 
 def persona_record(config):
-    return {"name": config.name, "voice": config.voice, "eagerness": config.eagerness, "speaks_for": config.speaks_for, "instructions": config.instructions_extra}
+    return {"name": config.name, "voice": config.voice, "eagerness": config.eagerness, "speaks_for": config.speaks_for,
+            "instructions": config.instructions_extra, "role": config.role}
 
 
 def load_personas():
@@ -96,7 +137,8 @@ def load_personas():
             result[name] = {"name": name, "voice": data.get("voice") if data.get("voice") in VOICES else None,
                             "eagerness": data.get("eagerness") if data.get("eagerness") in tg.SILENCE_AFTER_TURN_S else None,
                             "speaks_for": data.get("speaks_for") if isinstance(data.get("speaks_for"), str) else "",
-                            "instructions": clean_instructions(data.get("instructions", ""))}
+                            "instructions": clean_instructions(data.get("instructions", "")),
+                            "role": data.get("role") if data.get("role") in pp.ROLES else "voice"}
         except (OSError, ValueError):
             continue
     return result
@@ -128,13 +170,13 @@ def merge_personas(configs):
         if record is None:
             result.append(config)
         else:
-            result.append(dataclasses.replace(config, voice=record["voice"] or config.voice, eagerness=record["eagerness"] or config.eagerness,
-                                              speaks_for=record["speaks_for"], instructions_extra=record["instructions"]))
+            result.append(with_role(dataclasses.replace(config, voice=record["voice"] or config.voice, eagerness=record["eagerness"] or config.eagerness,
+                                                        speaks_for=record["speaks_for"], instructions_extra=record["instructions"]), record["role"]))
     template = configs[0] if configs else AgentConfig("template")
     for name, record in saved.items():
         if name not in seen:
-            result.append(dataclasses.replace(template, name=name, voice=record["voice"] or template.voice, eagerness=record["eagerness"] or template.eagerness,
-                                              speaks_for=record["speaks_for"], instructions_extra=record["instructions"]))
+            result.append(with_role(dataclasses.replace(template, name=name, voice=record["voice"] or template.voice, eagerness=record["eagerness"] or template.eagerness,
+                                                        speaks_for=record["speaks_for"], instructions_extra=record["instructions"]), record["role"]))
     return result[:MAX_AGENTS]
 
 
@@ -155,20 +197,27 @@ def load_config(path):
                 raise ValueError(f"Agent {field} must be a nonempty string of at most 200 characters")
         if config.name.casefold() in names:
             raise ValueError("Agent names must be unique (ignoring case)")
-        if config.provider not in ("openai_realtime", "xai_speech", "gemini_live"):
+        if config.provider not in PROVIDERS:
             raise ValueError("Unknown provider")
+        if config.role not in pp.ROLES:
+            raise ValueError("Role must be voice or arbitrator")
+        if (config.provider == "openai_responses") != (config.role == "arbitrator"):
+            raise ValueError("Provider openai_responses is for the arbitrator role only, and an arbitrator uses openai_responses")
         if config.eagerness not in tg.SILENCE_AFTER_TURN_S:
             raise ValueError("Eagerness must be quiet, balanced, or eager")
         if not isinstance(config.output_device, str) or not isinstance(config.instructions_extra, str) or not isinstance(config.speaks_for, str):
             raise ValueError("output_device, instructions_extra and speaks_for must be strings")
+        if config.role == "arbitrator" and config.speaks_for.strip():
+            raise ValueError("An arbitrator is neutral and cannot speak for anyone")
         clean_instructions(config.instructions_extra)
         names.add(config.name.casefold())
         configs.append(config)
     return configs
 
 
-def reply_note(session_id, names, state, decision):
-    """Exact live-earned pre-reply wording from realtime_openai.py; change only after a live run."""
+def reply_note(session_id, names, state, decision, arbitrator_prompt=None):
+    """Exact live-earned pre-reply wording from realtime_openai.py; change only after a live run.
+    A verified arbitrator prompt is appended after the unchanged text, never woven into it."""
     roster = ", ".join(names.values())
     last = state.history[-1] if state.history else None
     who = names.get(last.get("speaker_id"), "unknown") if last else "unknown"
@@ -179,6 +228,8 @@ def reply_note(session_id, names, state, decision):
             "Labels high and medium are reliable enough to name the speaker.")
     if decision == "clarify":
         note += " The newest line's attribution is uncertain: ask who just spoke instead of answering."
+    if arbitrator_prompt:
+        note += f" The arbitrator asks you to raise this now: {arbitrator_prompt}"
     return note
 
 
@@ -216,6 +267,9 @@ class EventLog:
             "control": ("action", "value", "held", "reason"),
             "playback": ("action", "response_id", "audio_timeline_ms", "timing_basis", "includes_mute_tail"),
             "runtime": ("action",), "gate": ("decision", "audio_timeline_ms"),
+            "arbitrator": ("action", "trigger", "tag", "confirmed", "ingested_rows", "generations", "tier", "redactions"),
+            "guard": ("action", "stage", "redactions"),
+            "summary": ("action", "attempts", "board_rows", "transcript_rows", "reason"),
         }
         original = value
         value = {k: original[k] for k in fields.get(kind, ()) if k in original}
@@ -249,7 +303,7 @@ class EventLog:
     @staticmethod
     def tool_evidence(item):
         output = item.get("output")
-        return {"name": item.get("name") if item.get("name") in ("get_transcript", "get_current_speaker") else "other",
+        return {"name": item.get("name") if item.get("name") in TOOL_NAMES else "other",
                 "output_bytes": len(str(output).encode("utf-8")) if output is not None else 0,
                 "succeeded": item.get("error") is None and output is not None}
 
@@ -297,7 +351,9 @@ class RestClient:
                 return json.load(response)
         except urllib.error.HTTPError as error:
             # The server's status suffices; do not reflect credentials or arbitrary response text.
-            raise RuntimeError(f"Voiceprint {method} {path.split('?')[0]} returned HTTP {error.code}") from None
+            failure = RuntimeError(f"Voiceprint {method} {path.split('?')[0]} returned HTTP {error.code}")
+            failure.status = error.code
+            raise failure from None
 
     async def request(self, method, path, body=None):
         return await asyncio.to_thread(self._request, method, path, body)
@@ -356,6 +412,12 @@ class Agent:
         self.provider, self.player, self.room = provider, player, room
         self.gate = tg.GateState((config.name,), config.eagerness, participant_id,
                                 room_agent_names=tuple(c.name for c in room.configs))
+        pp.apply_mode(self.gate, pp.default_mode(room.conversation_type, config.role, config.speaks_for))
+        # An advocate holds only its OWN principal's constraint values; it never sees the other side's.
+        self.principal_id = room.principal_of(config)
+        self.guard_values = ob.constraint_values([room.objectives[self.principal_id]]) if self.principal_id in room.objectives else ()
+        self.pending_prompt = None        # verified arbitrator prompt, delivered through the next pre-reply note
+        self.deltas = {}                  # (response_id, item_id) -> streamed transcript so far, for the leak guard
         self.active = False
         self.final_done = False
         self.cancelled = False
@@ -381,10 +443,19 @@ class Agent:
         self.room.log.emit(kind, value, self.config.name, self.participant_id)
 
     def state(self):
-        return {"name": self.config.name, "participant_id": self.participant_id,
+        return {"name": self.config.name, "participant_id": self.participant_id, "role": self.config.role,
                 "provider": self.config.provider, "model": self.config.model, "voice": self.config.voice,
                 "eagerness": self.gate.eagerness, "held": self.gate.manual == "hold",
                 "responding": self.active or self.player.busy(), "mcp": dict(self.mcp)}
+
+    async def update_objective(self, objective):
+        """A new version of this advocate's own principal's objective: refresh the guard and the open session's prompt."""
+        self.guard_values = ob.constraint_values([objective])
+        principal_name = self.room.names.get(self.principal_id)
+        if hasattr(self.provider, "objective"):
+            self.provider.objective, self.provider.principal_name = objective, principal_name
+        await self.provider.update_instructions(compose_prompt(self.config, self.room.session_id, self.room.names, objective, principal_name))
+        self.emit("runtime", {"action": "objective_updated"})
 
     @staticmethod
     def safe_error(item):
@@ -402,13 +473,13 @@ class Agent:
             error = self.safe_error(item)
             tools = [t.get("name") for t in item.get("tools") or [] if isinstance(t, dict)]
             self.mcp["list_tools"] = "failed" if error or item.get("status") == "failed" else "ok"
-            self.mcp["tools"] = [t for t in tools if t in ("get_transcript", "get_current_speaker")]
+            self.mcp["tools"] = [t for t in tools if t in TOOL_NAMES]
             self.mcp["last_error"] = error or (item.get("status") if item.get("status") == "failed" else None)
             print(f"{self.config.name}: provider {'FAILED to list' if self.mcp['list_tools'] == 'failed' else 'listed'} the MCP tools"
                   + (f" ({self.mcp['last_error']})" if self.mcp["last_error"] else f" {self.mcp['tools']}") + "; the server log is the independent record", flush=True)
         elif kind == "mcp_call":
             error = self.safe_error(item)
-            name = item.get("name") if item.get("name") in ("get_transcript", "get_current_speaker") else "other"
+            name = item.get("name") if item.get("name") in TOOL_NAMES else "other"
             self.mcp["calls"] += 1
             if error:
                 self.mcp["failed"] += 1
@@ -441,6 +512,7 @@ class Agent:
         self.continue_pending = False
         self.tool_calls = 0
         self.ignored_response_ids.update(self.turn_response_ids)
+        self.deltas.clear()
         self.player.flush()
         self.final_done = True
         if self.active:
@@ -458,13 +530,17 @@ class Agent:
         self.continue_pending = False
         self.response_id = None
         self.turn_response_ids.clear()
+        self.deltas.clear()
         self.start_ms = self.room.timeline_ms
-        if self.gate.manual == "speak":
+        if self.gate.manual in ("speak", "override"):
             self.gate.manual = None
+        prompt, self.pending_prompt = self.pending_prompt, None
+        if prompt and self.room.arbitrator is not None:
+            self.room.arbitrator.pending_tag = None
         self.emit("gate", {"decision": decision, "audio_timeline_ms": self.start_ms})
         print(f"  [{self.config.name} gate: {decision}]", flush=True)
         try:
-            await self.provider.request_reply(reply_note(self.room.session_id, self.room.names, self.gate, decision))
+            await self.provider.request_reply(reply_note(self.room.session_id, self.room.names, self.gate, decision, prompt))
         except Exception:
             await self.cancel("request_failed")
             raise
@@ -499,8 +575,8 @@ class Agent:
         # decide consumes a manual one-shot; preserve it until the API actually grants the floor.
         manual = self.gate.manual
         decision = tg.decide(self.gate, now, self.room.status, self.room.last_end_at)
-        if manual == "speak":
-            self.gate.manual = "speak"
+        if manual in ("speak", "override"):
+            self.gate.manual = manual
         if decision != "wait":
             await self.begin(decision)
 
@@ -532,13 +608,27 @@ class Agent:
             if hasattr(self.player, "begin"):
                 self.player.begin(response_id or self.response_id)
             self.player.play(base64.b64decode(event["delta"]))
+        elif kind == "response.output_audio_transcript.delta":
+            # Voice-leak guard (best effort: audio already rendered cannot be recalled, docs/TURN_TAKING.md §9).
+            if self.guard_values:
+                key = (response_id or self.response_id, event.get("item_id"))
+                self.deltas[key] = self.deltas.get(key, "") + str(event.get("delta") or "")
+                _, hits = ob.redact(self.deltas[key], self.guard_values)
+                if hits:
+                    self.emit("guard", {"action": "cut", "stage": "spoken_delta", "redactions": hits})
+                    print(f"{self.config.name}: spoken output matched a private constraint; reply cut", flush=True)
+                    await self.cancel("leak_guard")
         elif kind == "response.output_audio_transcript.done":
             key = (response_id or self.response_id, event.get("item_id"), event.get("content_index", 0))
+            self.deltas.pop(key[:2], None)
             if key in self.transcript_ids or not event.get("transcript", "").strip():
                 return
             self.transcript_ids.add(key)
+            text, hits = ob.redact(event["transcript"], self.guard_values) if self.guard_values else (event["transcript"], 0)
+            if hits:
+                self.emit("guard", {"action": "redacted", "stage": "stored_utterance", "redactions": hits})
             row = {"speaker_id": self.participant_id, "start_ms": self.start_ms,
-                   "end_ms": max(self.start_ms, self.room.timeline_ms), "text": event["transcript"], "source": "agent"}
+                   "end_ms": max(self.start_ms, self.room.timeline_ms), "text": text, "source": "agent"}
             self.pending_posts += 1
             try:
                 await self.room.authorized()
@@ -572,11 +662,15 @@ class Agent:
 
 
 class Room:
-    def __init__(self, configs, session_id, names, api, log, consent=None):
+    def __init__(self, configs, session_id, names, api, log, consent=None, conversation_type="casual"):
         self.configs, self.session_id, self.names = configs, session_id, names
         self.api, self.log = api, log
         self.path = "/speaker/session/" + quote(session_id)
-        self.agents = []
+        self.agents = []                  # voice agents only; the arbitrator has no floor, player or provider events
+        self.arbitrator = None
+        self.conversation_type = conversation_type
+        self.objectives = {}              # principal_id -> objectives.Objective (latest version)
+        self.objectives_forbidden = False
         self.status, self.timeline_ms, self.last_end_at = "silence", 0, None
         self.cursor, self.seen = 0, set()
         self.controls = queue.Queue()
@@ -590,8 +684,59 @@ class Room:
     def any_active(self):
         return any(a.active or a.player.busy() for a in self.agents)
 
+    def principal_of(self, config):
+        """Participant id of the human this agent speaks for, or None."""
+        wanted = (config.speaks_for or "").strip().casefold()
+        if not wanted:
+            return None
+        return next((pid for pid, name in self.names.items() if name.casefold() == wanted), None)
+
     def state(self):
-        return {"session_id": self.session_id, "agents": [a.state() for a in self.agents]}
+        agents = [a.state() for a in self.agents]
+        if self.arbitrator is not None:
+            agents.append(self.arbitrator.state())
+        return {"session_id": self.session_id, "conversation_type": self.conversation_type, "agents": agents}
+
+    def request_override(self, prompt_to, prompt, tag):
+        """A verified arbitrator prompt: the advocate's next opportunity is an override turn carrying the prompt."""
+        agent = next((a for a in self.agents if a.participant_id == prompt_to or a.config.name == prompt_to), None)
+        if agent is None or agent.gate.manual == "hold":
+            return False
+        agent.gate.manual = "override"
+        agent.pending_prompt = prompt
+        agent.emit("control", {"action": "override", "value": tag, "held": False})
+        return True
+
+    def cancel_override(self):
+        for agent in self.agents:
+            if agent.gate.manual == "override":
+                agent.gate.manual = None
+            agent.pending_prompt = None
+
+    async def refresh_objectives(self):
+        """Latest objective per principal from the API (the runtime is the only reader). Hands both to the arbitrator and
+        each advocate only its own; a new version re-prompts that advocate's open session."""
+        if self.objectives_forbidden:
+            return
+        try:
+            result = await self.api.request("GET", self.path + "/objectives")
+        except RuntimeError as error:
+            if getattr(error, "status", None) == 403:
+                self.objectives_forbidden = True
+                print("Objectives are not readable for this room (negotiation_text scope missing); agents run without them", flush=True)
+                return
+            raise
+        parsed = ob.parse_objectives(result)
+        changed = {pid for pid, o in parsed.items() if pid not in self.objectives or self.objectives[pid].version != o.version}
+        self.objectives = parsed
+        if self.arbitrator is not None:
+            self.arbitrator.objectives = parsed
+        for agent in self.agents:
+            if agent.principal_id in parsed:
+                if agent.principal_id in changed:
+                    await agent.update_objective(parsed[agent.principal_id])
+                else:
+                    agent.guard_values = ob.constraint_values([parsed[agent.principal_id]])
 
     async def register(self):
         next_id = 1
@@ -627,7 +772,11 @@ class Room:
     async def apply_controls(self):
         while not self.controls.empty():
             name, action, value = self.controls.get_nowait()
-            agent = next(a for a in self.agents if a.config.name == name)
+            agent = next((a for a in self.agents if a.config.name == name), None)
+            if agent is None:
+                if self.arbitrator is not None and self.arbitrator.config.name == name:
+                    await self.arbitrator.control(action, value)
+                continue
             if action == "speak":
                 agent.gate.manual = "speak"
             elif action == "hold":
@@ -660,6 +809,7 @@ class Runtime:
         # Persisted personas win over agents.toml so each person's agent keeps its flavor between runs.
         self.configs = merge_personas(list(configs))
         self.session_configs = None
+        self.conversation_type = room.conversation_type if room is not None else "casual"
         self.mcp_url, self.api_token = mcp_url, api_token
         self.phase = "live" if room is not None else "setup"
         self.detail = ""
@@ -685,13 +835,15 @@ class Runtime:
     def state(self):
         with self.lock:
             agents = self.room.state()["agents"] if self.room is not None else []
-            return {"session_id": self.session_id, "agents": agents, "phase": self.phase, "detail": self.detail,
+            return {"session_id": self.session_id, "conversation_type": self.conversation_type, "agents": agents,
+                    "phase": self.phase, "detail": self.detail,
                     "participants": [dict(p, enrollment=self.enrollment.get(p["id"], {"state": "pending", "peak": None}))
                                      for p in self.participants],
                     "awaiting": self.awaiting, "needs_openai_key": self.needs_openai_key(),
-                    "agent_configs": [{"name": c.name, "voice": c.voice, "model": c.model, "eagerness": c.eagerness,
+                    "agent_configs": [{"name": c.name, "role": c.role, "voice": c.voice, "model": c.model, "eagerness": c.eagerness,
                                        "instructions": c.instructions_extra, "speaks_for": c.speaks_for} for c in (self.session_configs or self.configs)],
                     "voices": list(VOICES), "eagerness_levels": list(tg.SILENCE_AFTER_TURN_S), "max_agents": MAX_AGENTS,
+                    "roles": list(pp.ROLES), "conversation_types": list(pp.CONVERSATION_TYPES),
                     "mcp_configured": bool(self.mcp_url), "mcp_url": self.mcp_url, "gui": self.gui}
 
     def bootstrap(self):
@@ -726,14 +878,19 @@ class Runtime:
             raise ValueError("Invalid provider key")
         if self.needs_openai_key() and not key:
             raise ValueError("The OpenAI API key is required to start the agents")
+        conversation_type = body.get("conversation_type", "casual")
+        if conversation_type not in pp.CONVERSATION_TYPES:
+            raise ValueError("Conversation type must be casual or negotiation")
         session_configs = self.configs
         if "agents" in body:
             session_configs = self.build_agents(body.get("agents"), names)
+        validate_room(conversation_type, session_configs)
         if key:
             # Held only in this process's environment for the provider transport; never logged or written.
             os.environ["OPENAI_API_KEY"] = key.strip()
         with self.lock:
             self.session_configs = session_configs
+            self.conversation_type = conversation_type
         if "agents" in body:
             save_personas(session_configs)
         self.setup.put({"names": names, "contacts": contacts, "session_id": session})
@@ -762,14 +919,19 @@ class Runtime:
             eagerness = row.get("eagerness", base.eagerness)
             if voice not in VOICES or eagerness not in tg.SILENCE_AFTER_TURN_S:
                 raise ValueError(f"{name}: voice must be one of {', '.join(VOICES)} and eagerness quiet, balanced or eager")
+            role = row.get("role", base.role)
+            if role not in pp.ROLES:
+                raise ValueError(f"{name}: role must be voice or arbitrator")
             speaks_for = row.get("speaks_for", "")
             if not isinstance(speaks_for, str):
                 raise ValueError("speaks_for must be a name")
             speaks_for = speaks_for.strip()
             if speaks_for and speaks_for.casefold() not in humans:
                 raise ValueError(f"{name} can only speak for a person in the room")
-            result.append(dataclasses.replace(base, name=name, voice=voice, eagerness=eagerness, speaks_for=speaks_for,
-                                              instructions_extra=clean_instructions(row.get("instructions", base.instructions_extra))))
+            if speaks_for and role == "arbitrator":
+                raise ValueError(f"{name} is the arbitrator and stays neutral; it cannot speak for anyone")
+            result.append(with_role(dataclasses.replace(base, name=name, voice=voice, eagerness=eagerness, speaks_for=speaks_for,
+                                                        instructions_extra=clean_instructions(row.get("instructions", base.instructions_extra))), role))
         return result
 
     def active_configs(self):
@@ -944,18 +1106,22 @@ def control_server(target, port=8090, api_origin="http://127.0.0.1:8080", token=
             match = re.fullmatch(r"/agents/([^/]+)/control", self.path)
             name = unquote(match[1]) if match else None
             room = runtime.room
-            agent = next((a for a in room.agents if a.config.name == name), None) if room is not None else None
-            if agent is None:
-                self.answer(404, {"error": "unknown_agent"})
-                return
+            # Read the body before answering: a reply sent while the request body is unread resets the socket on Windows.
             try:
                 body = self.body()
                 if not 0 < int(self.headers.get("Content-Length", "0")):
                     raise ValueError()
-                action, value = body.get("action"), body.get("value")
-                if action not in ("speak", "hold", "cancel", "eagerness") or (action == "eagerness" and value not in tg.SILENCE_AFTER_TURN_S):
-                    raise ValueError()
             except (ValueError, TypeError):
+                body = None
+            agent = next((a for a in room.agents if a.config.name == name), None) if room is not None else None
+            if agent is None and room is not None and room.arbitrator is not None and room.arbitrator.config.name == name:
+                agent = room.arbitrator
+            if agent is None:
+                self.answer(404, {"error": "unknown_agent"})
+                return
+            actions = ("speak", "hold", "cancel") if agent is room.arbitrator else ("speak", "hold", "cancel", "eagerness")
+            action, value = (body.get("action"), body.get("value")) if body is not None else (None, None)
+            if action not in actions or (action == "eagerness" and value not in tg.SILENCE_AFTER_TURN_S):
                 self.answer(400, {"error": "invalid_control"})
                 return
             room.controls.put((name, action, value))
@@ -971,8 +1137,8 @@ async def main(args):
     if args.events is not None:
         raise vp.ConsentError("--events disk logs are disabled pending encrypted artifact registration/destruction; aggregate scoring uses memory")
     configs = getattr(args, "configs", None) or load_config(args.config)
-    if any(c.provider != "openai_realtime" for c in configs):
-        raise RuntimeError("Only openai_realtime is live; xai_speech and gemini_live are stubs")
+    if any(c.provider != "openai_realtime" and not (c.provider == "openai_responses" and c.role == "arbitrator") for c in configs):
+        raise RuntimeError("Only openai_realtime (voice) and openai_responses (arbitrator) are live; xai_speech and gemini_live are stubs")
     if not os.environ.get("OPENAI_API_KEY") and not getattr(args, "gui", False):
         raise RuntimeError("Set OPENAI_API_KEY in this shell before starting the runtime, or start with --gui and enter it there")
     mcp_token = getattr(args, "mcp_token", None) or os.environ.get("VOICEPRINT_MCP_TOKEN")
@@ -1023,9 +1189,13 @@ async def run_session(args, configs, runtime, server, microphone, mcp_token, sto
         runtime.session_id = session_id
         runtime.participants = [{"id": f"participant_{i}", "name": name} for i, name in enumerate(names, 1)]
     configs = runtime.active_configs()
+    conversation_type = runtime.conversation_type if gui else getattr(args, "conversation_type", None) or runtime.conversation_type
     for config in configs:
         if config.speaks_for and config.speaks_for.casefold() not in {n.casefold() for n in names}:
             raise RuntimeError(f"{config.name} is configured to speak for {config.speaks_for}, who is not in this room")
+    validate_room(conversation_type, configs)
+    with runtime.lock:
+        runtime.conversation_type = conversation_type
     runtime.set_phase("consent", "Each person signs their written release in the GUI; microphone closed")
     try:
         consent = await asyncio.to_thread(vp.prepare_room, args.api, session_id, names, contacts, True, runtime.stop)
@@ -1038,6 +1208,13 @@ async def run_session(args, configs, runtime, server, microphone, mcp_token, sto
                 pass
         raise
     try:
+        if conversation_type == "negotiation":
+            # Fail before anyone records: without this scope from everyone the arbitrator's first vendor call would latch
+            # the guard mid-conversation and stop the whole room. Read through an already-granted scope, no latch.
+            state = await asyncio.to_thread(consent.require, "openai_audio")
+            if (state.get("scopes") or {}).get("negotiation_text") is not True:
+                raise vp.ConsentError("A negotiation room needs every release to include the negotiation text disclosure; "
+                                      "end this room and sign again with that box checked")
         record = runtime.recorder(microphone, consent, console=not gui)
         names = await asyncio.to_thread(vp.enroll, args.api, session_id, names, record, None, consent, runtime.reset_enrollment)
     except BaseException:
@@ -1049,7 +1226,7 @@ async def run_session(args, configs, runtime, server, microphone, mcp_token, sto
         raise
     runtime.set_phase("connecting", "Registering agents and connecting to the provider")
     log = EventLog(args.events, session_id, secrets=(os.environ.get("OPENAI_API_KEY"), mcp_token, vp.api_token()))
-    room = Room(configs, session_id, names, RestClient(args.api, vp.api_token()), log, consent)
+    room = Room(configs, session_id, names, RestClient(args.api, vp.api_token()), log, consent, conversation_type)
     with runtime.lock:
         runtime.room = room
     loop = asyncio.get_running_loop()
@@ -1057,9 +1234,25 @@ async def run_session(args, configs, runtime, server, microphone, mcp_token, sto
     failures = queue.Queue()
     tasks, providers, players = [], [], []
     transcriber, stream, capture_thread = None, None, None
+    operator_end = False
+    mcp_local = getattr(args, "mcp_local", None) or "http://127.0.0.1:%s/mcp" % os.environ.get("VOICEPRINT_MCP_PORT", "8082")
     try:
         ids = await room.register()
+        if room.conversation_type == "negotiation":
+            try:
+                await room.refresh_objectives()   # advocates connect with their own objective already in the prompt
+            except Exception as error:
+                # The live poll retries every 2 s and re-prompts an advocate as soon as its objective is readable.
+                print(f"Objectives not readable yet ({type(error).__name__}); the runtime keeps polling once live", flush=True)
+                log.emit("runtime", {"action": "objectives_poll_failed"})
         for config, participant_id in zip(configs, ids):
+            if config.role == "arbitrator":
+                # Text only: no player, no floor, no realtime session. Reads go through the local MCP endpoint as proof rows.
+                room.arbitrator = Arbitrator(config, participant_id, room, OpenAIResponses(config.model, consent),
+                                             McpClient(mcp_local, mcp_token, participant_id))
+                room.arbitrator.objectives = room.objectives
+                print(f"{config.name}: arbitrator ready (text only, model={config.model}); reads via {mcp_local}", flush=True)
+                continue
             output_spec = args.output_device if args.output_device is not None else config.output_device
             output = resolve_device(output_spec, "output")
             if output is None and output_spec:
@@ -1069,8 +1262,10 @@ async def run_session(args, configs, runtime, server, microphone, mcp_token, sto
                                   lambda value, c=config, pid=participant_id: log.emit("playback", value, c.name, pid),
                                   lambda: room.timeline_ms)
             players.append(player)
+            principal_id = room.principal_of(config)
             provider = make_provider(config, session_id=session_id, names=names, participant_id=participant_id,
-                                     mcp_url=args.mcp_url, mcp_token=mcp_token, consent=consent)
+                                     mcp_url=args.mcp_url, mcp_token=mcp_token, consent=consent,
+                                     objective=room.objectives.get(principal_id), principal_name=names.get(principal_id))
             providers.append(provider)
             await provider.connect()
             room.agents.append(Agent(config, participant_id, provider, player, room))
@@ -1159,6 +1354,22 @@ async def run_session(args, configs, runtime, server, microphone, mcp_token, sto
                     await agent.tick(time.monotonic())
                 await asyncio.sleep(.2)
 
+        async def arbitrator_loop():
+            # Own task: a text generation can take tens of seconds and must never stall floor renewals or controls.
+            while not stop.is_set():
+                if room.arbitrator is not None:
+                    await room.arbitrator.tick(time.monotonic())
+                await asyncio.sleep(.2)
+
+        async def objectives_loop():
+            while not stop.is_set():
+                if room.conversation_type == "negotiation":
+                    try:
+                        await room.refresh_objectives()
+                    except Exception:
+                        log.emit("runtime", {"action": "objectives_poll_failed"})
+                await asyncio.sleep(2)
+
         async def consent_monitor():
             try:
                 while not stop.is_set():
@@ -1185,7 +1396,8 @@ async def run_session(args, configs, runtime, server, microphone, mcp_token, sto
         capture_thread = threading.Thread(target=microphone_loop, daemon=True)
         capture_thread.start()
         threading.Thread(target=keyboard_loop, daemon=True).start()
-        tasks = [asyncio.create_task(sender()), asyncio.create_task(gate_loop()), asyncio.create_task(consent_monitor())]
+        tasks = [asyncio.create_task(sender()), asyncio.create_task(gate_loop()), asyncio.create_task(consent_monitor()),
+                 asyncio.create_task(objectives_loop()), asyncio.create_task(arbitrator_loop())]
         tasks += [asyncio.create_task(receiver(a)) for a in room.agents]
         while not stop.is_set() and not runtime.stop.is_set():
             for task in tasks:
@@ -1195,6 +1407,7 @@ async def run_session(args, configs, runtime, server, microphone, mcp_token, sto
             await asyncio.sleep(.2)
         if not failures.empty():
             raise failures.get()
+        operator_end = True          # reached only when the operator ended the room (GUI Stop or Q), never on a failure
     finally:
         stop.set()
         runtime.set_phase("ending", "Finishing transcription and ending the room")
@@ -1235,11 +1448,10 @@ async def run_session(args, configs, runtime, server, microphone, mcp_token, sto
             await asyncio.to_thread(transcriber.finish)
         while not audio_out.empty():
             audio_out.get_nowait()
-        # Persist all final human turns before ending the session.
+        # All final human turns are persisted above; the summary (negotiation, operator end only) is written before /end.
         try:
-            await room.api.request("POST", room.path + "/end", {})
+            await end_room(room, log, consent, operator_end and not consent.failed.is_set(), summary_file=getattr(args, "summary_file", None))
         finally:
-            log.emit("runtime", {"action": "ended", "agents": room.state()["agents"]})
             log.summarize()
             log.close()
             room.names.clear()
@@ -1248,11 +1460,115 @@ async def run_session(args, configs, runtime, server, microphone, mcp_token, sto
         runtime.set_phase("ended", f"Session ended: {session_id}")
 
 
+SUMMARY_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["agreements", "open_items", "next_steps", "summary"],
+                  "properties": {"agreements": {"type": "array", "items": {"type": "string"}},
+                                 "open_items": {"type": "array", "items": {"type": "string"}},
+                                 "next_steps": {"type": "array", "items": {"type": "string"}},
+                                 "summary": {"type": "string"}}}
+SUMMARY_INSTRUCTIONS = ("You write the closing record of a negotiation from its public notes board and named transcript. List the "
+                        "agreements reached, the open items and the recommended next steps, then a short summary. Never state, quote, "
+                        "approximate or confirm any party's private constraint value; describe outcomes in words. Attribution labels "
+                        "in the transcript are similarity-based, not calibrated. Output JSON only.")
+SUMMARY_ATTEMPTS = 3
+MAX_SUMMARY_CHARS = 20000
+
+
+def render_summary(result):
+    def items(key):
+        return [str(x).strip() for x in (result.get(key) or []) if str(x).strip()] or ["(none)"]
+    sections = [("Agreements", items("agreements")), ("Open items", items("open_items")), ("Next steps", items("next_steps"))]
+    text = "\n\n".join(f"{title}:\n" + "\n".join(f"- {line}" for line in lines) for title, lines in sections)
+    return text + "\n\nSummary: " + str(result.get("summary") or "").strip()
+
+
+async def fetch_all(api, path, key, limit=200, max_rows=1000, extra=""):
+    rows, after = [], 0
+    while len(rows) < max_rows:
+        page = await api.request("GET", f"{path}?after_id={after}&limit={limit}{extra}")
+        batch = page.get(key) or []
+        rows.extend(batch)
+        cursor = page.get("next_after_id", after)
+        if len(batch) < limit or cursor <= after:
+            break
+        after = cursor
+    return rows
+
+
+async def write_summary(room, responses, log, consent, summary_file=None, attempts=SUMMARY_ATTEMPTS):
+    """One Responses call over the board rows and transcript, redacted, then POST .../summary (retried). True when saved."""
+    try:
+        await asyncio.to_thread(consent.require, "negotiation_text")
+    except vp.ConsentError:
+        log.emit("summary", {"action": "skipped", "reason": "scope_missing"})
+        return False
+    board_rows = await fetch_all(room.api, room.path + "/agent_channel", "rows", extra="&tier=board")
+    board_rows = [r for r in board_rows if r.get("tier", "board") == "board"]
+    transcript_rows = await fetch_all(room.api, room.path + "/utterances", "utterances")
+    counts = {"board_rows": len(board_rows), "transcript_rows": len(transcript_rows)}
+    board_text = "\n".join(str(r.get("text") or "") for r in board_rows) or "(empty)"
+    transcript_text = "\n".join(f"{room.names.get(r.get('speaker_id'), 'unknown')} [{r.get('label')}]: {r.get('text') or ''}"
+                                for r in transcript_rows) or "(empty)"
+    try:
+        result = await asyncio.to_thread(responses.generate, SUMMARY_INSTRUCTIONS,
+                                         f"Notes board:\n{board_text}\n\nTranscript:\n{transcript_text}", "negotiation_summary", SUMMARY_SCHEMA)
+    except Exception as error:
+        log.emit("summary", {"action": "failed", "attempts": 0, **counts})
+        print(f"SUMMARY NOT SAVED: generation failed ({type(error).__name__}); the room still ends", file=sys.stderr, flush=True)
+        return False
+    text, hits = ob.redact(render_summary(result), ob.constraint_values(room.objectives))
+    if hits:
+        log.emit("guard", {"action": "redacted", "stage": "summary", "redactions": hits})
+    text = text[:MAX_SUMMARY_CHARS]
+    body = {"text": text, "model": responses.model, **counts}
+    for attempt in range(1, attempts + 1):
+        try:
+            await room.api.request("POST", room.path + "/summary", body)
+        except Exception:
+            await asyncio.sleep(.2 * attempt)
+            continue
+        log.emit("summary", {"action": "saved", "attempts": attempt, **counts})
+        print(f"Summary saved to the API ({counts['board_rows']} board rows, {counts['transcript_rows']} transcript rows).", flush=True)
+        if summary_file:
+            # Operator's explicit choice, only after the database record is confirmed (docs/API.md "Summary").
+            Path(summary_file).write_text(text, encoding="utf-8")
+            print(f"Summary also written to {summary_file}.", flush=True)
+        return True
+    log.emit("summary", {"action": "failed", "attempts": attempts, **counts})
+    print("SUMMARY NOT SAVED after %d attempts; the room still ends so its purpose data is destroyed on time." % attempts, file=sys.stderr, flush=True)
+    return False
+
+
+async def end_room(room, log, consent, operator_end, responses=None, summary_file=None):
+    """Summary first (negotiation room, arbitrator present, operator-initiated end, consent intact), then POST /end.
+    The summary is a derived artifact; /end, which starts purpose-data destruction, always follows even when the
+    summary could not be generated or stored. Privacy destruction wins over a derived artifact."""
+    if room.conversation_type != "negotiation" or room.arbitrator is None:
+        log.emit("summary", {"action": "skipped", "reason": "not_negotiation"})
+    elif consent is None or consent.failed.is_set():
+        log.emit("summary", {"action": "skipped", "reason": "consent_failed"})
+    elif not operator_end:
+        log.emit("summary", {"action": "skipped", "reason": "not_operator_end"})
+    else:
+        responses = responses or OpenAIResponses(room.arbitrator.config.model, consent)
+        try:
+            await write_summary(room, responses, log, consent, summary_file)
+        except Exception as error:
+            log.emit("summary", {"action": "failed", "attempts": 0})
+            print(f"SUMMARY NOT SAVED ({type(error).__name__}); the room still ends", file=sys.stderr, flush=True)
+    try:
+        await room.api.request("POST", room.path + "/end", {})
+    finally:
+        log.emit("runtime", {"action": "ended", "agents": room.state()["agents"]})
+
+
 def parser():
     result = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     result.add_argument("--config", type=Path, default=Path(__file__).with_name("agents.toml"))
     result.add_argument("--api", default="http://127.0.0.1:8080")
     result.add_argument("--mcp-url", help="public HTTPS URL ending /mcp from the port 8082 tunnel")
+    result.add_argument("--mcp-local", help="local MCP HTTP endpoint for the arbitrator's reads (default http://127.0.0.1:$VOICEPRINT_MCP_PORT/mcp)")
+    result.add_argument("--conversation-type", choices=list(pp.CONVERSATION_TYPES), default="casual", help="without --gui; the GUI setup sends it")
+    result.add_argument("--summary-file", type=Path, help="negotiation only: also write the closing summary here after the API record is confirmed")
     result.add_argument("--names", nargs="+", default=["Grant", "Kyle"])
     result.add_argument("--contacts", nargs="+", help="one typed email/phone per full name; otherwise prompt before consent")
     result.add_argument("--session")
@@ -1278,7 +1594,8 @@ if __name__ == "__main__":
         print(sd.query_devices())
     elif args.check_config:
         for agent in load_config(args.config):
-            print(f"{agent.name}: {agent.provider} / {agent.model} / {agent.voice} / {agent.eagerness} / output {agent.output_device}")
+            print(f"{agent.name}: {agent.provider} / {agent.model} / {agent.voice} / {agent.eagerness} / output {agent.output_device}"
+                  + (f" / role {agent.role}" if agent.role != "voice" else ""))
     else:
         if not args.mcp_url:
             argument_parser.error("--mcp-url is required (port 8082 tunnel URL ending /mcp)")
