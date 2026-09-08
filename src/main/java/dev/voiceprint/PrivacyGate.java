@@ -54,7 +54,7 @@ final class PrivacyGate {
         var room = room(session); var participants = Json.arr();
         boolean valid = policy.configured() && PrivacyPolicy.VERSION.equals(room.path("policy_version").asText())
             && room.path("state").asText().equals("active") && clock.millis() < room.path("retention_deadline_ms").asLong();
-        boolean audio = true, hosted = true;
+        boolean audio = true, hosted = true, negotiation = true;
         try (var p = store.prepare("SELECT * FROM biometric_consents WHERE session_id=? ORDER BY participant_id", session); var r = p.executeQuery()) {
             while (r.next()) {
                 boolean granted = r.getBoolean("bipa_consent_granted") && r.getObject("revoked_at_ms") == null
@@ -64,15 +64,23 @@ final class PrivacyGate {
                 if (r.getObject("consent_timestamp") == null) member.putNull("consent_timestamp"); else member.put("consent_timestamp", r.getLong("consent_timestamp"));
                 participants.add(member); valid &= granted;
                 var scopes = Json.parse(r.getString("disclosure_scopes"));
-                audio &= contains(scopes, "openai_audio"); hosted &= contains(scopes, "hosted_mcp");
+                audio &= contains(scopes, "openai_audio"); hosted &= contains(scopes, "hosted_mcp"); negotiation &= contains(scopes, "negotiation_text");
             }
         } catch (SQLException e) { throw new IllegalStateException(e); }
         valid &= participants.size() >= 2;
         room.put("policy_version", PrivacyPolicy.VERSION).put("consent_method_version", PrivacyPolicy.METHOD).put("allowed", valid);
         room.set("participants", participants);
         room.set("scopes", Json.obj().put("local_processing", valid).put("openai_audio", valid && audio && policy.openaiReviewed())
-            .put("hosted_mcp", valid && hosted && policy.openaiReviewed() && policy.cloudflareReviewed()));
+            .put("hosted_mcp", valid && hosted && policy.openaiReviewed() && policy.cloudflareReviewed())
+            .put("negotiation_text", valid && negotiation && policy.openaiReviewed()));
         return room;
+    }
+    /** Human roster of the room: every biometric_consents participant, whether or not enrollment has happened yet. */
+    List<String> roster(String session) {
+        var result = new ArrayList<String>();
+        try (var p = store.prepare("SELECT participant_id FROM biometric_consents WHERE session_id=? ORDER BY participant_id", session); var r = p.executeQuery()) { while (r.next()) result.add(r.getString(1)); }
+        catch (SQLException e) { throw new IllegalStateException(e); }
+        return result;
     }
     private static boolean contains(JsonNode array, String value) { for (var item : array) if (item.asText().equals(value)) return true; return false; }
     void require(String session, String scope) {
@@ -110,7 +118,7 @@ final class PrivacyGate {
         var scopes = request.path("disclosure_scopes");
         if (!scopes.isArray()) throw new ApiException(403, "release_rejected", "Select disclosure scopes explicitly, or use an empty list.");
         var unique = new HashSet<String>();
-        for (var scope : scopes) if (!scope.isTextual() || !Set.of("openai_audio", "hosted_mcp").contains(scope.asText()) || !unique.add(scope.asText())) throw new ApiException(403, "release_rejected", "Invalid disclosure scope.");
+        for (var scope : scopes) if (!scope.isTextual() || !Set.of("openai_audio", "hosted_mcp", "negotiation_text").contains(scope.asText()) || !unique.add(scope.asText())) throw new ApiException(403, "release_rejected", "Invalid disclosure scope.");
         if (!notice.equals(policy.noticeHash())) throw new ApiException(403, "release_rejected", "Review the current notice before signing.");
         return store.transaction(() -> {
             long now = clock.millis(); String consentId;
@@ -172,6 +180,8 @@ final class PrivacyGate {
             store.execute("UPDATE privacy_rooms SET state='destroying',roster_version=roster_version+1,purpose_completed_ms=? WHERE session_id=?", now, session);
             store.execute("UPDATE biometric_consents SET bipa_consent_granted=0,revoked_at_ms=COALESCE(revoked_at_ms,?) WHERE session_id=?", now, session);
             store.execute("UPDATE consent_challenges SET consumed=1 WHERE session_id=?", session);
+            // A withdrawal or explicit deletion takes the retained summary with it; purpose completion and expiry are the retention path.
+            if (reason.equals("withdrawal") || reason.equals("deletion_requested")) store.deleteSummary(session);
             store.execute("INSERT OR IGNORE INTO destruction_jobs(session_id,state,created_ms) VALUES(?,'pending',?)", session, now);
             long job;
             try (var p = store.prepare("SELECT job_id FROM destruction_jobs WHERE session_id=?", session); var row = p.executeQuery()) { row.next(); job = row.getLong(1); }
@@ -191,6 +201,8 @@ final class PrivacyGate {
     }
     void sweep() {
         for (String session : expiredRooms()) schedule(session, "deadline_expired", null);
+        // Summaries are a separately retained artifact with their own 30-day deadline, not part of the session graph.
+        try { store.deleteExpiredSummaries(clock.millis()); } catch (SQLException e) { throw new IllegalStateException(e); }
         var jobs = new ArrayList<Long>();
         try (var p = store.prepare("SELECT job_id FROM destruction_jobs WHERE state!='complete' AND (lease_until_ms IS NULL OR lease_until_ms<=?) ORDER BY job_id LIMIT 100", clock.millis()); var r = p.executeQuery()) { while (r.next()) jobs.add(r.getLong(1)); }
         catch (SQLException e) { throw new IllegalStateException(e); }
@@ -207,6 +219,8 @@ final class PrivacyGate {
             if (!sqliteDone) {
                 store.transaction(() -> {
                     store.execute("DELETE FROM sessions WHERE id=?", session);
+                    // These reference the privacy room rather than the session, so no cascade reaches them.
+                    for (String table : List.of("objectives", "agent_channel", "channel_reveals")) store.execute("DELETE FROM " + table + " WHERE session_id=?", session);
                     store.execute("UPDATE biometric_consents SET opening_audio_sha256=NULL WHERE session_id=?", session);
                     store.execute("DELETE FROM consent_challenges WHERE session_id=?", session);
                     store.execute("UPDATE destruction_items SET attempts=attempts+1 WHERE job_id=? AND destination='sqlite_session_graph'", job);
@@ -215,7 +229,7 @@ final class PrivacyGate {
                 try (var p = store.prepare("PRAGMA wal_checkpoint(TRUNCATE)"); var r = p.executeQuery()) { if (r.getInt(1) != 0) throw new SQLException("WAL checkpoint busy"); }
                 store.execute("VACUUM");
                 try (var p = store.prepare("PRAGMA wal_checkpoint(TRUNCATE)"); var r = p.executeQuery()) { if (r.getInt(1) != 0) throw new SQLException("WAL checkpoint busy after compaction"); }
-                for (String table : List.of("sessions", "profiles", "participants", "segments", "corrections", "correction_examples", "utterances", "events", "floor", "mcp_calls")) {
+                for (String table : List.of("sessions", "profiles", "participants", "segments", "corrections", "correction_examples", "utterances", "events", "floor", "mcp_calls", "objectives", "agent_channel", "channel_reveals")) {
                     String column = table.equals("sessions") ? "id" : "session_id";
                     try (var p = store.prepare("SELECT count(*) FROM " + table + " WHERE " + column + "=?", session); var r = p.executeQuery()) { if (r.getLong(1) != 0) throw new SQLException("Session graph remains"); }
                 }

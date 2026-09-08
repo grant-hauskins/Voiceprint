@@ -13,6 +13,7 @@ record PrivacyPolicy(String controllerName, String controllerAddress, String con
     static final String PURPOSE = "live_conversation_v1";
     static final String PURPOSE_TEXT = "identify consenting speakers and provide a speaker-attributed transcript during the current room conversation";
     static final long INACTIVITY_MS = 30 * 60 * 1000L;
+    static final long SUMMARY_RETENTION_MS = 30L * 24 * 60 * 60 * 1000;
     static PrivacyPolicy environment() {
         return new PrivacyPolicy(System.getenv("VOICEPRINT_CONTROLLER_NAME"), System.getenv("VOICEPRINT_CONTROLLER_ADDRESS"),
             System.getenv("VOICEPRINT_CONTROLLER_EMAIL"), System.getenv("VOICEPRINT_API_TOKEN"),
@@ -31,6 +32,7 @@ record PrivacyPolicy(String controllerName, String controllerAddress, String con
             + "Voiceprint captures enrollment and room audio, creates speaker-identifying voice embeddings, and stores attributed transcript, attribution, correction and tool-use records. "
             + "Local models process these data on the operator's computer. Voiceprints and related data are not sold, leased, traded or used for profit from biometric data. "
             + "Optional openai_audio disclosure sends room audio to OpenAI Realtime and its transcription systems; optional hosted_mcp disclosure sends attributed transcript and tool results to OpenAI through Cloudflare's MCP tunnel. "
+            + "Optional negotiation_text disclosure stores each participant's typed negotiation objective (position and private constraint values), injects it only into that participant's own advocate agent, sends both objectives, the notes board and the named transcript to OpenAI text models for a neutral arbitrator and an end-of-conversation summary, and retains that written summary for 30 days after the room ends; private constraint values are never written to any shared channel. "
             + "Each optional disclosure requires every participant's release and operator review of the recipient's agreements and account retention/deletion settings. Closing a provider connection does not prove deletion of its logs. "
             + retentionText() + "\nBy personally checking the release box, typing my full name and submitting, I affirmatively authorize the stated collection and local processing for this current conversation, and only the optional disclosures I select. "
             + "I may withdraw through the room controls or ask the operator to stop. I am signing for myself; representative consent is not supported. "

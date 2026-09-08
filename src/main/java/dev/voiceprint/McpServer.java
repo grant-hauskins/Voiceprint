@@ -13,7 +13,7 @@ import java.util.Set;
 final class McpServer {
     static final String VERSION = "2025-11-25";
     static final Set<String> VERSIONS = Set.of("2025-03-26", "2025-06-18", "2025-11-25");
-    static final Set<String> TOOLS = Set.of("list_sessions", "get_transcript", "get_current_speaker", "get_participant_statements", "correct_attribution");
+    static final Set<String> TOOLS = Set.of("list_sessions", "get_transcript", "get_current_speaker", "get_participant_statements", "correct_attribution", "get_agent_channel", "post_agent_channel");
     static final String LABEL_NOTICE = "Human labels high/medium/low are similarity-based, not calibrated probabilities. Agent labels are declared by their registered producer. Null confidence is unavailable, not zero.";
 
     /** Per-connection state for stdio, where the lifecycle handshake is enforced. HTTP is stateless and skips it. */
@@ -39,9 +39,13 @@ final class McpServer {
      * the stdio lifecycle is enforced (initialize before tools); with null every request stands alone.
      */
     static ObjectNode dispatch(JsonNode request, HttpClient client, String api, String token, Session session) {
-        return dispatch(request, client, api, token, session, false);
+        return dispatch(request, client, api, token, session, false, null);
     }
     static ObjectNode dispatch(JsonNode request, HttpClient client, String api, String token, Session session, boolean hosted) {
+        return dispatch(request, client, api, token, session, hosted, null);
+    }
+    /** `participant` is the MCP URL's caller-declared participant_id tag (null on stdio); only post_agent_channel uses it. */
+    static ObjectNode dispatch(JsonNode request, HttpClient client, String api, String token, Session session, boolean hosted, String participant) {
         JsonNode id = request == null ? null : request.get("id");
         if (request == null || !request.isObject() || !request.path("jsonrpc").asText().equals("2.0") || !request.path("method").isTextual()
             || (id != null && !(id.isTextual() || id.isIntegralNumber())))
@@ -69,7 +73,7 @@ final class McpServer {
                 var params = request.path("params"); String name = Json.text(params, "name", 80);
                 if (!TOOLS.contains(name)) throw new ApiException(-32602, "protocol", "Unknown tool");
                 JsonNode arguments = params.path("arguments");
-                try { result = call(client, api, token, name, arguments, hosted); }
+                try { result = call(client, api, token, name, arguments, hosted, participant); }
                 catch (Exception e) {
                     if (e instanceof InterruptedException) Thread.currentThread().interrupt();
                     String message = e instanceof ApiException ? e.getMessage() : "Voiceprint API is unavailable.";
@@ -81,11 +85,24 @@ final class McpServer {
             var response = Json.obj().put("jsonrpc", "2.0"); response.set("id", id); response.set("result", result); return response;
         } catch (ApiException e) { return error(id, e.status < 0 ? e.status : -32602, e.getMessage()); }
     }
-    private static ObjectNode call(HttpClient client, String base, String token, String tool, JsonNode args, boolean hosted) throws Exception {
+    private static ObjectNode call(HttpClient client, String base, String token, String tool, JsonNode args, boolean hosted, String participant) throws Exception {
         String path; String body = null;
         if (tool.equals("list_sessions")) path = "/speaker/sessions?limit=" + (args.has("limit") ? Json.integer(args, "limit", 1, 200) : 10);
         else path = "/speaker/session/" + Json.id(args, "session_id");
         if (tool.equals("list_sessions")) {}
+        else if (tool.equals("get_agent_channel")) {
+            long after = args.has("after_id") ? Json.integer(args, "after_id", 0, Integer.MAX_VALUE) : 0;
+            long limit = args.has("limit") ? Json.integer(args, "limit", 1, 200) : 100;
+            path += "/agent_channel?after_id=" + after + "&limit=" + limit + "&tier=all";
+        }
+        else if (tool.equals("post_agent_channel")) {
+            // The sender is the URL tag, never an argument: an agent cannot post as another participant by naming it.
+            if (participant == null) throw new ApiException(400, "tool_error", "post_agent_channel requires ?participant_id on the MCP URL");
+            String tier = args.has("tier") ? Json.text(args, "tier", 10) : "raw";
+            if (!Set.of("board", "raw").contains(tier)) throw new ApiException(-32602, "protocol", "tier must be board or raw");
+            path += "/agent_channel";
+            body = Json.obj().put("sender_participant_id", participant).put("tier", tier).put("text", Json.text(args, "text", 4000)).toString();
+        }
         else if (tool.equals("get_transcript")) {
             long after = args.has("after_id") ? Json.integer(args, "after_id", 0, Integer.MAX_VALUE) : 0;
             long limit = args.has("limit") ? Json.integer(args, "limit", 1, 200) : 100;
@@ -122,6 +139,18 @@ final class McpServer {
             result.putArray("content").add(Json.obj().put("type", "text").put("text", text.isEmpty() ? "(no utterances yet)" : text.strip()));
             return result;
         }
+        if (tool.equals("get_agent_channel") && response.statusCode() < 400) {
+            String text = value.path("text").asText().strip();
+            var compact = Json.obj().put("session_id", value.path("session_id").asText()).put("next_after_id", value.path("next_after_id").asLong()).put("count", value.path("rows").size())
+                .put("channel", text.isEmpty() ? "(no channel messages yet)" : text);
+            var result = Json.obj().put("isError", false); result.set("structuredContent", compact);
+            result.putArray("content").add(Json.obj().put("type", "text").put("text", compact.path("channel").asText()));
+            return result;
+        }
+        if (tool.equals("post_agent_channel") && response.statusCode() < 400) {
+            var compact = Json.obj().put("row_id", value.path("row_id").asLong()).put("tier", value.path("tier").asText()).put("redactions", value.path("redactions").asInt());
+            return toolResult(compact, false);
+        }
         if (tool.equals("list_sessions") && response.statusCode() < 400) {
             var lines = new StringBuilder();
             for (var s : value.path("sessions")) lines.append(s.path("session_id").asText()).append(' ').append(s.path("status").asText()).append(' ').append(s.path("elapsed_ms").asLong() / 1000).append("s [").append(s.path("participants").asText()).append("]\n");
@@ -155,6 +184,17 @@ final class McpServer {
         properties.set("limit", Json.obj().put("type", "integer").put("minimum", 1).put("maximum", 200));
         result.add(statements);
         result.add(tool("correct_attribution", "Apply a user-provided correction to an exact segment; update the profile only for verified single-speaker audio.", false, "session_id", "segment_id", "actual_speaker"));
+        var channel = tool("get_agent_channel", "Read the agent-to-agent channel as compact lines '#id HH:MM:SS Sender [board|raw](TAG): text'. board rows are the neutral notes board visible to the humans; raw rows are private agent notes. Pass after_id from the previous call to fetch only new lines. Stored text has already passed the redaction guard.", true, "session_id");
+        ObjectNode cp = (ObjectNode) channel.path("inputSchema").path("properties");
+        cp.set("after_id", Json.obj().put("type", "integer").put("minimum", 0));
+        cp.set("limit", Json.obj().put("type", "integer").put("minimum", 1).put("maximum", 200));
+        result.add(channel);
+        var post = tool("post_agent_channel", "Post a text note to the agent channel as the participant named on this MCP URL. tier=raw (default) is a private note for other agents; tier=board is the public notes board the humans see. Never state a participant's private constraint values; the server redacts literal matches as [withheld].", false, "session_id", "text");
+        ObjectNode pp = (ObjectNode) post.path("inputSchema").path("properties");
+        pp.set("text", Json.obj().put("type", "string").put("minLength", 1).put("maxLength", 4000));
+        ObjectNode tier = Json.obj().put("type", "string"); tier.putArray("enum").add("board").add("raw");
+        pp.set("tier", tier);
+        result.add(post);
         return result;
     }
     private static ObjectNode tool(String name, String description, boolean readOnly, String... fields) {

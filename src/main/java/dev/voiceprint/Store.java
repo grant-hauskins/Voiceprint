@@ -16,11 +16,14 @@ final class Store implements AutoCloseable {
     Store(Path path) throws Exception {
         Path parent = path.toAbsolutePath().getParent(); Files.createDirectories(parent);
         db = DriverManager.getConnection("jdbc:sqlite:" + path.toAbsolutePath());
+        try { migrate(); } catch (Exception e) { db.close(); throw e; }
+    }
+    private void migrate() throws Exception {
         try (var s = db.createStatement()) {
             s.execute("PRAGMA foreign_keys=ON"); s.execute("PRAGMA journal_mode=WAL"); s.execute("PRAGMA busy_timeout=3000");
             s.execute("PRAGMA secure_delete=ON");
             int version; try (var r = s.executeQuery("PRAGMA user_version")) { version = r.getInt(1); }
-            if (version > 5) throw new IllegalStateException("Database schema is newer than this application");
+            if (version > 6) throw new IllegalStateException("Database schema is newer than this application");
             s.execute("CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,status TEXT NOT NULL,created_ms INTEGER NOT NULL,next_sequence INTEGER NOT NULL DEFAULT 0,elapsed_ms INTEGER NOT NULL DEFAULT 0)");
             s.execute("CREATE TABLE IF NOT EXISTS profiles(session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,id TEXT NOT NULL,name TEXT NOT NULL,model TEXT NOT NULL,anchor TEXT NOT NULL,vector TEXT NOT NULL,PRIMARY KEY(session_id,id))");
             s.execute("CREATE TABLE IF NOT EXISTS segments(id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,sequence INTEGER NOT NULL,hash TEXT NOT NULL,speaker_id TEXT,body TEXT NOT NULL,embedding TEXT,eligible INTEGER NOT NULL,UNIQUE(session_id,sequence))");
@@ -71,6 +74,20 @@ final class Store implements AutoCloseable {
                     // Unknown old data is preserved but never silently authorized or auto-purged.
                     s.execute("INSERT INTO privacy_rooms(session_id,purpose_id,state,created_ms,last_interaction_ms,retention_deadline_ms,policy_version) SELECT id,'legacy_unknown','legacy_blocked',created_ms,created_ms,created_ms,'legacy_unknown' FROM sessions");
                     s.execute("PRAGMA user_version=5");
+                    db.commit();
+                } catch (Exception e) { db.rollback(); throw e; }
+                finally { db.setAutoCommit(true); }
+            }
+            if (version < 6) {
+                // Objectives, channel and reveals hang off the privacy room (it predates enrollment); purge deletes them explicitly.
+                db.setAutoCommit(false);
+                try {
+                    s.execute("CREATE TABLE objectives(id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL REFERENCES privacy_rooms(session_id), principal_id TEXT NOT NULL, version INTEGER NOT NULL, position TEXT NOT NULL, constraints TEXT NOT NULL, source TEXT NOT NULL CHECK(source IN ('typed','uploaded')), trigger TEXT NOT NULL, created_ms INTEGER NOT NULL, UNIQUE(session_id,principal_id,version))");
+                    s.execute("CREATE TABLE agent_channel(id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL REFERENCES privacy_rooms(session_id), sender_participant_id TEXT NOT NULL, tier TEXT NOT NULL CHECK(tier IN ('board','raw')), tag TEXT, text TEXT NOT NULL, redactions INTEGER NOT NULL DEFAULT 0, timestamp_ms INTEGER NOT NULL)");
+                    s.execute("CREATE INDEX agent_channel_session ON agent_channel(session_id,id)");
+                    s.execute("CREATE TABLE channel_reveals(session_id TEXT NOT NULL REFERENCES privacy_rooms(session_id), participant_id TEXT NOT NULL, revealed_ms INTEGER NOT NULL, PRIMARY KEY(session_id,participant_id))");
+                    s.execute("CREATE TABLE summaries(session_id TEXT PRIMARY KEY, text TEXT NOT NULL, model TEXT NOT NULL, board_rows INTEGER NOT NULL, transcript_rows INTEGER NOT NULL, created_ms INTEGER NOT NULL, retention_deadline_ms INTEGER NOT NULL)");
+                    s.execute("PRAGMA user_version=6");
                     db.commit();
                 } catch (Exception e) { db.rollback(); throw e; }
                 finally { db.setAutoCommit(true); }
@@ -198,6 +215,77 @@ final class Store implements AutoCloseable {
             return result;
         } catch (SQLException e) { throw new IllegalStateException(e); }
     }
+    /** Latest version per principal ordered by principal, or every version ordered by ID. */
+    ArrayNode objectives(String session, boolean history) {
+        String sql = history ? "SELECT * FROM objectives WHERE session_id=? ORDER BY id"
+            : "SELECT * FROM objectives o WHERE session_id=? AND version=(SELECT max(version) FROM objectives WHERE session_id=o.session_id AND principal_id=o.principal_id) ORDER BY principal_id";
+        try (var p = prepare(sql, session); var r = p.executeQuery()) {
+            var result = Json.arr();
+            while (r.next()) {
+                var row = Json.obj().put("principal_id", r.getString("principal_id")).put("version", r.getLong("version")).put("position", r.getString("position"));
+                row.set("constraints", Json.parse(r.getString("constraints")));
+                result.add(row.put("source", r.getString("source")).put("trigger", r.getString("trigger")).put("created_ms", r.getLong("created_ms")));
+            }
+            return result;
+        } catch (SQLException e) { throw new IllegalStateException(e); }
+    }
+    /** Inside a transaction: the next version for this principal is max+1, never an in-place edit. */
+    long insertObjective(String session, String principal, String position, String constraints, String source, String trigger, long now) throws SQLException {
+        execute("INSERT INTO objectives(session_id,principal_id,version,position,constraints,source,trigger,created_ms) SELECT ?,?,COALESCE(max(version),0)+1,?,?,?,?,? FROM objectives WHERE session_id=? AND principal_id=?",
+            session, principal, position, constraints, source, trigger, now, session, principal);
+        try (var p = prepare("SELECT version FROM objectives WHERE id=?", lastInsertId()); var r = p.executeQuery()) { r.next(); return r.getLong(1); }
+    }
+    /** Union of constraint values from every principal's latest objective; what the guard watches. */
+    List<String> constraintValues(String session) {
+        var values = new ArrayList<String>();
+        for (var objective : objectives(session, false)) for (var c : objective.path("constraints")) if (c.path("value").isTextual()) values.add(c.path("value").asText());
+        return values;
+    }
+    private static final String CHANNEL_SELECT = "SELECT c.id,c.sender_participant_id,p.name,c.tier,c.tag,c.text,c.redactions,c.timestamp_ms FROM agent_channel c LEFT JOIN participants p ON p.session_id=c.session_id AND p.id=c.sender_participant_id";
+    private static ObjectNode channelRow(ResultSet r) throws SQLException {
+        return Json.obj().put("row_id", r.getLong(1)).put("sender_participant_id", r.getString(2)).put("sender_name", r.getString(3)).put("tier", r.getString(4))
+            .put("tag", r.getString(5)).put("text", r.getString(6)).put("redactions", r.getInt(7)).put("timestamp_ms", r.getLong(8));
+    }
+    /** Rows after the cursor; a null tier means every tier. */
+    ArrayNode channel(String session, long after, int limit, String tier) {
+        try (var p = prepare(CHANNEL_SELECT + " WHERE c.session_id=? AND c.id>? AND (? IS NULL OR c.tier=?) ORDER BY c.id LIMIT ?", session, after, tier, tier, limit); var r = p.executeQuery()) {
+            var result = Json.arr(); while (r.next()) result.add(channelRow(r)); return result;
+        } catch (SQLException e) { throw new IllegalStateException(e); }
+    }
+    ObjectNode channelRow(String session, long id) throws SQLException {
+        try (var p = prepare(CHANNEL_SELECT + " WHERE c.session_id=? AND c.id=?", session, id); var r = p.executeQuery()) {
+            if (!r.next()) throw new IllegalStateException("Stored channel row missing");
+            return channelRow(r);
+        }
+    }
+    long insertChannel(String session, String sender, String tier, String tag, String text, int redactions, long now) throws SQLException {
+        execute("INSERT INTO agent_channel(session_id,sender_participant_id,tier,tag,text,redactions,timestamp_ms) VALUES(?,?,?,?,?,?,?)", session, sender, tier, tag, text, redactions, now);
+        return lastInsertId();
+    }
+    List<String> reveals(String session) {
+        var result = new ArrayList<String>();
+        try (var p = prepare("SELECT participant_id FROM channel_reveals WHERE session_id=? ORDER BY participant_id", session); var r = p.executeQuery()) { while (r.next()) result.add(r.getString(1)); }
+        catch (SQLException e) { throw new IllegalStateException(e); }
+        return result;
+    }
+    void reveal(String session, String participant, boolean revealed, long now) throws SQLException {
+        if (revealed) execute("INSERT INTO channel_reveals VALUES(?,?,?) ON CONFLICT(session_id,participant_id) DO UPDATE SET revealed_ms=excluded.revealed_ms", session, participant, now);
+        else execute("DELETE FROM channel_reveals WHERE session_id=? AND participant_id=?", session, participant);
+    }
+    void saveSummary(String session, String text, String model, long boardRows, long transcriptRows, long now, long deadline) throws SQLException {
+        execute("INSERT OR REPLACE INTO summaries VALUES(?,?,?,?,?,?,?)", session, text, model, boardRows, transcriptRows, now, deadline);
+    }
+    ObjectNode summary(String session) {
+        try (var p = prepare("SELECT * FROM summaries WHERE session_id=?", session); var r = p.executeQuery()) {
+            if (!r.next()) return null;
+            return Json.obj().put("session_id", session).put("text", r.getString("text")).put("model", r.getString("model")).put("board_rows", r.getLong("board_rows"))
+                .put("transcript_rows", r.getLong("transcript_rows")).put("created_ms", r.getLong("created_ms")).put("retention_deadline_ms", r.getLong("retention_deadline_ms"));
+        } catch (SQLException e) { throw new IllegalStateException(e); }
+    }
+    boolean deleteSummary(String session) throws SQLException {
+        try (var p = prepare("DELETE FROM summaries WHERE session_id=?", session)) { return p.executeUpdate() > 0; }
+    }
+    void deleteExpiredSummaries(long now) throws SQLException { execute("DELETE FROM summaries WHERE retention_deadline_ms<=?", now); }
     void rebuildProfiles(String session) throws SQLException {
         for (Profile p : profiles(session)) {
             double[] sum = new double[p.anchor.length]; int count = 0;

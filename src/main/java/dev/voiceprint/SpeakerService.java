@@ -334,10 +334,125 @@ final class SpeakerService {
     }
     static ObjectNode safeMcpArguments(JsonNode arguments) {
         var safe = Json.obj();
-        for (String key : List.of("session_id", "speaker_id", "segment_id", "actual_speaker")) if (arguments.has(key)) safe.put(key, "[redacted]");
+        for (String key : List.of("session_id", "speaker_id", "segment_id", "actual_speaker", "text")) if (arguments.has(key)) safe.put(key, "[redacted]");
         for (String key : List.of("limit", "after_id", "after_sequence")) if (arguments.path(key).isIntegralNumber()) safe.set(key, arguments.path(key));
         if (Set.of("high", "medium", "low").contains(arguments.path("min_label").asText())) safe.put("min_label", arguments.path("min_label").asText());
+        if (Set.of("board", "raw").contains(arguments.path("tier").asText())) safe.put("tier", arguments.path("tier").asText());
+        if (TAGS.contains(arguments.path("tag").asText())) safe.put("tag", arguments.path("tag").asText());
         return safe;
+    }
+    static final Set<String> TAGS = Set.of("OBJECTIVE_ACHIEVED", "REFOCUS_NEEDED");
+
+    // ---- V3: objectives, agent channel, reveal gate and summary (docs/API.md, V3 arbitration contract) ----
+
+    private String principal(String session, JsonNode request, String key) {
+        String id = Json.id(request, key);
+        if (!privacy.roster(session).contains(id)) throw new ApiException(404, "participant_not_found", "Participant is not a human in this room's released roster.");
+        return id;
+    }
+    /** Every POST is a new version; constraint values are what the redaction guard watches. */
+    synchronized ObjectNode createObjective(String session, JsonNode request) {
+        privacy.require(session, "local_processing"); privacy.require(session, "negotiation_text");
+        String principal = principal(session, request, "principal_id");
+        String position = Json.text(request, "position", 2000), trigger = Json.text(request, "trigger", 200);
+        String source = Json.text(request, "source", 20);
+        if (!Set.of("typed", "uploaded").contains(source)) throw new ApiException(400, "invalid_input", "source must be typed or uploaded.");
+        JsonNode given = request.path("constraints");
+        if (!given.isArray() || given.size() > 20) throw new ApiException(400, "invalid_input", "constraints must be an array of at most 20 items.");
+        var constraints = Json.arr();
+        for (JsonNode c : given) constraints.add(Json.obj().put("label", Json.text(c, "label", 80)).put("value", Json.text(c, "value", 200)));
+        return store.transaction(() -> {
+            long now = clock.millis();
+            long version = store.insertObjective(session, principal, position, constraints.toString(), source, trigger, now);
+            return Json.obj().put("session_id", session).put("principal_id", principal).put("version", version).put("created_ms", now);
+        });
+    }
+    synchronized ObjectNode objectives(String session, boolean history) {
+        privacy.require(session, "local_processing"); privacy.require(session, "negotiation_text");
+        return Json.obj().put("session_id", session).set("objectives", store.objectives(session, history));
+    }
+    /** The guard runs on the write path against every latest objective's values; the row is stored already redacted. */
+    synchronized ObjectNode postChannel(String session, JsonNode request) {
+        privacy.require(session, "local_processing");
+        if (!store.session(session).status().equals("active")) throw new ApiException(409, "session_ended", "This session has ended.");
+        String sender = Json.id(request, "sender_participant_id");
+        if (!store.participant(session, sender).path("kind").asText().equals("agent")) throw new ApiException(400, "invalid_participant", "Only registered agents post to the agent channel.");
+        String tier = Json.text(request, "tier", 10);
+        if (!Set.of("board", "raw").contains(tier)) throw new ApiException(400, "invalid_input", "tier must be board or raw.");
+        String tag = null;
+        if (request.has("tag") && !request.get("tag").isNull()) {
+            tag = Json.text(request, "tag", 40);
+            if (!TAGS.contains(tag)) throw new ApiException(400, "invalid_input", "tag must be OBJECTIVE_ACHIEVED or REFOCUS_NEEDED.");
+        }
+        var guarded = Redaction.redact(Json.text(request, "text", 4000), store.constraintValues(session));
+        String stored = tag;
+        ObjectNode result = store.transaction(() -> {
+            long now = clock.millis();
+            long id = store.insertChannel(session, sender, tier, stored, guarded.text(), guarded.hits(), now);
+            if (tier.equals("board")) store.event(session, now, "agent_channel", store.channelRow(session, id));
+            return Json.obj().put("session_id", session).put("row_id", id).put("tier", tier).put("redactions", guarded.hits()).put("text", guarded.text());
+        });
+        notifyAll();
+        return result;
+    }
+    private boolean revealed(String session) {
+        var reveals = store.reveals(session);
+        var roster = privacy.roster(session);
+        return !roster.isEmpty() && reveals.containsAll(roster);
+    }
+    /** Reveal gate: the hosted MCP path sees every tier; anyone else sees raw rows only once every human has revealed. */
+    synchronized ObjectNode channel(String session, long after, int limit, String tier, boolean hosted) {
+        privacy.require(session, "local_processing");
+        store.session(session); validatePage(after, limit);
+        if (tier == null || tier.equals("all")) tier = null;
+        else if (!Set.of("board", "raw").contains(tier)) throw new ApiException(400, "invalid_query", "tier must be board, raw or all.");
+        boolean revealed = revealed(session);
+        ArrayNode fetched = store.channel(session, after, limit, tier);
+        long next = fetched.isEmpty() ? after : fetched.get(fetched.size() - 1).path("row_id").asLong();
+        var rows = Json.arr(); var text = new StringBuilder();
+        for (var row : fetched) {
+            if (!hosted && !revealed && row.path("tier").asText().equals("raw")) continue;
+            rows.add(row);
+            var time = java.time.LocalTime.ofInstant(java.time.Instant.ofEpochMilli(row.path("timestamp_ms").asLong()), java.time.ZoneId.systemDefault());
+            String who = row.path("sender_name").isNull() ? row.path("sender_participant_id").asText() : row.path("sender_name").asText();
+            text.append('#').append(row.path("row_id").asLong()).append(' ').append(String.format("%02d:%02d:%02d", time.getHour(), time.getMinute(), time.getSecond()))
+                .append(' ').append(who).append(" [").append(row.path("tier").asText()).append(']');
+            if (!row.path("tag").isNull()) text.append('(').append(row.path("tag").asText()).append(')');
+            text.append(": ").append(row.path("text").asText()).append('\n');
+        }
+        return Json.obj().put("session_id", session).put("next_after_id", next).put("revealed", revealed).put("text", text.toString()).set("rows", rows);
+    }
+    synchronized ObjectNode reveal(String session, JsonNode request) {
+        privacy.require(session, "local_processing");
+        String participant = principal(session, request, "participant_id");
+        if (!request.path("revealed").isBoolean()) throw new ApiException(400, "invalid_input", "revealed must be true or false.");
+        boolean revealed = request.path("revealed").asBoolean();
+        store.transaction(() -> { store.reveal(session, participant, revealed, clock.millis()); return null; });
+        var by = Json.arr(); for (String id : store.reveals(session)) by.add(id);
+        return Json.obj().put("session_id", session).put("revealed", revealed(session)).set("revealed_by", by);
+    }
+    /** Written by the runtime before POST .../end; retained on its own 30-day deadline after the room is destroyed. */
+    synchronized ObjectNode saveSummary(String session, JsonNode request) {
+        privacy.require(session, "local_processing"); privacy.require(session, "negotiation_text");
+        if (!store.session(session).status().equals("active")) throw new ApiException(409, "session_ended", "This session has ended.");
+        String text = Json.text(request, "text", 20000), model = Json.text(request, "model", 200);
+        long board = Json.integer(request, "board_rows", 0, Integer.MAX_VALUE), transcript = Json.integer(request, "transcript_rows", 0, Integer.MAX_VALUE);
+        return store.transaction(() -> {
+            long now = clock.millis(), deadline = now + PrivacyPolicy.SUMMARY_RETENTION_MS;
+            store.saveSummary(session, text, model, board, transcript, now, deadline);
+            return Json.obj().put("session_id", session).put("created_ms", now).put("retention_deadline_ms", deadline);
+        });
+    }
+    /** Operator read after the room is gone: no room admission, because destruction has already removed the room's authority. */
+    synchronized ObjectNode summary(String session) {
+        var row = store.summary(session);
+        if (row == null) throw new ApiException(404, "summary_not_found", "No summary is retained for this session.");
+        return row;
+    }
+    synchronized ObjectNode deleteSummary(String session) {
+        boolean deleted = store.transaction(() -> store.deleteSummary(session));
+        if (!deleted) throw new ApiException(404, "summary_not_found", "No summary is retained for this session.");
+        return Json.obj().put("session_id", session).put("deleted", true);
     }
     synchronized ObjectNode corrections(String session, long after, int limit) {
         privacy.require(session, "local_processing");
