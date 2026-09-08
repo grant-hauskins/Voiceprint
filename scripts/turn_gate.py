@@ -9,6 +9,7 @@ decide(...) returns one of:
   "clarify"  - the agent was addressed but the last attribution is unreliable; ask who spoke rather than answer
   "wait"     - not the agent's turn
 """
+import difflib
 import re
 import time
 from dataclasses import dataclass, field
@@ -17,6 +18,8 @@ SILENCE_AFTER_TURN_S = {"quiet": 2.0, "balanced": 1.2, "eager": 0.7}
 AGENT_COOLDOWN_S = {"quiet": 12.0, "balanced": 6.0, "eager": 3.0}
 OVERLAP_HOLD_S = 3.0             # stay quiet this long after any overlap row
 ADDRESS_WINDOW_S = 8.0           # a direct address stays "live" this long
+RELIABLE_LABELS = ("high", "reviewed")             # "reviewed": the operator confirmed the speaker (docs/API.md "Transcript review")
+USABLE_LABELS = ("high", "medium", "reviewed")
 
 
 @dataclass
@@ -44,16 +47,62 @@ class GateState:
         self.agent_last_spoke_at = time.monotonic() if now is None else now
 
 
-def addressed(text, agent_names):
-    """True when the utterance names the agent (start of sentence, or a direct 'Name,' / 'Name?' form)."""
-    if not text:
+FUZZY_MIN_CHARS = 4              # both normalized forms must be at least this long before a near-match counts
+FUZZY_RATIO = 0.85               # difflib ratio at or above this is a near-match (0.8 let "great" address Grant)
+WORD_RE = re.compile(r"[^\W\d_]+")   # letter runs only: "Ryan's" -> "Ryan", "s"
+
+
+def normalize_name(word):
+    """Light phonetic normalization (docs/API.md "Fuzzy addressing"): casefold, y->i, ph->f, ck->k, doubled letters collapsed."""
+    lowered = (word or "").casefold().replace("ph", "f").replace("ck", "k").replace("y", "i")
+    out = []
+    for ch in lowered:
+        if not out or out[-1] != ch:
+            out.append(ch)
+    return "".join(out)
+
+
+def similar_name(token, name):
+    """True for an exact match after casefold, or when both normalized forms are at least FUZZY_MIN_CHARS long and
+    difflib rates them at or above FUZZY_RATIO. The length gate applies before the normalization is compared, so
+    "been" (-> "ben", three letters) never addresses Ben, while "Brian" (-> "brian" vs "rian", 0.89) addresses Ryan.
+    "Adrian" vs "Ryan", "great" vs "Grant" and "mediate" vs "Mediator" all rate 0.80 and stay below the threshold."""
+    if not token or not name:
         return False
+    if token.casefold() == name.casefold():
+        return True
+    a, b = normalize_name(token), normalize_name(name)
+    if len(a) < FUZZY_MIN_CHARS or len(b) < FUZZY_MIN_CHARS:
+        return False
+    return a == b or difflib.SequenceMatcher(None, a, b).ratio() >= FUZZY_RATIO
+
+
+def _exact_pattern(name):
+    return rf"(^|[\s,.;!?\"'])(hey |ok |okay )?{re.escape(name.lower())}([\s,.;!?\"']|$)"
+
+
+def addressed_as(text, agent_names):
+    """(agent name, the transcript's token that matched) for the first agent the utterance names, exact spelling first,
+    then a near-match under similar_name(); None when nobody is addressed."""
+    if not text:
+        return None
     lowered = text.lower()
+    tokens = WORD_RE.findall(text)
     for name in agent_names:
-        n = name.lower()
-        if re.search(rf"(^|[\s,.;!?\"'])(hey |ok |okay )?{re.escape(n)}([\s,.;!?\"']|$)", lowered):
-            return True
-    return False
+        if re.search(_exact_pattern(name), lowered):
+            token = next((t for t in tokens if t.casefold() == name.casefold()), name)
+            return name, token
+    for token in tokens:
+        for name in agent_names:
+            if similar_name(token, name):
+                return name, token
+    return None
+
+
+def addressed(text, agent_names):
+    """True when the utterance names the agent (start of sentence, or a direct 'Name,' / 'Name?' form), or when any
+    word of it is a near-match for the agent's name (the transcript is machine-generated and may write Ryan as Brian)."""
+    return addressed_as(text, agent_names) is not None
 
 
 def question_like(text):
@@ -115,8 +164,8 @@ def decide(state, now, current_status, last_utterance_end_at):
     # Soft opportunity: a clean, question-like turn followed by silence.
     if state.raise_hand or state.eagerness == "quiet":
         return "wait"                        # raise-hand advocates need an address or a verified override
-    if last.get("label") == "high" and question_like(last.get("text")) and silence >= SILENCE_AFTER_TURN_S[state.eagerness]:
+    if last.get("label") in RELIABLE_LABELS and question_like(last.get("text")) and silence >= SILENCE_AFTER_TURN_S[state.eagerness]:
         return "speak"
-    if state.eagerness == "eager" and silence >= SILENCE_AFTER_TURN_S["eager"] * 2 and last.get("label") in ("high", "medium"):
+    if state.eagerness == "eager" and silence >= SILENCE_AFTER_TURN_S["eager"] * 2 and last.get("label") in USABLE_LABELS:
         return "speak"
     return "wait"

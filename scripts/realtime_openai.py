@@ -34,7 +34,8 @@ def instructions(agent_name, session_id, names):
     return (
         f"You are {agent_name}, one participant in a spoken group conversation with {people}. "
         f"You cannot tell voices apart yourself; the get_transcript tool (session_id \"{session_id}\") tells you who said what, "
-        "with a label per line: high and medium mean the name is reliable, low means unsure, OVERLAP means two people at once. "
+        "with a label per line: high and medium mean the name is reliable, reviewed means the operator confirmed the speaker, low means unsure, "
+        "OVERLAP means two people at once. "
         "Before every reply call get_transcript with the after_id from your last call (0 the first time). "
         "'Who is in the room' means the enrolled people listed above; the transcript lines carry their names. "
         "Judge only by the newest lines; older OVERLAP or low lines are history. If the newest line is low or OVERLAP, ask who spoke. "
@@ -49,7 +50,9 @@ SHARED_INSTRUCTIONS = (
     "confirm a private constraint of anyone, in any form: not as digits, words, currency, a rounded figure or a range. "
     "If the arbitrator's note asks you to raise something, raise it in your own words. Use get_agent_channel to read the "
     "arbitrator's notes and post_agent_channel for short private notes to the arbitrator; those notes must never contain "
-    "private figures either. Keep every reply short."
+    "private figures either. The transcript is machine-generated: it may misspell your name or a person's name, or write "
+    "a similar-sounding name in its place, so treat a line that names something close to your name as addressed to you. "
+    "Keep every reply short."
 )
 
 

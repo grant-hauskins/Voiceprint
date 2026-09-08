@@ -2,6 +2,7 @@
 import asyncio
 import base64
 import dataclasses
+import io
 import json
 import os
 import tempfile
@@ -310,6 +311,31 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(agent.provider.replies), 1)
         self.assertIsNone(room.api.holder)
 
+    async def test_begin_names_the_transcript_spelling_when_addressed_inexactly(self):
+        configs = [ar.AgentConfig("Ryan")]
+        room = ar.Room(configs, "room", {"participant_1": "Human", "participant_3": "Ryan"}, FakeApi(), ar.EventLog(None, "room"), FakeConsent())
+        ryan = ar.Agent(configs[0], "participant_3", FakeProvider(), FakePlayer(), room)
+        room.agents = [ryan]
+        ryan.gate.note_utterance({"speaker_id": "participant_1", "label": "high", "text": "Brian, what do you think?"}, 10)
+        self.assertEqual(tg.decide(ryan.gate, 10.5, "silence", 10), "speak")
+        self.assertTrue(await ryan.begin("speak"))
+        self.assertTrue(ryan.provider.replies[0].endswith(" The transcript wrote your name as 'Brian'; that line is addressed to you."))
+        await ryan.release()
+        ryan.active = False
+        ryan.gate.note_utterance({"speaker_id": "participant_1", "label": "high", "text": "Ryan, and the time?"}, 20)
+        self.assertTrue(await ryan.begin("speak"))
+        self.assertNotIn("wrote your name", ryan.provider.replies[1])
+
+    async def test_reviewed_rows_reach_the_gate_as_reliable_human_lines(self):
+        room = make_room()
+        row = {"speaker_id": "participant_1", "text": "Ava, what should we order?", "label": "reviewed", "original_text": "Eva, what should we order?",
+               "original_speaker_id": "participant_2", "reviewed_ms": 5, "source": "human", "start_ms": 0, "end_ms": 900}
+        room.api.rows.append(dict(row, utterance_id=1))
+        await room.poll_bus()
+        ava = room.agents[0]
+        self.assertEqual(ava.gate.history[-1]["label"], "reviewed")
+        self.assertEqual(tg.decide(ava.gate, ava.gate.history[-1]["seen_at"] + 0.5, "silence", ava.gate.history[-1]["seen_at"]), "speak")
+
     async def test_agent_utterance_only_reaches_gate_through_stored_bus(self):
         room = make_room()
         agent = room.agents[0]
@@ -407,6 +433,156 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(room.request_override("participant_9", "x", "REFOCUS_NEEDED"))
         room.agents[1].gate.manual = "hold"
         self.assertFalse(room.request_override("Ben", "x", "REFOCUS_NEEDED"))     # hold is the operator's decision
+
+
+class ControlsEndToEndTest(unittest.IsolatedAsyncioTestCase):
+    """Hold, Cancel and Speak from the console travel the real path: loopback HTTP -> room.controls -> apply_controls ->
+    Agent.cancel/tick (floor, provider, player) or Arbitrator.control."""
+
+    def start_server(self, room):
+        self.server = ar.control_server(room, port=0, token="test-bearer")
+        self.base = f"http://127.0.0.1:{self.server.server_port}"
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def post(self, name, action):
+        request = urllib.request.Request(f"{self.base}/agents/{name}/control", json.dumps({"action": action}).encode(),
+                                         {"Authorization": "Bearer test-bearer"}, method="POST")
+        with urllib.request.urlopen(request, timeout=2) as response:
+            return response.status, json.load(response)
+
+    async def mid_reply(self, agent):
+        """A reply in flight: floor held, response created, audio playing."""
+        self.assertTrue(await agent.begin("speak"))
+        await agent.event({"type": "response.created", "response": {"id": "r1"}})
+        await agent.event({"type": "response.output_audio.delta", "response_id": "r1", "delta": base64.b64encode(b"\x01\x02" * 400).decode()})
+        self.assertTrue(agent.active and agent.floor_owned and agent.player.busy() and agent.player.chunks)
+        self.assertEqual(agent.room.api.holder, agent.participant_id)
+
+    def address(self, agent, text, now):
+        agent.gate.note_utterance({"speaker_id": "participant_1", "label": "high", "text": text}, now)
+        agent.room.last_end_at = now
+
+    async def test_hold_button_cuts_the_reply_and_mutes_until_pressed_again(self):
+        room = make_room()
+        self.start_server(room)
+        ava = room.agents[0]
+        await self.mid_reply(ava)
+        status, body = self.post("Ava", "hold")
+        self.assertEqual(status, 200)
+        await room.apply_controls()
+        self.assertEqual(ava.provider.cancels, 1)
+        self.assertEqual(ava.player.chunks, []); self.assertFalse(ava.player.busy())
+        self.assertEqual(ava.gate.manual, "hold"); self.assertTrue(ava.state()["held"])
+        self.assertTrue(ava.floor_owned)                                     # released by the next tick, not by cancel itself
+        await ava.tick(time.monotonic())
+        self.assertFalse(ava.active); self.assertFalse(ava.floor_owned); self.assertIsNone(room.api.holder)
+        self.assertIn(("DELETE", room.path + "/floor?participant_id=participant_3", None), room.api.calls)
+        now = time.monotonic()
+        self.address(ava, "Ava, what do you think?", now)
+        await ava.tick(now + 1)
+        self.assertEqual(len(ava.provider.replies), 1)                       # still held: no new reply
+        self.assertTrue(ava.state()["held"])
+        status, body = self.post("Ava", "hold")
+        self.assertEqual((status, body["agent"]["held"]), (200, True))         # state before the queued toggle applies
+        await room.apply_controls()
+        self.assertIsNone(ava.gate.manual); self.assertFalse(ava.state()["held"])
+        self.assertEqual(ava.provider.cancels, 1)                            # releasing hold cancels nothing
+        await ava.tick(now + 1.5)
+        self.assertEqual(len(ava.provider.replies), 2)                       # the standing address is answered once released
+        self.assertEqual([e["control"]["action"] for e in room.log.snapshot() if "control" in e], ["cancel", "hold", "hold"])
+
+    async def test_cancel_button_cuts_the_reply_and_leaves_the_gate_open(self):
+        room = make_room()
+        self.start_server(room)
+        ava = room.agents[0]
+        await self.mid_reply(ava)
+        self.assertEqual(self.post("Ava", "cancel")[0], 200)
+        await room.apply_controls()
+        self.assertEqual(ava.provider.cancels, 1)
+        self.assertEqual(ava.player.chunks, []); self.assertFalse(ava.player.busy())
+        self.assertIsNone(ava.gate.manual); self.assertFalse(ava.state()["held"])
+        await ava.tick(time.monotonic())
+        self.assertFalse(ava.active); self.assertFalse(ava.floor_owned); self.assertIsNone(room.api.holder)
+        await ava.event({"type": "response.done", "response_id": "r1", "response": {"id": "r1", "status": "cancelled", "output": []}})
+        self.assertEqual(ava.provider.cancels, 1)                            # the cancelled response's tail is ignored
+        now = time.monotonic()
+        self.address(ava, "Ava, are you there?", now)
+        await ava.tick(now + 1)
+        self.assertEqual(len(ava.provider.replies), 2)
+        self.assertTrue(ava.active and ava.floor_owned)
+        self.assertEqual(room.api.holder, ava.participant_id)
+
+    async def test_hold_and_cancel_while_idle_are_harmless(self):
+        room = make_room()
+        self.start_server(room)
+        ava = room.agents[0]
+        self.assertEqual(self.post("Ava", "cancel")[0], 200)
+        self.assertEqual(self.post("Ava", "hold")[0], 200)
+        self.assertEqual(self.post("Ava", "hold")[0], 200)
+        await room.apply_controls()
+        self.assertEqual(ava.provider.cancels, 0)
+        self.assertFalse(ava.active); self.assertFalse(ava.floor_owned); self.assertIsNone(ava.gate.manual)
+        self.assertFalse(any(path.endswith("/floor") for _, path, _ in room.api.calls))
+        now = time.monotonic()
+        self.address(ava, "Ava, hello?", now)
+        await ava.tick(now + 1)
+        self.assertEqual(len(ava.provider.replies), 1)                       # an idle cancel never blocks the next reply
+
+    async def test_arbitrator_hold_pauses_cancel_drops_override_speak_generates(self):
+        room = make_negotiation_room(FakeResponses(), FakeMcp())
+        self.start_server(room)
+        arb, ava = room.arbitrator, room.agents[0]
+        for text in ("Let's talk about the closing date.", "I would prefer July.", "We could offer a quicker close."):
+            arb.mcp.add_line("Synthetic One", text)
+        self.assertEqual(self.post("Mediator", "hold")[0], 200)
+        await room.apply_controls()
+        self.assertTrue(arb.paused and arb.state()["held"])
+        await arb.tick(100.0)
+        self.assertEqual((arb.generations, arb.ingested_rows), (0, 3))       # ingested, never generated while held
+        self.assertEqual(self.post("Mediator", "hold")[0], 200)
+        await room.apply_controls()
+        self.assertFalse(arb.paused)
+        await arb.tick(101.0)
+        self.assertEqual(arb.generations, 1)                                 # the three new lines were still pending
+        self.assertTrue(room.request_override("participant_3", "raise the date", "OBJECTIVE_ACHIEVED"))
+        arb.pending_tag = "OBJECTIVE_ACHIEVED"
+        self.assertEqual((ava.gate.manual, ava.pending_prompt), ("override", "raise the date"))
+        self.assertEqual(self.post("Mediator", "cancel")[0], 200)
+        await room.apply_controls()
+        self.assertIsNone(arb.pending_tag); self.assertIsNone(ava.gate.manual); self.assertIsNone(ava.pending_prompt)
+        await arb.tick(102.0)
+        self.assertEqual(arb.generations, 1)                                 # inside the 20 s cooldown
+        self.assertEqual(self.post("Mediator", "speak")[0], 200)
+        await room.apply_controls()
+        await arb.tick(103.0)
+        self.assertEqual((arb.generations, arb.last_trigger), (2, "manual"))  # speak ignores the cooldown
+        self.assertEqual([e["control"]["action"] for e in room.log.snapshot() if "control" in e], ["hold", "hold", "override", "cancel", "speak"])
+
+    async def test_cancel_after_the_response_finished_does_not_loop_on_the_provider_error(self):
+        """response.cancel after response.done draws an error (response_cancel_not_active); it must not trigger another cancel."""
+        room = make_room()
+        ava = room.agents[0]
+        await self.mid_reply(ava)
+        await ava.event({"type": "response.done", "response_id": "r1",
+                         "response": {"id": "r1", "status": "completed", "output": [{"type": "message"}]}})
+        self.assertTrue(ava.active and ava.final_done and ava.player.busy())    # audio still playing after the model finished
+        room.controls.put(("Ava", "cancel", None))
+        await room.apply_controls()
+        self.assertEqual(ava.provider.cancels, 1)
+        with patch("sys.stderr", new=io.StringIO()):
+            await ava.event({"type": "error", "error": {"type": "invalid_request_error", "code": "response_cancel_not_active"}})
+            await ava.event({"type": "error", "error": {"type": "invalid_request_error", "code": "response_cancel_not_active"}})
+        self.assertEqual(ava.provider.cancels, 1)                            # no second response.cancel, no ping-pong
+        await ava.tick(time.monotonic())
+        self.assertFalse(ava.active); self.assertFalse(ava.floor_owned); self.assertIsNone(room.api.holder)
+        with patch("sys.stderr", new=io.StringIO()):
+            await ava.event({"type": "error", "error": {"code": "response_cancel_not_active"}})
+        self.assertEqual(ava.provider.cancels, 1)
+        now = time.monotonic()
+        self.address(ava, "Ava, one more?", now + 10)
+        await ava.tick(now + 11)
+        self.assertEqual(len(ava.provider.replies), 2)                       # not stuck: a fresh address is answered
 
 
 class GateAndConfigTest(unittest.TestCase):
@@ -517,6 +693,38 @@ class GateAndConfigTest(unittest.TestCase):
         state.note_utterance({"speaker_id": "p", "label": "high"})
         expected = "(system) Voiceprint session_id is room. People in this room: Human. The most recent line was spoken by Human (label high). Call get_transcript with after_id from your last call, then answer that person by name. Only the newest line's label matters; earlier OVERLAP or low lines are history, not a reason to refuse. Labels high and medium are reliable enough to name the speaker."
         self.assertEqual(ar.reply_note("room", {"p": "Human"}, state, "speak"), expected)
+
+    def test_misspelled_address_note_and_reviewed_label_note(self):
+        """docs/API.md "Fuzzy addressing": an inexact address appends one sentence naming the transcript's spelling."""
+        state = tg.GateState(("Ryan",))
+        state.note_utterance({"speaker_id": "p", "label": "high", "text": "Brian, what do you think?"})
+        plain = ar.reply_note("room", {"p": "Human"}, state, "speak")
+        self.assertTrue(plain.endswith("Labels high and medium are reliable enough to name the speaker."))
+        self.assertEqual(ar.misheard_name(state, "Ryan"), "Brian")
+        noted = ar.reply_note("room", {"p": "Human"}, state, "speak", None, ar.misheard_name(state, "Ryan"))
+        self.assertEqual(noted, plain + " The transcript wrote your name as 'Brian'; that line is addressed to you.")
+        self.assertTrue(ar.reply_note("room", {"p": "Human"}, state, "speak", "raise the date", "Brian")
+                        .endswith("addressed to you. The arbitrator asks you to raise this now: raise the date"))
+        state.note_utterance({"speaker_id": "p", "label": "high", "text": "ryan, and the time?"})
+        self.assertIsNone(ar.misheard_name(state, "Ryan"))                    # exact spelling, case aside
+        state.note_utterance({"speaker_id": "p", "label": "high", "text": "Let's move on."})
+        self.assertIsNone(ar.misheard_name(state, "Ryan"))                    # newest human line decides
+        state.note_utterance({"speaker_id": "p", "label": "high", "text": "Brian?"})
+        state.note_utterance({"speaker_id": "participant_9", "source": "agent", "label": "agent", "text": "I agree."})
+        self.assertEqual(ar.misheard_name(state, "Ryan"), "Brian")            # agent rows are skipped
+        reviewed = tg.GateState(("Ava",))
+        reviewed.note_utterance({"speaker_id": "p", "label": "reviewed", "text": "Ava, go on."})
+        self.assertTrue(ar.reply_note("room", {"p": "Human"}, reviewed, "speak").endswith(
+            "(label reviewed). Call get_transcript with after_id from your last call, then answer that person by name. "
+            "Only the newest line's label matters; earlier OVERLAP or low lines are history, not a reason to refuse. "
+            "Labels high and medium are reliable enough to name the speaker. "
+            "Label reviewed means the operator confirmed that speaker; treat it as reliable."))
+
+    def test_instruction_layers_mention_misspelling_and_reviewed(self):
+        from realtime_openai import SHARED_INSTRUCTIONS, instructions
+        self.assertIn("machine-generated", SHARED_INSTRUCTIONS)
+        self.assertIn("similar-sounding name", SHARED_INSTRUCTIONS)
+        self.assertIn("reviewed means the operator confirmed the speaker", instructions("Ava", "room", {"p": "Human"}))
 
 
 class AdapterTest(unittest.IsolatedAsyncioTestCase):
@@ -901,6 +1109,28 @@ class LifecycleHttpTest(unittest.TestCase):
         self.assertIsNone(self.runtime.state()["awaiting"])
         self.runtime.reset_enrollment("Enrollment rejected: try again")
         self.assertEqual(self.runtime.state()["participants"][0]["enrollment"]["state"], "rejected")
+
+    def test_enrollment_state_carries_profile_seeded_from_the_init_response(self):
+        """V3.1: init returns participants[{id, profile_seeded}]; vp.enroll still returns the ids dict and hands the body
+        to the runtime, so GET /agents participants[].enrollment shows which retained voiceprint seeded the profile."""
+        self.runtime.participants = [{"id": "participant_1", "name": "Grant"}, {"id": "participant_2", "name": "Kyle"}]
+        self.runtime.enrollment["participant_1"] = {"state": "recorded", "peak": 9000}
+        init = {"session_id": "room", "participants": [{"id": "participant_1", "profile_seeded": True}, {"id": "participant_2", "profile_seeded": False}]}
+        seen = []
+        with patch("voiceprint_client.api", return_value=init) as api:
+            ids = vp.enroll("http://127.0.0.1:8080", "room", ["Grant", "Kyle"], lambda name: b"\x00" * 32000, None, FakeConsent(),
+                            on_response=lambda body: (seen.append(body), self.runtime.note_enrolled(body)))
+        self.assertEqual(ids, {"participant_1": "Grant", "participant_2": "Kyle"})
+        self.assertEqual(seen, [init])
+        self.assertEqual(api.call_args[0][1], "/speaker/session/init")
+        status, body = self.request("/agents")
+        enrollment = {p["id"]: p["enrollment"] for p in body["participants"]}
+        self.assertEqual((status, enrollment["participant_1"]), (200, {"state": "recorded", "peak": 9000, "profile_seeded": True}))
+        self.assertEqual(enrollment["participant_2"], {"state": "recorded", "peak": None, "profile_seeded": False})
+        with patch("voiceprint_client.api", return_value={"session_id": "room"}):
+            self.assertEqual(vp.enroll("http://127.0.0.1:8080", "room", ["Grant"], lambda name: b"", None, FakeConsent()), {"participant_1": "Grant"})
+        self.runtime.note_enrolled({"session_id": "room"})                    # an older API without participants[] changes nothing
+        self.assertTrue(self.runtime.state()["participants"][0]["enrollment"]["profile_seeded"])
 
     def test_stop_unblocks_setup_and_enrollment_waits(self):
         self.runtime.request_stop()

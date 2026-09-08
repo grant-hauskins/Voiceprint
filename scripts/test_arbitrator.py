@@ -176,6 +176,7 @@ class ArbitratorTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(parse_line("#7 12:01:05 Mediator [board] (OBJECTIVE_ACHIEVED): done"), ("Mediator", "board", "OBJECTIVE_ACHIEVED", "done"))
         self.assertEqual(parse_line("#3 0:01.0-0:02.0 OVERLAP Alice+Bob [overlap 100%]: hi"), ("OVERLAP Alice+Bob", "overlap 100%", None, "hi"))
         self.assertIsNone(parse_line("(no utterances yet)"))
+        self.assertEqual(parse_line("#5 0:05.0-0:06.0 Synthetic Two [reviewed]: corrected words"), ("Synthetic Two", "reviewed", None, "corrected words"))
 
 
 class SummarySequencingTest(unittest.IsolatedAsyncioTestCase):
@@ -225,6 +226,64 @@ class SummarySequencingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(room.arbitrator.responses.calls, [])
         self.assertEqual([row["summary"] for row in room.log.snapshot() if "summary" in row], [{"action": "skipped", "reason": "scope_missing"}])
         self.assertTrue(room.api.ended)
+
+    async def test_summary_file_default_path_override_and_disable(self):
+        """docs/API.md "Runtime and console" answer 2: data/summaries/<session_id>.md by default, --summary-file overrides,
+        --no-summary-file disables; the saved event carries no path."""
+        with tempfile.TemporaryDirectory() as tmp:
+            summaries = Path(tmp) / "data" / "summaries"
+            with patch("agent_runtime.SUMMARY_DIR", summaries):
+                room = make_negotiation_room(FakeResponses([self.RESULT]))
+                await ar.end_room(room, room.log, room.consent, True, room.arbitrator.responses)
+                self.assertEqual(sorted(p.name for p in summaries.iterdir()), ["room.md"])
+                self.assertEqual((summaries / "room.md").read_text(encoding="utf-8"), room.api.summaries[0]["text"])
+                self.assertEqual([row["summary"] for row in room.log.snapshot() if "summary" in row],
+                                 [{"action": "saved", "attempts": 1, "board_rows": 0, "transcript_rows": 0}])
+                self.assertEqual(ar.default_summary_path("../x/y room"), summaries / "_x_y_room.md")   # never leaves the directory
+                room = make_negotiation_room(FakeResponses([self.RESULT]))
+                await ar.end_room(room, room.log, room.consent, True, room.arbitrator.responses, None)
+                self.assertEqual(sorted(p.name for p in summaries.iterdir()), ["room.md"])
+                self.assertEqual(len(room.api.summaries), 1)
+                self.assertTrue(room.api.ended)
+                override = Path(tmp) / "elsewhere" / "closing.md"
+                room = make_negotiation_room(FakeResponses([self.RESULT]))
+                await ar.end_room(room, room.log, room.consent, True, room.arbitrator.responses, override)
+                self.assertEqual(override.read_text(encoding="utf-8"), room.api.summaries[0]["text"])
+                self.assertEqual(sorted(p.name for p in summaries.iterdir()), ["room.md"])
+        args = ar.parser().parse_args(["--mcp-url", "https://x/mcp"])
+        self.assertIs(ar.summary_file_from_args(args), ar.DEFAULT_SUMMARY_FILE)
+        self.assertIsNone(ar.summary_file_from_args(ar.parser().parse_args(["--mcp-url", "https://x/mcp", "--no-summary-file"])))
+        self.assertEqual(ar.summary_file_from_args(ar.parser().parse_args(["--mcp-url", "https://x/mcp", "--summary-file", "out.md"])), Path("out.md"))
+        self.assertTrue(str(ar.SUMMARY_DIR).replace("\\", "/").endswith("/data/summaries"))
+
+    async def test_summary_file_written_only_after_the_record_is_confirmed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            summaries = Path(tmp) / "summaries"
+            with patch("agent_runtime.SUMMARY_DIR", summaries):
+                room = make_negotiation_room(FakeResponses([self.RESULT]))
+                room.api.summary_failures = 3
+                with patch("agent_runtime.asyncio.sleep") as sleep:
+                    sleep.return_value = None
+                    with patch("sys.stderr", new=io.StringIO()):
+                        await ar.end_room(room, room.log, room.consent, True, room.arbitrator.responses)
+                self.assertFalse(summaries.exists())
+                self.assertTrue(room.api.ended)
+                room = make_negotiation_room(FakeResponses([self.RESULT]))
+                room.api.summary_failures = 1
+                with patch("agent_runtime.asyncio.sleep") as sleep:
+                    sleep.return_value = None
+                    await ar.end_room(room, room.log, room.consent, True, room.arbitrator.responses)
+                self.assertEqual(self.order(room.api).count("summary"), 2)
+                self.assertTrue((summaries / "room.md").exists())              # second attempt succeeded, then the file
+
+    async def test_summary_transcript_renders_reviewed_rows_with_reviewed_values(self):
+        room = make_negotiation_room(FakeResponses([self.RESULT]))
+        room.api.rows.append({"utterance_id": 1, "speaker_id": "participant_2", "text": "corrected words", "label": "reviewed",
+                              "original_text": "garbled words", "original_speaker_id": "participant_1", "reviewed_ms": 9})
+        await ar.end_room(room, room.log, room.consent, True, room.arbitrator.responses, None)
+        rendered = room.arbitrator.responses.calls[0][2]
+        self.assertIn("Synthetic Two [reviewed]: corrected words", rendered)
+        self.assertNotIn("garbled", rendered); self.assertNotIn("Synthetic One [", rendered)
 
     async def test_k_section_6_end_still_fires_after_three_failed_summary_writes(self):
         room = make_negotiation_room(FakeResponses([self.RESULT]))

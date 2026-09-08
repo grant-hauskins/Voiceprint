@@ -215,9 +215,23 @@ def load_config(path):
     return configs
 
 
-def reply_note(session_id, names, state, decision, arbitrator_prompt=None):
+def misheard_name(state, agent_name):
+    """The transcript's spelling of this agent's name in the newest human line when it addressed the agent inexactly
+    (docs/API.md "Fuzzy addressing"), else None. Agent rows and the agent's own echo are skipped."""
+    for row in reversed(state.history):
+        if row.get("source") == "agent" or row.get("label") == "agent" or row.get("speaker_id") == state.agent_speaker_id:
+            continue
+        match = tg.addressed_as(row.get("text"), (agent_name,))
+        if match and match[1].casefold() != agent_name.casefold():
+            return match[1]
+        return None
+    return None
+
+
+def reply_note(session_id, names, state, decision, arbitrator_prompt=None, spelled_as=None):
     """Exact live-earned pre-reply wording from realtime_openai.py; change only after a live run.
-    A verified arbitrator prompt is appended after the unchanged text, never woven into it."""
+    Sentences are appended after the unchanged text only under new conditions (a reviewed label, clarify, a misspelled
+    address, a verified arbitrator prompt), never woven into it; the arbitrator prompt stays last."""
     roster = ", ".join(names.values())
     last = state.history[-1] if state.history else None
     who = names.get(last.get("speaker_id"), "unknown") if last else "unknown"
@@ -226,8 +240,12 @@ def reply_note(session_id, names, state, decision, arbitrator_prompt=None):
             "Call get_transcript with after_id from your last call, then answer that person by name. "
             "Only the newest line's label matters; earlier OVERLAP or low lines are history, not a reason to refuse. "
             "Labels high and medium are reliable enough to name the speaker.")
+    if last and last.get("label") == "reviewed":
+        note += " Label reviewed means the operator confirmed that speaker; treat it as reliable."
     if decision == "clarify":
         note += " The newest line's attribution is uncertain: ask who just spoke instead of answering."
+    if spelled_as:
+        note += f" The transcript wrote your name as '{spelled_as}'; that line is addressed to you."
     if arbitrator_prompt:
         note += f" The arbitrator asks you to raise this now: {arbitrator_prompt}"
     return note
@@ -540,7 +558,8 @@ class Agent:
         self.emit("gate", {"decision": decision, "audio_timeline_ms": self.start_ms})
         print(f"  [{self.config.name} gate: {decision}]", flush=True)
         try:
-            await self.provider.request_reply(reply_note(self.room.session_id, self.room.names, self.gate, decision, prompt))
+            await self.provider.request_reply(reply_note(self.room.session_id, self.room.names, self.gate, decision, prompt,
+                                                         misheard_name(self.gate, self.config.name)))
         except Exception:
             await self.cancel("request_failed")
             raise
@@ -588,7 +607,9 @@ class Agent:
             return
         if kind == "error":
             print(f"{self.config.name}: provider error ({event.get('error', {}).get('code', 'unknown')})", file=sys.stderr, flush=True)
-            if self.active:
+            # An already-cancelled turn never re-cancels: OpenAI answers a response.cancel sent after the response finished
+            # with an error (response_cancel_not_active), and cancelling again would send another and loop until release.
+            if self.active and not self.cancelled:
                 await self.cancel("provider_error")
             return
         if not self.active or self.cancelled:
@@ -1013,6 +1034,18 @@ class Runtime:
                 self.enrollment[p["id"]] = {"state": "rejected", "peak": None}
         self.set_phase("enrollment", message)
 
+    def note_enrolled(self, response):
+        """The accepted init response (vp.enroll on_response): participants[].profile_seeded says whose retained
+        voiceprint seeded this session's profile (V3.1 contract), surfaced as enrollment.profile_seeded in GET /agents."""
+        with self.lock:
+            for p in (response or {}).get("participants") or []:
+                pid = p.get("id")
+                if not isinstance(pid, str):
+                    continue
+                entry = dict(self.enrollment.get(pid) or {"state": "recorded", "peak": None})
+                entry["profile_seeded"] = p.get("profile_seeded") is True
+                self.enrollment[pid] = entry
+
 
 def control_server(target, port=8090, api_origin="http://127.0.0.1:8080", token=None):
     runtime = target if isinstance(target, Runtime) else Runtime(room=target)
@@ -1216,7 +1249,8 @@ async def run_session(args, configs, runtime, server, microphone, mcp_token, sto
                 raise vp.ConsentError("A negotiation room needs every release to include the negotiation text disclosure; "
                                       "end this room and sign again with that box checked")
         record = runtime.recorder(microphone, consent, console=not gui)
-        names = await asyncio.to_thread(vp.enroll, args.api, session_id, names, record, None, consent, runtime.reset_enrollment)
+        names = await asyncio.to_thread(vp.enroll, args.api, session_id, names, record, None, consent, runtime.reset_enrollment,
+                                        on_response=runtime.note_enrolled)
     except BaseException:
         consent.deny()
         try:
@@ -1450,7 +1484,7 @@ async def run_session(args, configs, runtime, server, microphone, mcp_token, sto
             audio_out.get_nowait()
         # All final human turns are persisted above; the summary (negotiation, operator end only) is written before /end.
         try:
-            await end_room(room, log, consent, operator_end and not consent.failed.is_set(), summary_file=getattr(args, "summary_file", None))
+            await end_room(room, log, consent, operator_end and not consent.failed.is_set(), summary_file=summary_file_from_args(args))
         finally:
             log.summarize()
             log.close()
@@ -1471,6 +1505,21 @@ SUMMARY_INSTRUCTIONS = ("You write the closing record of a negotiation from its 
                         "in the transcript are similarity-based, not calibrated. Output JSON only.")
 SUMMARY_ATTEMPTS = 3
 MAX_SUMMARY_CHARS = 20000
+SUMMARY_DIR = Path(__file__).resolve().parents[1] / "data" / "summaries"   # data/ is git-ignored (docs/API.md "Runtime and console")
+DEFAULT_SUMMARY_FILE = object()      # sentinel: write data/summaries/<session_id>.md; None disables the file
+
+
+def default_summary_path(session_id):
+    """data/summaries/<session_id>.md; characters outside [A-Za-z0-9_.-] become "_" so a typed --session cannot leave the directory."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", str(session_id or "session")).strip(".") or "session"
+    return SUMMARY_DIR / f"{safe}.md"
+
+
+def summary_file_from_args(args):
+    """None (--no-summary-file), the operator's --summary-file path, or the default sentinel."""
+    if getattr(args, "no_summary_file", False):
+        return None
+    return getattr(args, "summary_file", None) or DEFAULT_SUMMARY_FILE
 
 
 def render_summary(result):
@@ -1494,8 +1543,10 @@ async def fetch_all(api, path, key, limit=200, max_rows=1000, extra=""):
     return rows
 
 
-async def write_summary(room, responses, log, consent, summary_file=None, attempts=SUMMARY_ATTEMPTS):
-    """One Responses call over the board rows and transcript, redacted, then POST .../summary (retried). True when saved."""
+async def write_summary(room, responses, log, consent, summary_file=DEFAULT_SUMMARY_FILE, attempts=SUMMARY_ATTEMPTS):
+    """One Responses call over the board rows and transcript, redacted, then POST .../summary (retried). True when saved.
+    The same text is then written to summary_file (default data/summaries/<session_id>.md; None disables it), only after
+    the API record is confirmed. A file error never changes the outcome: the record is the summary, the file is a copy."""
     try:
         await asyncio.to_thread(consent.require, "negotiation_text")
     except vp.ConsentError:
@@ -1528,17 +1579,24 @@ async def write_summary(room, responses, log, consent, summary_file=None, attemp
             continue
         log.emit("summary", {"action": "saved", "attempts": attempt, **counts})
         print(f"Summary saved to the API ({counts['board_rows']} board rows, {counts['transcript_rows']} transcript rows).", flush=True)
+        if summary_file is DEFAULT_SUMMARY_FILE:
+            summary_file = default_summary_path(room.session_id)
         if summary_file:
-            # Operator's explicit choice, only after the database record is confirmed (docs/API.md "Summary").
-            Path(summary_file).write_text(text, encoding="utf-8")
-            print(f"Summary also written to {summary_file}.", flush=True)
+            # Only after the database record is confirmed (docs/API.md "Summary"); the event carries no path.
+            try:
+                path = Path(summary_file)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text, encoding="utf-8")
+                print(f"Summary also written to {path}.", flush=True)
+            except OSError as error:
+                print(f"Summary file not written ({type(error).__name__}); the API record is saved", file=sys.stderr, flush=True)
         return True
     log.emit("summary", {"action": "failed", "attempts": attempts, **counts})
     print("SUMMARY NOT SAVED after %d attempts; the room still ends so its purpose data is destroyed on time." % attempts, file=sys.stderr, flush=True)
     return False
 
 
-async def end_room(room, log, consent, operator_end, responses=None, summary_file=None):
+async def end_room(room, log, consent, operator_end, responses=None, summary_file=DEFAULT_SUMMARY_FILE):
     """Summary first (negotiation room, arbitrator present, operator-initiated end, consent intact), then POST /end.
     The summary is a derived artifact; /end, which starts purpose-data destruction, always follows even when the
     summary could not be generated or stored. Privacy destruction wins over a derived artifact."""
@@ -1568,7 +1626,8 @@ def parser():
     result.add_argument("--mcp-url", help="public HTTPS URL ending /mcp from the port 8082 tunnel")
     result.add_argument("--mcp-local", help="local MCP HTTP endpoint for the arbitrator's reads (default http://127.0.0.1:$VOICEPRINT_MCP_PORT/mcp)")
     result.add_argument("--conversation-type", choices=list(pp.CONVERSATION_TYPES), default="casual", help="without --gui; the GUI setup sends it")
-    result.add_argument("--summary-file", type=Path, help="negotiation only: also write the closing summary here after the API record is confirmed")
+    result.add_argument("--summary-file", type=Path, help="negotiation only: write the closing summary here instead of data/summaries/<session_id>.md (after the API record is confirmed)")
+    result.add_argument("--no-summary-file", action="store_true", help="negotiation only: keep the closing summary as the API record only, no file")
     result.add_argument("--names", nargs="+", default=["Grant", "Kyle"])
     result.add_argument("--contacts", nargs="+", help="one typed email/phone per full name; otherwise prompt before consent")
     result.add_argument("--session")
