@@ -1,0 +1,29 @@
+{
+  "description": "Shared conformance vectors for the v3 redaction guard. Both implementations (Java Redaction.java, Python scripts/objectives.py) must produce exactly `expected` and `hits` for every case. Values are registered constraint values; text is what an agent tried to emit. Token: [withheld]. Documented misses are in docs/API.md (V3 redaction guard).",
+  "token": "[withheld]",
+  "cases": [
+    {"name": "exact digits", "values": ["300000"], "text": "I can go to 300000.", "expected": "I can go to [withheld].", "hits": 1},
+    {"name": "currency and thousands separators", "values": ["300000"], "text": "Floor is $300,000 firm", "expected": "Floor is [withheld] firm", "hits": 1},
+    {"name": "k suffix", "values": ["300000"], "text": "around 300k should work", "expected": "around [withheld] should work", "hits": 1},
+    {"name": "K suffix with space and dollar", "values": ["300000"], "text": "say $ 300 K and see", "expected": "say [withheld] and see", "hits": 1},
+    {"name": "spelled out", "values": ["300000"], "text": "three hundred thousand dollars is the floor", "expected": "[withheld] dollars is the floor", "hits": 1},
+    {"name": "spelled out mixed case with hyphen and 'and'", "values": ["12525"], "text": "Twelve Thousand five hundred and twenty-five", "expected": "[withheld]", "hits": 1},
+    {"name": "decimal percent", "values": ["4.5"], "text": "a 4.5% rate is the ceiling", "expected": "a [withheld] rate is the ceiling", "hits": 1},
+    {"name": "million word", "values": ["1500000"], "text": "1.5 million, take it", "expected": "[withheld], take it", "hits": 1},
+    {"name": "million suffix letter", "values": ["1500000"], "text": "1.5M is our cap", "expected": "[withheld] is our cap", "hits": 1},
+    {"name": "value registered with currency formatting", "values": ["$275,000"], "text": "275000 is the number", "expected": "[withheld] is the number", "hits": 1},
+    {"name": "text constraint case-insensitive with punctuation", "values": ["Must keep the piano"], "text": "he MUST keep the piano!", "expected": "he [withheld]!", "hits": 1},
+    {"name": "text constraint across whitespace", "values": ["June 30"], "text": "we must close by June   30.", "expected": "we must close by [withheld].", "hits": 1},
+    {"name": "two values two hits", "values": ["300000", "June 30"], "text": "300,000 by June 30 works", "expected": "[withheld] by [withheld] works", "hits": 2},
+    {"name": "same value twice", "values": ["300000"], "text": "300000 or 300,000", "expected": "[withheld] or [withheld]", "hits": 2},
+    {"name": "no false positive on other numbers", "values": ["300000"], "text": "we have 3 items and 30 days and 300 pages", "expected": "we have 3 items and 30 days and 300 pages", "hits": 0},
+    {"name": "adjacent number is a documented miss", "values": ["300000"], "text": "299,000 is close", "expected": "299,000 is close", "hits": 0},
+    {"name": "range bracket is a documented miss", "values": ["300000"], "text": "somewhere between 280 and 320 thousand", "expected": "somewhere between 280 and 320 thousand", "hits": 0},
+    {"name": "short text values are ignored", "values": ["ok", "no"], "text": "ok, no problem", "expected": "ok, no problem", "hits": 0},
+    {"name": "empty values", "values": [], "text": "$300,000 stays", "expected": "$300,000 stays", "hits": 0},
+    {"name": "blank text", "values": ["300000"], "text": "", "expected": "", "hits": 0},
+    {"name": "number inside a word is not a number", "values": ["42"], "text": "room42 is free but 42 is not", "expected": "room42 is free but [withheld] is not", "hits": 1},
+    {"name": "spelled number with dollar word", "values": ["2000"], "text": "two thousand", "expected": "[withheld]", "hits": 1},
+    {"name": "position text is not a constraint", "values": ["300000"], "text": "wants to sell the property", "expected": "wants to sell the property", "hits": 0}
+  ]
+}

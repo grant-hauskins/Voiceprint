@@ -163,3 +163,67 @@ Stream B also owns `scripts/agents.toml` and `scripts/test_agent_runtime.py` in 
 ## V2 privacy amendment (blocking contract)
 
 The implementation requirements and endpoint shapes in `docs/BIPA_V2.md` supersede permissive collection, disclosure and retention behavior above. Schema v5 follows the in-progress v4 migration. An existing session or API token never implies a participant's consent. All streams must enforce the privacy amendment before their v2 live run. B additionally owns privacy enforcement changes in `scripts/voiceprint_client.py`, `scripts/realtime_openai.py`, `scripts/live.py` and `scripts/openai_responses_probe.py`; A additionally owns `worker/worker.py` and its privacy boundary test, to prevent direct worker calls from bypassing authorization. Root owns the privacy specification, retention verification and integration review. No threshold or agent-nudge wording change is authorized by this amendment.
+
+## V3 arbitration contract (streams api, agent, gui, eval)
+
+Implementation contract for v3 (`docs/BUILD_SPEC_V3.md`; stream plan in `docs/V3_STREAMS.md`). Existing endpoints above are unchanged. **This section explicitly supersedes `docs/V2_STREAMS.md`'s "no agent-to-agent messaging, no second channel" rule for one case only: the agent channel below, a new MCP tool on the same server with the same cursor shape as `get_transcript`.** The room-level gate that prevents automatic agent-to-agent voice loops is unchanged; the channel is text, stored, guarded and never claims the floor.
+
+### Disclosure scope `negotiation_text` (schema v5 tables, notice text change)
+
+A third optional disclosure scope, alongside `openai_audio` and `hosted_mcp`. A release may include `"negotiation_text"` in `disclosure_scopes`. `GET .../consent` reports `scopes.negotiation_text`, effective only when the room is valid, **every** human's release includes it, and `VOICEPRINT_OPENAI_REVIEWED=true`. It authorizes, for this room only: storing each participant's typed negotiation objective; injecting a participant's own objective into the prompt of the advocate agent that speaks for them; sending both objectives, the notes board and the named transcript to OpenAI text models (Responses API, `store:false`) for the arbitrator and the end-of-conversation summary; and retaining that written summary for 30 days after the room ends. `PrivacyPolicy.noticeText()` gains one sentence describing exactly that; the notice hash therefore changes and every previously signed room must be re-signed (expected). Without this scope from everyone, `POST .../objectives`, `POST .../summary` and the arbitrator's vendor calls are refused with 403 `prior_written_release_required`, and the room behaves as v2.
+
+### Schema v6
+
+`user_version=6` adds four tables. Objectives, channel rows and reveals reference `privacy_rooms(session_id)` (a room exists before enrollment creates `sessions`), so **destruction deletes them explicitly** in `PrivacyGate.purge()` and the zero-row verification list includes `objectives`, `agent_channel` and `channel_reveals`. Summaries are a separately retained artifact (see below), deleted by the sweeper at their own deadline or by `DELETE .../summary`, and are not part of the session graph.
+
+```sql
+CREATE TABLE objectives(id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL REFERENCES privacy_rooms(session_id), principal_id TEXT NOT NULL, version INTEGER NOT NULL, position TEXT NOT NULL, constraints TEXT NOT NULL, source TEXT NOT NULL CHECK(source IN ('typed','uploaded')), trigger TEXT NOT NULL, created_ms INTEGER NOT NULL, UNIQUE(session_id,principal_id,version));
+CREATE TABLE agent_channel(id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL REFERENCES privacy_rooms(session_id), sender_participant_id TEXT NOT NULL, tier TEXT NOT NULL CHECK(tier IN ('board','raw')), tag TEXT, text TEXT NOT NULL, redactions INTEGER NOT NULL DEFAULT 0, timestamp_ms INTEGER NOT NULL);
+CREATE TABLE channel_reveals(session_id TEXT NOT NULL REFERENCES privacy_rooms(session_id), participant_id TEXT NOT NULL, revealed_ms INTEGER NOT NULL, PRIMARY KEY(session_id,participant_id));
+CREATE TABLE summaries(session_id TEXT PRIMARY KEY, text TEXT NOT NULL, model TEXT NOT NULL, board_rows INTEGER NOT NULL, transcript_rows INTEGER NOT NULL, created_ms INTEGER NOT NULL, retention_deadline_ms INTEGER NOT NULL);
+```
+
+`constraints` is a JSON array of `{"label":"...","value":"..."}`; `value` strings are what the redaction guard watches. The raw uploaded file is never stored: the GUI parses it client-side into these fields and posts only the fields (`source:"uploaded"`).
+
+### Objectives (operator-local only; never an MCP tool)
+
+`POST /speaker/session/{id}/objectives` with `{"principal_id":"participant_1","position":"wants to sell the property","constraints":[{"label":"floor","value":"300000"}],"source":"typed","trigger":"initial"}` returns 201 `{"session_id":"...","principal_id":"participant_1","version":1,"created_ms":...}`. Every POST creates a new version (`max+1`, never an in-place edit); `trigger` (≤200 chars) says what caused it. `principal_id` must be a human in the room's released roster. Limits: position ≤2000 chars, ≤20 constraints, label ≤80, value ≤200. Requires operator token, room admission and the `negotiation_text` scope.
+
+`GET /speaker/session/{id}/objectives` returns `{"session_id":"...","objectives":[{principal_id,version,position,constraints,source,trigger,created_ms}]}`: the latest version per principal, ordered by principal ID; `?history=1` returns every version ordered by ID. Same requirements. The runtime is the only intended reader (it injects each objective into its own advocate's prompt and hands both to the arbitrator in-process). There is deliberately no per-agent read tool: `participant_id` on the MCP URL is unauthenticated (see the V2 proof section), so objective access is never keyed on it.
+
+### Agent channel
+
+`POST /speaker/session/{id}/agent_channel` with `{"sender_participant_id":"participant_3","tier":"board"|"raw","text":"...","tag":null|"OBJECTIVE_ACHIEVED"|"REFOCUS_NEEDED"}` returns 201 `{"session_id":"...","row_id":7,"tier":"board","redactions":0,"text":"<stored text>"}`. The sender must be a registered agent in an active session (400/404 as for the floor). **Before the row is stored the server runs the redaction guard over `text` against the union of every latest objective's constraint values in the session** (the sender's identity is a declared label, so the guard never depends on it); the stored text is the redacted text and `redactions` counts replacements. Text ≤4000 chars. A `board` row also commits an `agent_channel` event (feed type `agent_channel`, data = the row) atomically; `raw` rows produce no event. Hosted MCP writes arrive through `post_agent_channel` with the same body, sender taken from the MCP URL's `participant_id` tag.
+
+`GET /speaker/session/{id}/agent_channel?after_id=0&limit=100&tier=board|raw|all` returns `{"session_id":"...","next_after_id":7,"revealed":false,"rows":[{row_id,sender_participant_id,sender_name,tier,tag,text,redactions,timestamp_ms}],"text":"#7 12:01:05 Mediator [board]: ...\n"}`. Tier defaults to `all`. **Reveal gate (API-enforced, not GUI-hidden):** a request carrying `X-Voiceprint-Hosted-MCP: true` (the MCP server's path, authenticated by the separate MCP bearer token, i.e. the agents themselves) receives every requested tier. Any other caller receives `board` rows only until **every** human in the released roster has a `channel_reveals` row; until then `raw` rows are omitted, `revealed` is false, and `next_after_id` still advances past omitted rows (highest ID examined, or the cursor when nothing new). Compact `text` lines use the server timestamp as `HH:MM:SS` local time, `Sender [tier]` and `(TAG)` when tagged.
+
+`POST /speaker/session/{id}/agent_channel/reveal` with `{"participant_id":"participant_1","revealed":true|false}` records or withdraws that human's consent to show the raw stream on the console; returns 200 `{"session_id":"...","revealed_by":["participant_1"],"revealed":false}`. Like consent writes it requires the exact local browser Origin (the person clicks it themselves) and a human roster member.
+
+### Summary (retained artifact)
+
+`POST /speaker/session/{id}/summary` with `{"text":"...","model":"gpt-5","board_rows":4,"transcript_rows":61}` returns 201 `{"session_id":"...","created_ms":...,"retention_deadline_ms":...}` and replaces any earlier summary for the session. Requires room admission (the session must not have ended: the runtime writes it **before** `POST .../end`) and the `negotiation_text` scope. `retention_deadline_ms = created_ms + 30 days`. Text ≤ 20000 chars. `GET /speaker/session/{id}/summary` (operator token; no room admission, because the room is destroyed by the time anyone reads it) returns the row or 404. `DELETE /speaker/session/{id}/summary` removes it. The 60-second privacy sweeper deletes summaries past their deadline. The summary is stored in the database, not written to a file: `docs/TURN_TAKING.md` §7's disk-log ban stands; an operator who wants a file passes the runtime's explicit `--summary-file PATH` flag (off by default) after the database write is confirmed.
+
+### MCP tools
+
+- `get_agent_channel(session_id, after_id?, limit?)` (read-only): same cursor contract as `get_transcript`; returns compact lines in `content[0].text` and `{session_id,next_after_id,count,channel}` in `structuredContent`; served through the hosted REST path, so agents see both tiers.
+- `post_agent_channel(session_id, text, tier?)` (not read-only): posts a row as the URL's `participant_id`; `tier` defaults to `raw`; refuses with a tool error when the URL carries no participant tag. Returns `{row_id,tier,redactions}`.
+- `safeMcpArguments` redacts `text` like other identifying arguments (it is not persisted in `mcp_calls`). `McpServer.dispatch` receives the participant tag from `McpHttpServer` (null on stdio). Advocates' `allowed_tools` grows to `get_transcript, get_current_speaker, get_agent_channel, post_agent_channel`.
+
+### Redaction guard (server-authoritative; runtime mirror for spoken output)
+
+`Redaction.redact(text, values)` returns the redacted text and hit count. Shared vectors: `evaluation/redaction_cases.json`; both `src/test/java/.../RedactionTest.java` and `scripts/test_objectives.py` iterate every case and assert `expected` and `hits` exactly. Rules:
+
+1. A registered value is **numeric** when, after removing `$`, `,`, `_`, spaces and `%`, and applying a trailing multiplier (`k`/`K` ×1000, `m`/`M` ×1,000,000, `thousand`, `million`), it parses as a number. Otherwise it is a **text** value; text values shorter than 3 characters after normalization are ignored.
+2. Numeric mentions in the candidate text are spans of: optional `$` (with optional space), digits with optional thousands separators and decimals, optional space and multiplier or `%`; **or** spelled-out numbers (`zero`–`nineteen`, tens, hyphenated `twenty-five`, `hundred`, `thousand`, `million`, `billion`, with `and` allowed between parts but never consumed at the end of a span). A digit run immediately preceded or followed by a letter (other than a multiplier) is not a mention (`room42`). A mention matches a numeric value when the canonical numbers are equal (absolute difference < 0.005).
+3. Text values match case-insensitively as a whole-word-bounded phrase with any run of whitespace/punctuation between words.
+4. Every matching span is replaced with `[withheld]`; the count of replacements is returned.
+5. Documented misses (deliberately not caught): adjacent numbers (`299,000` for `300000`), ranges and brackets (`between 280 and 320 thousand`), paraphrase (`the low three hundreds`), ordinal forms of dated text values (`June 30th` for `June 30`), and anything the model states as a *derived* figure. The guard is a literal-value backstop behind the instruction layer, not a classifier.
+
+Behavior on a catch: **redact in place** for channel/board/summary text (the row is stored redacted and the count is visible); for an advocate's *spoken* output the runtime cancels the response and flushes playback the moment the streamed transcript matches (best effort: audio already played cannot be recalled; see `docs/TURN_TAKING.md` §9).
+
+### Runtime control API additions (loopback 8090)
+
+- `GET /agents`: `conversation_type` (`casual`|`negotiation`), each agent gains `role` (`voice`|`arbitrator`); an arbitrator agent additionally reports `arbitrator:{generations,ingested_rows,last_trigger,pending_tag,cooldown_until_ms,paused}` and never reports a voice. `agent_configs` rows gain `role`.
+- `POST /setup`: accepts `conversation_type` and per-agent `role`. `negotiation` requires 2–4 humans, exactly two `voice` agents with distinct `speaks_for` values (the advocates) and exactly one `arbitrator`; an arbitrator is rejected in `casual`.
+- `POST /agents/{name}/control` for an arbitrator: `speak` = generate a contribution now, `hold` = pause/resume posting, `cancel` = drop any pending override.
+- Arbitrator reads use the **local MCP HTTP endpoint** (`http://127.0.0.1:8082/mcp?participant_id=<arbitrator>` with the MCP bearer token), not REST, so its `get_transcript`/`get_agent_channel` calls appear in `mcp_calls` and the proof panel, and its channel reads carry the agent credential.
