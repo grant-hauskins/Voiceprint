@@ -202,6 +202,21 @@ class RuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(agent.provider.replies), 1)
         self.assertIsNone(room.api.holder)
 
+    async def test_provider_cancel_error_after_manual_cancel_does_not_recancel(self):
+        # Cancel/Hold after response.done while audio still plays: OpenAI answers response.cancel with
+        # response_cancel_not_active; the agent is still active until the tick releases the floor, so it must not cancel again.
+        room = make_room()
+        agent = room.agents[0]
+        await agent.begin("speak")
+        await agent.event({"type": "response.created", "response": {"id": "r"}})
+        await agent.event({"type": "response.output_audio.delta", "response_id": "r", "delta": base64.b64encode(b"\0\0").decode()})
+        self.assertTrue(agent.player.playing)
+        await agent.event({"type": "response.done", "response": {"id": "r", "output": [{"type": "message"}]}})
+        self.assertTrue(agent.active)
+        await agent.cancel()
+        await agent.event({"type": "error", "error": {"code": "response_cancel_not_active"}})
+        self.assertEqual(agent.provider.cancels, 1)
+
     async def test_agent_utterance_only_reaches_gate_through_stored_bus(self):
         room = make_room()
         agent = room.agents[0]

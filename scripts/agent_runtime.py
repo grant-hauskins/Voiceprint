@@ -512,7 +512,7 @@ class Agent:
             return
         if kind == "error":
             print(f"{self.config.name}: provider error ({event.get('error', {}).get('code', 'unknown')})", file=sys.stderr, flush=True)
-            if self.active:
+            if self.active and not self.cancelled:
                 await self.cancel("provider_error")
             return
         if not self.active or self.cancelled:
